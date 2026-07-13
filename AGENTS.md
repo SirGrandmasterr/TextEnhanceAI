@@ -10,11 +10,11 @@
 - Create venv (optional):
   - Windows: `python -m venv .venv && .venv\\Scripts\\activate`
   - Unix: `python -m venv .venv && source .venv/bin/activate`
-- Install deps: `pip install ollama` (Tkinter and difflib are stdlib).
+- Install deps: `pip install -r requirements.txt` (Tkinter and difflib are stdlib).
 - Ollama model: `ollama pull llama3.1:8b` (ensure Ollama is installed and running).
 
 ## Coding Style & Naming Conventions
-- Python 3.7+; follow PEP 8 with 4‑space indents.
+- Python 3.8+; follow PEP 8 with 4‑space indents.
 - Functions/variables: `snake_case`; classes: `PascalCase`; constants: `UPPER_CASE`.
 - Docstrings: short summary + key args/returns where useful.
 - UI labeling: keep button text concise; tooltips explain behavior.
@@ -33,4 +33,3 @@
 - The app uses a local LLM via the `ollama` Python client. No cloud calls are required; ensure your model is local.
 - Do not commit runtime artifacts (e.g., `TextEnhanceAI-scratchpad_*.md`).
 - If you introduce config, prefer environment variables with safe defaults.
-
