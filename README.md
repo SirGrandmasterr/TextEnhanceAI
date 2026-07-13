@@ -23,14 +23,18 @@ TextEnhanceAI is a local desktop editor that uses [Ollama](https://ollama.com/) 
 - Ollama installed and running
 - At least one local Ollama model
 
-Install the Python dependency and pull the default model:
+Install the Python dependency:
 
 ```powershell
 pip install -r requirements.txt
-ollama pull llama3.1:8b
 ```
 
-The default can be changed with the `TEAI_MODEL` environment variable.
+Pull a model suited to your hardware:
+
+- GPU with approximately 6–8 GB of VRAM: `ollama pull llama3.1:8b`
+- CPU-only or lower-resource computer: `ollama pull qwen3:1.7b`
+
+The app defaults to `llama3.1:8b`. Select another installed model from the Model dropdown or change the default with the `TEAI_MODEL` environment variable.
 
 ## Run the app
 
