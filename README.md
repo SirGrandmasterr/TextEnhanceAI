@@ -1,69 +1,88 @@
-# TextEnhanceAI - Editor with Local LLM Integration #
+# TextEnhanceAI - Editor with Local LLM Integration
 
-A user-friendly, Python-based editor that leverages a locally hosted LLM (via [Ollama](https://github.com/jmorganca/ollama) for now) for fast text enhancements, proofreading, and rewriting. Whether you’re polishing a blog post, correcting grammar, or simplifying your wording, this editor enables you to harness the power of local generative AI right from your desktop—no cloud services needed.
+TextEnhanceAI is a local desktop editor that uses [Ollama](https://ollama.com/) to proofread, rewrite, translate, and improve text without sending it to a cloud service. Version 0.13 adds a structured review workflow so every suggestion can be accepted or rejected before it changes the document.
 
-![App Window - v0.1](https://github.com/wenrolland/TextEnhanceAI/blob/main/TextEnhanceAI-v0.11.png)
+![TextEnhanceAI v0.13 review screen](https://github.com/wenrolland/TextEnhanceAI/blob/main/TextEnhanceAI-v0.13.png)
 
-## Key Features
+## Key features
 
-1. **Inline Editing and Diff View**  
-   - Type or paste your plain text into the editor, then click an editing action (Grammar, Proofread, Rewrite, etc.).  
-   - The application compares your text against the AI-edited output and highlights changes inline.  
-   - Deletions appear in red, additions in green.
+- **Sentence-by-sentence review:** changed sentences are shown separately instead of combining red and green words in the editor.
+- **Individual change groups:** expand a sentence to accept or reject specific word or punctuation changes.
+- **Clear visual differences:** removed text is labeled and struck through; added text is labeled and underlined, so color is not the only indicator.
+- **Visible decisions:** accepted and rejected states are bold green and red; pending and partially accepted states are bold blue and orange.
+- **Safe application:** the source remains unchanged while suggestions are reviewed. Apply is enabled only after every change has a decision.
+- **Undo:** restore the exact text from before the most recently applied review.
+- **Cancellable local generation:** Ollama runs in the background, the editor stays responsive, and partial cancelled responses are discarded.
+- **Editing modes:** Grammar, Proofread, Natural, Streamline, Awkward, Rewrite, Concise, Polish, Improve, Translate, and Custom.
+- **Model status:** see whether Ollama is connected, unavailable, or missing a local model.
+- **Markdown history:** each successful proposal, individual decision, and final result is logged to a local scratchpad.
 
-2. **Multiple Editing Modes**  
-   - Built-in prompts let you quickly fix grammar, streamline awkward phrases, or make your text more concise.  
-   - A customizable “Custom Prompt” option allows you to craft specialized instructions for the LLM.
+## Requirements
 
-3. **Accept / Reject All Changes**  
-   - Quickly apply all AI-suggested edits with “Accept All Changes,” or revert them entirely with “Reject All Changes.”  
+- Python 3.8 or newer
+- Ollama installed and running
+- At least one local Ollama model
 
-4. **Scratchpad Logging**  
-   - Every edit is logged to a Markdown scratchpad file. [Example](https://github.com/wenrolland/TextEnhanceAI/blob/main/TextEnhanceAI-scratchpad_20250605_191604.md)
-   - The original user text and the LLM’s edited text are saved side by side, with any removed/added words highlighted in **bold** Markdown, helping you track changes over time.
+Install the Python dependency and pull the default model:
 
-5. **Local LLM Support**  
-   - Connects to a locally hosted LLM through Ollama.  
-   - No internet connection required—your content stays on your own machine.
+```powershell
+pip install -r requirements.txt
+ollama pull llama3.1:8b
+```
 
-## Getting Started
+The default can be changed with the `TEAI_MODEL` environment variable.
 
-1. **Install Requirements**  
-   - Ensure Python 3.7+ is [installed](https://www.python.org/downloads/).  
-   - Install the [Ollama](https://github.com/jmorganca/ollama) package.
-   - Download llama3.1:8b in Ollama :
-      ```bash
-      ollama pull llama3.1:8b
-      ```
-   - Install other Python dependencies as needed (e.g., `tkinter`—usually bundled with Python, `difflib`—comes with standard library).
+## Run the app
 
-2. **Run the App**  
-   Clone the repository or simply download TextEnhanceAI.py to get the program. Launch it using :
-      ```bash
-      python TextEnhanceAI.py
-      ```
-   If Ollama is running, you’ll see the main editor window.
+```powershell
+python TextEnhanceAI.py
+```
 
-4. **Use the Editing Buttons**  
-   - Type or paste your text.  
-   - Click on an editing button (e.g., “Grammar,” “Proofread”) to send a prompt to the local LLM.  
-   - The edited text will be displayed inline, with suggested deletions in red and additions in green.
+Using `uv` is also supported:
 
-5. **Accept/Reject Changes**  
-   - When ready, you can accept all or reject all the AI-suggested edits.
-   - The edition scratchpad is saved in the same directory. This way, you can review the output, whatever your choices.
-   - When done, simply copy the text and paste it where you want to use it.
+```powershell
+uv venv
+uv pip install -r requirements.txt
+uv run python TextEnhanceAI.py
+```
+
+## Review workflow
+
+1. Paste or type text in the editor.
+2. Choose an editing mode and model.
+3. Select **Review changes** or press `Ctrl+Enter`.
+4. Review each changed sentence. Accept or reject the whole sentence, or expand **Review individual changes** for finer control.
+5. Use **Previous** and **Next** to navigate.
+6. Apply the reviewed text after no pending decisions remain.
+
+Keyboard shortcuts:
+
+- `Ctrl+Enter`: generate suggestions or apply a completed review
+- `Alt+A`: accept the current sentence
+- `Alt+R`: reject the current sentence
+- `Alt+Left` / `Alt+Right`: previous or next suggestion
+
+Generated `TextEnhanceAI-scratchpad_*.md` files are stored next to the application and ignored by Git.
+
+## Development and tests
+
+The launcher remains `TextEnhanceAI.py`. Pure editing logic and Ollama access live in `core/`, while Tkinter screens live in `ui/`.
+
+Install test dependencies and run the suite:
+
+```powershell
+uv pip install -r requirements-dev.txt
+uv run pytest -q
+```
+
+The automated suite uses fake Ollama responses and does not require a running model. Version 0.13 is verified with Ollama Python client 0.6.1; a live Ollama smoke test is still recommended for release verification.
 
 ## Contact
 
-For questions, feedback, or collaboration opportunities, feel free to reach out:
-
-📧 Email: [wenrolland@designecologique.ca](mailto:wenrolland@designecologique.ca)
-
-I’d love to hear from you! 😊
-
----
+**Email:** [wenrolland@designecologique.ca](mailto:wenrolland@designecologique.ca)
 
 ## Updates
 
-**Version 0.11** : Fixes the formating to keep the line breaks after editing. 
+- **Version 0.13:** Adds structured sentence and word-group review, safe mixed decisions, cancellation, connection status, enhanced scratchpads, undo, and automated tests.
+- **Version 0.12:** Adds local model selection and background generation.
+- **Version 0.11:** Preserves line breaks after editing.

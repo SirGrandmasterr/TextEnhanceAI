@@ -1,0 +1,19 @@
+# Byte-compiled / cache
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment files
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime artifacts
+TextEnhanceAI-scratchpad_*.md

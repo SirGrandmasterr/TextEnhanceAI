@@ -1,0 +1,50 @@
+"""Tests for Markdown proposal and outcome logging."""
+
+from datetime import datetime
+
+from core.diff_engine import build_edit_session, render_reviewed_text
+from core.scratchpad import ScratchpadLogger
+
+
+def test_scratchpad_records_proposal_decisions_and_final_text(tmp_path):
+    session = build_edit_session(
+        "This are wrong.",
+        "This is correct.",
+        instruction="Fix grammar.",
+        model="test-model",
+        revision_id=3,
+    )
+    session.review_items[0].changed_hunks[0].decision = "accepted"
+    for hunk in session.review_items[0].changed_hunks[1:]:
+        hunk.decision = "rejected"
+    final_text = render_reviewed_text(session)
+    logger = ScratchpadLogger(
+        tmp_path, now_provider=lambda: datetime(2026, 7, 12, 10, 11, 12)
+    )
+
+    path = logger.log_proposal(session)
+    logger.log_outcome(session, "applied", final_text)
+    content = path.read_text(encoding="utf-8")
+
+    assert path.name == "TextEnhanceAI-scratchpad_20260712_101112.md"
+    assert "Model: `test-model`" in content
+    assert "## Original text" in content
+    assert "## Proposed text" in content
+    assert "Outcome: **applied**" in content
+    assert "Change 1: accepted" in content
+    assert final_text in content
+
+
+def test_discarded_session_is_logged_without_losing_proposal(tmp_path):
+    session = build_edit_session("Old text.", "New text.")
+    logger = ScratchpadLogger(
+        tmp_path, now_provider=lambda: datetime(2026, 7, 12, 10, 11, 13)
+    )
+
+    path = logger.log_proposal(session)
+    logger.log_outcome(session, "discarded", session.original_text)
+    content = path.read_text(encoding="utf-8")
+
+    assert "## Suggestions" in content
+    assert "Outcome: **discarded**" in content
+    assert "Old text." in content
