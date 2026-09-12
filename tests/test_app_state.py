@@ -37,7 +37,7 @@ def test_stale_revision_result_is_discarded_before_session_creation():
 
     assert app.finished is True
     assert app.current_session is None
-    assert "stale Ollama result was discarded" in app.status_messages[-1]
+    assert "stale result from model was discarded" in app.status_messages[-1]
 
 
 def test_result_from_superseded_request_is_ignored():

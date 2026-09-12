@@ -1,0 +1,45 @@
+# TextEnhanceAI relay for the public (Strato) server.
+#
+#   cp .env.example .env      # then fill in RELAY_DOMAIN and the keys
+#   docker compose up -d --build
+#
+# Caddy obtains and renews the Let's Encrypt certificate for RELAY_DOMAIN and
+# forwards HTTPS + WebSocket traffic to the relay, which is never exposed
+# directly. Ports 80 and 443 must be reachable from the internet.
+
+services:
+  relay:
+    build: .
+    image: teai-relay:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      RELAY_HOST: 0.0.0.0
+      RELAY_PORT: "8080"
+    expose:
+      - "8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - relay
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:?Set RELAY_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  caddy-data:
+  caddy-config:

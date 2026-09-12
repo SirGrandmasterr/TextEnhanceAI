@@ -1,6 +1,5 @@
 """Main Tkinter application for TextEnhanceAI v0.13."""
 
-import os
 import queue
 import re
 import threading
@@ -9,20 +8,47 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
+from core.backend import EditCancelled, OutputTruncated
 from core.diff_engine import build_edit_session, render_reviewed_text
-from core.ollama_service import EditCancelled, OllamaService, OllamaUnavailable
+from core.ollama_service import OllamaService
 from core.prompts import EDITING_MODES, PROMPTS, build_instruction
+from core.remote_service import RemoteService
 from core.scratchpad import ScratchpadLogger
+from core.settings import (
+    BACKEND_LABELS,
+    BACKEND_OLLAMA,
+    BACKEND_REMOTE,
+    SETTINGS_FILENAME,
+    AppSettings,
+)
+from .connection_dialog import ConnectionDialog
 from .review_panel import ReviewPanel
+
+COLOR_OK = "#176b32"
+COLOR_WARN = "#9a6700"
+COLOR_ERROR = "#9b1c1c"
+COLOR_NEUTRAL = "#555555"
 
 
 class EditorApp:
-    """Coordinate editing, local generation, and structured review."""
+    """Coordinate editing, local or remote generation, and structured review."""
 
-    def __init__(self, root, app_directory=None, ollama_service=None):
+    def __init__(
+        self,
+        root,
+        app_directory=None,
+        ollama_service=None,
+        remote_service=None,
+        settings=None,
+    ):
         self.root = root
         self.app_directory = Path(app_directory or Path.cwd())
-        self.service = ollama_service or OllamaService()
+        self.settings = settings or AppSettings.load(self.app_directory / SETTINGS_FILENAME)
+        self.services = {
+            BACKEND_OLLAMA: ollama_service or OllamaService(),
+            BACKEND_REMOTE: remote_service or self._remote_from_settings(),
+        }
+        self.service = self.services[self.settings.backend]
         self.events = queue.Queue()
         self.cancel_event = None
         self.active_request_id = 0
@@ -30,21 +56,34 @@ class EditorApp:
         self.revision_id = 0
         self.generating = False
         self.generation_started_at = None
+        self.generation_label = ""
+        self._progress_chars = 0
         self.current_session = None
         self.current_logger = None
         self.last_applied_source = None
         self._suppress_modified = False
 
-        self.root.title("TextEnhanceAI Editor with Local LLM - V 0.13")
-        self.root.geometry("900x700")
-        self.root.minsize(800, 600)
+        self.root.title("TextEnhanceAI Editor - V 0.13")
+        self.root.geometry("960x720")
+        self.root.minsize(820, 600)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self._configure_style()
         self._build_interface()
         self._bind_shortcuts()
+        if self.settings.load_error:
+            self.set_status(self.settings.load_error)
         self.root.after(100, self._poll_events)
         self.root.after(150, self.refresh_models)
+
+    # --------------------------------------------------------------- services
+    def _remote_from_settings(self):
+        return RemoteService(
+            self.settings.remote_url,
+            self.settings.remote_api_key,
+            max_tokens=self.settings.remote_max_tokens,
+            enable_thinking=self.settings.remote_enable_thinking,
+        )
 
     def _configure_style(self):
         style = ttk.Style(self.root)
@@ -57,21 +96,38 @@ class EditorApp:
     def _build_interface(self):
         top_bar = ttk.Frame(self.root, padding=(8, 8, 8, 4))
         top_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(top_bar, text="Backend:").pack(side=tk.LEFT)
+        self.backend_var = tk.StringVar(value=BACKEND_LABELS[self.settings.backend])
+        self.backend_combo = ttk.Combobox(
+            top_bar,
+            textvariable=self.backend_var,
+            state="readonly",
+            width=18,
+            values=[BACKEND_LABELS[key] for key in (BACKEND_OLLAMA, BACKEND_REMOTE)],
+        )
+        self.backend_combo.pack(side=tk.LEFT, padx=(5, 10))
+        self.backend_combo.bind("<<ComboboxSelected>>", self._on_backend_selected)
+
         ttk.Label(top_bar, text="Model:").pack(side=tk.LEFT)
-        self.model_var = tk.StringVar(value=os.getenv("TEAI_MODEL", "llama3.1:8b"))
+        self.model_var = tk.StringVar(value=self.settings.preferred_model())
         self.model_combo = ttk.Combobox(
             top_bar,
             textvariable=self.model_var,
             state="readonly",
-            width=28,
-            values=(self.model_var.get(),),
+            width=30,
+            values=(self.model_var.get(),) if self.model_var.get() else (),
         )
         self.model_combo.pack(side=tk.LEFT, padx=(5, 6))
+        self.model_combo.bind("<<ComboboxSelected>>", self._on_model_selected)
         self.refresh_button = ttk.Button(
             top_bar, text="Refresh models", command=self.refresh_models
         )
         self.refresh_button.pack(side=tk.LEFT)
-        self.connection_var = tk.StringVar(value="Checking Ollama...")
+        self.connection_button = ttk.Button(
+            top_bar, text="Connection...", command=self.open_connection_dialog
+        )
+        self.connection_button.pack(side=tk.LEFT, padx=(6, 0))
+        self.connection_var = tk.StringVar(value="Checking...")
         self.connection_label = tk.Label(
             top_bar,
             textvariable=self.connection_var,
@@ -243,39 +299,110 @@ class EditorApp:
         self.connection_var.set(message)
         self.connection_label.configure(foreground=color)
 
+    # ------------------------------------------------------- backend switching
+    def _save_settings(self):
+        error = self.settings.save()
+        if error:
+            self.set_status(error)
+
+    def _on_backend_selected(self, event=None):
+        label = self.backend_var.get()
+        backend = next(
+            (key for key, value in BACKEND_LABELS.items() if value == label),
+            BACKEND_OLLAMA,
+        )
+        self._switch_backend(backend)
+
+    def _switch_backend(self, backend):
+        if self.generating:
+            self.backend_var.set(BACKEND_LABELS[self.settings.backend])
+            return
+        self.settings.backend = backend
+        self.service = self.services[backend]
+        self.backend_var.set(BACKEND_LABELS[backend])
+        self.model_var.set(self.settings.preferred_model(backend))
+        self.model_combo.configure(values=(self.model_var.get(),) if self.model_var.get() else ())
+        self._save_settings()
+        if backend == BACKEND_REMOTE and not self.settings.remote_configured:
+            self._set_connection("Not configured", COLOR_WARN)
+            self.set_status("Choose Connection... to enter the relay address and API key.")
+            return
+        self.refresh_models()
+
+    def _on_model_selected(self, event=None):
+        model = self.model_var.get().strip()
+        if model:
+            self.settings.remember_model(self.settings.backend, model)
+            self._save_settings()
+
+    def open_connection_dialog(self):
+        if self.generating:
+            return
+        ConnectionDialog(self.root, self.settings, on_save=self._apply_connection_settings)
+
+    def _apply_connection_settings(self, settings):
+        self.settings = settings
+        self.services[BACKEND_REMOTE] = self._remote_from_settings()
+        self._save_settings()
+        self._switch_backend(settings.backend)
+
+    # --------------------------------------------------------- model discovery
     def refresh_models(self):
         if self.generating:
             return
+        service = self.service
+        backend = self.settings.backend
+        if backend == BACKEND_REMOTE and not self.settings.remote_configured:
+            self._set_connection("Not configured", COLOR_WARN)
+            self.set_status("Choose Connection... to enter the relay address and API key.")
+            return
         self.refresh_button.configure(state=tk.DISABLED)
-        self._set_connection("Checking Ollama...", "#555555")
+        self._set_connection("Checking {0}...".format(service.display_name), COLOR_NEUTRAL)
 
         def worker():
             try:
-                models = self.service.list_models()
-                self.events.put(("models", models))
+                models = service.list_models()
+                summary = service.connection_summary()
+                self.events.put(("models", backend, models, summary))
             except Exception as exc:
-                self.events.put(("model_error", exc))
+                self.events.put(("model_error", backend, exc))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _handle_models(self, models):
+    def _handle_models(self, backend, models, summary):
         self.refresh_button.configure(state=tk.NORMAL)
+        if backend != self.settings.backend:
+            return  # the user switched backends while this request was running
         self.model_combo.configure(values=models)
         if not models:
             self.model_var.set("")
-            self._set_connection("Model missing", "#9a6700")
-            self.set_status("Install a local Ollama model, then refresh the list.")
+            self._set_connection("Model missing", COLOR_WARN)
+            self.set_status(self.service.no_models_hint())
             return
-        preferred = self.model_var.get()
-        self.model_var.set(preferred if preferred in models else models[0])
-        self._set_connection("Connected", "#176b32")
+        preferred = self.settings.preferred_model(backend) or self.model_var.get()
+        chosen = preferred if preferred in models else models[0]
+        self.model_var.set(chosen)
+        self.settings.remember_model(backend, chosen)
+        self._save_settings()
+        self._set_connection(summary or "Connected", COLOR_OK)
+        self.set_status(
+            "{0} ready with {1} model{2}. Paste text, choose an editing mode, then "
+            "review suggestions.".format(
+                self.service.display_name.capitalize(),
+                len(models),
+                "" if len(models) == 1 else "s",
+            )
+        )
 
-    def _handle_model_error(self, error):
+    def _handle_model_error(self, backend, error):
         self.refresh_button.configure(state=tk.NORMAL)
+        if backend != self.settings.backend:
+            return
         self.model_combo.configure(values=())
-        self._set_connection("Unavailable", "#9b1c1c")
+        self._set_connection("Unavailable", COLOR_ERROR)
         self.set_status(str(error))
 
+    # -------------------------------------------------------------- generation
     def _get_instruction(self):
         mode = self.mode_var.get()
         if mode == "Translate":
@@ -304,14 +431,16 @@ class EditorApp:
         model = self.model_var.get().strip()
         if not model:
             messagebox.showerror(
-                "Ollama model missing",
-                "No local model is available. Install a model and refresh the list.",
+                "Model missing",
+                "No model is available on the selected backend. "
+                + self.service.no_models_hint(),
             )
             return
         instruction = self._get_instruction()
         if instruction is None:
             return
 
+        service = self.service
         self.active_request_id += 1
         request_id = self.active_request_id
         revision_id = self.revision_id
@@ -319,12 +448,18 @@ class EditorApp:
         self.cancel_event = threading.Event()
         self.generating = True
         self.generation_started_at = time.time()
+        self.generation_label = "{0} via {1}".format(model, service.display_name)
+        self._progress_chars = 0
         self._set_generating_state(True)
+        cancel_event = self.cancel_event
+
+        def on_progress(received):
+            self._progress_chars = received
 
         def worker():
             try:
-                result = self.service.stream_edit(
-                    model, instruction, source, self.cancel_event
+                result = service.stream_edit(
+                    model, instruction, source, cancel_event, on_progress=on_progress
                 )
                 self.events.put(
                     (
@@ -349,15 +484,17 @@ class EditorApp:
         editor_state = tk.DISABLED if generating else tk.NORMAL
         self.text_area.configure(state=editor_state)
         self.model_combo.configure(state="disabled" if generating else "readonly")
+        self.backend_combo.configure(state="disabled" if generating else "readonly")
         self.mode_combo.configure(state="disabled" if generating else "readonly")
         self.refresh_button.configure(state=tk.DISABLED if generating else tk.NORMAL)
+        self.connection_button.configure(state=tk.DISABLED if generating else tk.NORMAL)
         self.review_button.configure(state=tk.DISABLED if generating else tk.NORMAL)
         self.cancel_button.configure(state=tk.NORMAL if generating else tk.DISABLED)
         if generating:
             self.progress.pack(side=tk.LEFT, before=self.status_label)
             self.cancel_button.pack(side=tk.LEFT, padx=6, before=self.status_label)
             self.progress.start(12)
-            self.set_status("Generating review with Ollama...")
+            self.set_status("Generating review with {0}...".format(self.generation_label))
         else:
             self.progress.stop()
             self.progress.pack_forget()
@@ -388,7 +525,9 @@ class EditorApp:
             return
         self._finish_generation()
         if revision_id != self.revision_id:
-            self.set_status("The text changed; the stale Ollama result was discarded.")
+            self.set_status(
+                "The text changed; the stale result from {0} was discarded.".format(model)
+            )
             return
 
         session = build_edit_session(
@@ -403,7 +542,7 @@ class EditorApp:
         if not session.review_items:
             self.current_logger.log_outcome(session, "no changes", source)
             self.current_logger = None
-            self.set_status("Ollama did not suggest any changes.")
+            self.set_status("{0} did not suggest any changes.".format(model))
             messagebox.showinfo("Review complete", "No changes were suggested.")
             return
 
@@ -416,9 +555,13 @@ class EditorApp:
         if request_id != self.active_request_id:
             return
         self._finish_generation()
-        self._set_connection("Unavailable", "#9b1c1c")
+        if isinstance(error, OutputTruncated):
+            title = "Response truncated"
+        else:
+            title = "{0} error".format(self.service.display_name.capitalize())
+            self._set_connection("Unavailable", COLOR_ERROR)
         self.set_status(str(error))
-        messagebox.showerror("Ollama error", str(error))
+        messagebox.showerror(title, str(error))
 
     def _handle_generation_cancelled(self, request_id):
         if request_id != self.active_request_id:
@@ -432,9 +575,9 @@ class EditorApp:
                 event = self.events.get_nowait()
                 kind = event[0]
                 if kind == "models":
-                    self._handle_models(event[1])
+                    self._handle_models(event[1], event[2], event[3])
                 elif kind == "model_error":
-                    self._handle_model_error(event[1])
+                    self._handle_model_error(event[1], event[2])
                 elif kind == "generation_result":
                     self._handle_generation_result(event)
                 elif kind == "generation_error":
@@ -444,16 +587,26 @@ class EditorApp:
         except queue.Empty:
             pass
 
-        if self.generating and self.generation_started_at:
+        if self.generating and self.generation_started_at and not (
+            self.cancel_event and self.cancel_event.is_set()
+        ):
             elapsed = int(time.time() - self.generation_started_at)
+            received = self._progress_chars
+            if received:
+                progress = " · {0} characters received".format(received)
+            else:
+                progress = " · waiting for the first tokens"
             self.set_status(
-                "Generating review with Ollama... {0}s elapsed".format(elapsed)
+                "Generating review with {0}... {1}s elapsed{2}".format(
+                    self.generation_label, elapsed, progress
+                )
             )
         try:
             self.root.after(100, self._poll_events)
         except tk.TclError:
             pass
 
+    # ------------------------------------------------------------------ review
     def apply_review(self, session):
         if session.pending_count:
             self.set_status("Review every pending change before applying.")
@@ -503,4 +656,5 @@ class EditorApp:
     def close(self):
         if self.cancel_event:
             self.cancel_event.set()
+        self._save_settings()
         self.root.destroy()

@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest>=7.0,<8.0
+# Relay / GPU agent test suites under remote/
+aiohttp>=3.9,<4

@@ -8,8 +8,9 @@ __pycache__/
 .venv/
 venv/
 
-# Environment files
+# Environment files and deployment secrets
 .env
+remote/**/.env
 
 # OS files
 .DS_Store
@@ -17,3 +18,4 @@ Thumbs.db
 
 # Runtime artifacts
 TextEnhanceAI-scratchpad_*.md
+TextEnhanceAI-settings.json

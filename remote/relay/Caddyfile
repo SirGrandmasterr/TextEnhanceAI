@@ -1,0 +1,23 @@
+# Caddy front door for the TextEnhanceAI relay.
+# RELAY_DOMAIN comes from .env (e.g. relay.example.com); Caddy obtains and
+# renews the Let's Encrypt certificate automatically. For a plain-HTTP test
+# without a domain, set RELAY_DOMAIN=:80 (no certificate, not for production).
+
+{$RELAY_DOMAIN} {
+	encode zstd gzip
+
+	# Streaming (SSE) responses and the agent WebSocket must not be buffered.
+	reverse_proxy relay:8080 {
+		flush_interval -1
+	}
+
+	header {
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

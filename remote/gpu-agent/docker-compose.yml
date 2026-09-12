@@ -1,0 +1,81 @@
+# TextEnhanceAI GPU server stack: vLLM + the relay agent.
+#
+#   cp .env.example .env      # set RELAY_URL, RELAY_AGENT_KEY, VLLM_MODEL, ...
+#   docker compose up -d --build
+#   docker compose logs -f agent      # "connected to relay", "vLLM ready ..."
+#
+# Nothing here needs an inbound port: the agent dials out to the relay. vLLM is
+# only published on localhost (VLLM_LOCAL_PORT) for local testing.
+
+services:
+  vllm:
+    image: vllm/vllm-openai:${VLLM_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      # Restrict to specific GPUs with e.g. NVIDIA_VISIBLE_DEVICES=0,1 in .env.
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      HF_HOME: /root/.cache/huggingface
+      VLLM_LOGGING_LEVEL: ${VLLM_LOGGING_LEVEL:-INFO}
+    volumes:
+      - ${HF_CACHE_DIR:-hf-cache}:/root/.cache/huggingface
+    ports:
+      - "127.0.0.1:${VLLM_LOCAL_PORT:-8000}:8000"
+    command: >
+      --host 0.0.0.0
+      --port 8000
+      --model ${VLLM_MODEL:?Set VLLM_MODEL in .env}
+      --served-model-name ${VLLM_SERVED_MODEL_NAME:-qwen-27b}
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-32768}
+      --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}
+      --tensor-parallel-size ${VLLM_TENSOR_PARALLEL_SIZE:-1}
+      --max-num-seqs ${VLLM_MAX_NUM_SEQS:-16}
+      ${VLLM_EXTRA_ARGS:-}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: ${VLLM_HEALTH_START_PERIOD:-30m}
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  agent:
+    build: ./agent
+    image: teai-agent:latest
+    restart: unless-stopped
+    depends_on:
+      - vllm
+    environment:
+      RELAY_URL: ${RELAY_URL:?Set RELAY_URL in .env}
+      RELAY_AGENT_KEY: ${RELAY_AGENT_KEY:?Set RELAY_AGENT_KEY in .env}
+      AGENT_NAME: ${AGENT_NAME:-gpu-1}
+      AGENT_MAX_CONCURRENCY: ${AGENT_MAX_CONCURRENCY:-4}
+      AGENT_TLS_VERIFY: ${AGENT_TLS_VERIFY:-true}
+      AGENT_REQUEST_TIMEOUT: ${AGENT_REQUEST_TIMEOUT:-900}
+      AGENT_RECONNECT_MAX_DELAY: ${AGENT_RECONNECT_MAX_DELAY:-30}
+      AGENT_LOG_LEVEL: ${AGENT_LOG_LEVEL:-INFO}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      VLLM_BASE_URL: http://vllm:8000
+      AGENT_HEALTH_PORT: "8090"
+    ports:
+      - "127.0.0.1:${AGENT_LOCAL_PORT:-8090}:8090"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  hf-cache:
