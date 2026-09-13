@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .backend import BackendUnavailable, EditCancelled, OutputTruncated
+from .change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS, classify_change
 from .chunking import (
     DEFAULT_MAX_CHAPTER_CHARS,
     DEFAULT_MAX_CHARS,
@@ -103,7 +104,12 @@ _FENCE = re.compile(r"^\s*```[a-zA-Z]*\s*\n(.*?)\n\s*```\s*$", re.DOTALL)
 # ------------------------------------------------------------------ models
 @dataclass
 class Change:
-    """One word-level edit proposed by a check, anchored in the segment text."""
+    """One word-level edit proposed by a check, anchored in the segment text.
+
+    ``kind`` (see ``change_kinds.CHANGE_KINDS``) describes what the edit does
+    regardless of which check proposed it; it is derived from the two texts
+    whenever it is missing or unknown, so older project files need no upgrade.
+    """
 
     change_id: str
     check: str
@@ -113,6 +119,11 @@ class Change:
     proposed_text: str
     explanation: str = ""
     decision: str = PENDING
+    kind: str = ""
+
+    def __post_init__(self):
+        if self.kind not in CHANGE_KINDS:
+            self.kind = classify_change(self.original_text, self.proposed_text)
 
     @property
     def priority(self):
@@ -128,6 +139,7 @@ class Change:
             "proposed": self.proposed_text,
             "explanation": self.explanation,
             "decision": self.decision,
+            "kind": self.kind,
         }
 
     @classmethod
@@ -136,6 +148,7 @@ class Change:
             data["id"], data["check"], int(data["start"]), int(data["end"]),
             data.get("original", ""), data.get("proposed", ""),
             data.get("explanation", ""), data.get("decision", PENDING),
+            data.get("kind") or "",
         )
 
 
@@ -363,7 +376,12 @@ class Project:
         stats = {
             "segments": 0, "queued": 0, "error": 0, "clean": 0, "ready": 0, "reviewed": 0,
             "tasks_total": 0, "tasks_done": 0, "changes": 0, "accepted": 0, "rejected": 0, "pending": 0,
-            "words": 0, "per_check": {check: {"changes": 0, "accepted": 0, "rejected": 0} for check in CHECKS},
+            "words": 0,
+            "per_check": {
+                check: {"changes": 0, "accepted": 0, "rejected": 0, "by_kind": {kind: 0 for kind in CHANGE_KINDS}}
+                for check in CHECKS
+            },
+            "per_kind": {kind: {"changes": 0, "accepted": 0, "rejected": 0} for kind in CHANGE_KINDS},
         }
         checks = self.options.enabled_checks()
         for _, segment in self.all_segments():
@@ -378,14 +396,20 @@ class Project:
                 if check in segment.results and segment.results[check].status == "done"
             )
             for change in segment.changes(enabled):
+                per_check = stats["per_check"][change.check]
+                per_kind = stats["per_kind"][change.kind]
                 stats["changes"] += 1
-                stats["per_check"][change.check]["changes"] += 1
+                per_check["changes"] += 1
+                per_check["by_kind"][change.kind] += 1
+                per_kind["changes"] += 1
                 if change.decision == ACCEPTED:
                     stats["accepted"] += 1
-                    stats["per_check"][change.check]["accepted"] += 1
+                    per_check["accepted"] += 1
+                    per_kind["accepted"] += 1
                 elif change.decision == REJECTED:
                     stats["rejected"] += 1
-                    stats["per_check"][change.check]["rejected"] += 1
+                    per_check["rejected"] += 1
+                    per_kind["rejected"] += 1
                 else:
                     stats["pending"] += 1
         return stats
@@ -493,6 +517,11 @@ class Project:
             lines.append("  - {0}: {1} proposed, {2} accepted, {3} rejected".format(
                 CHECK_LABELS[check], per["changes"], per["accepted"], per["rejected"]
             ))
+            if per["changes"]:
+                lines.append("    - by kind: " + ", ".join(
+                    "{0} {1}".format(CHANGE_KIND_LABELS[kind].lower(), per["by_kind"][kind])
+                    for kind in CHANGE_KINDS if per["by_kind"][kind]
+                ))
         lines.append("")
         for chapter in self.chapters:
             lines.append("## {0}. {1}\n".format(chapter.index, chapter.title))
