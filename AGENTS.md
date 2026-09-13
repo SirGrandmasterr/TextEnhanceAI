@@ -4,7 +4,8 @@
 - Root files: `TextEnhanceAI.py` (main app), `README.md`, `LICENSE`, screenshots `TextEnhanceAI-*.png`.
 - Runtime artifacts: scratchpads `TextEnhanceAI-scratchpad_*.md` are generated next to the script.
 - `core/` holds editing logic and model backends (`backend.py` contract, `ollama_service.py`, `remote_service.py`, `settings.py`), manuscript splitting (`chunking.py`) and the automatic review model, runner and persistence (`workflow.py`); `ui/` holds Tkinter screens (`app.py`, `review_panel.py`, `connection_dialog.py`, `workflow_screen.py`) and the shared `theme.py`. Keep Tk out of `core/` so it stays testable.
-- `scripts/` holds developer tools that are not part of the app (`record_responses.py` records model answers for the recorded-response tests).
+- `locales/<code>.json` holds UI translations (flat English-source → translation maps).
+- `scripts/` holds developer tools that are not part of the app (`record_responses.py` records model answers for the recorded-response tests, `extract_strings.py` lists untranslated UI strings).
 - `remote/` holds the self-hosted relay (`remote/relay`, runs on a public server) and the GPU stack (`remote/gpu-agent`, vLLM + agent). Each is a self-contained Docker Compose deployment; the wire protocol is in `remote/PROTOCOL.md`.
 
 ## Build, Test, and Development Commands
@@ -21,6 +22,7 @@
 - Docstrings: short summary + key args/returns where useful.
 - UI labeling: keep button text concise; tooltips explain behavior.
 - Prompts: extend the `PROMPTS` dict; avoid duplicating strings across the UI.
+- UI strings: wrap user-visible text in `tr()` from `ui/i18n.py` with named placeholders (`tr("Connecting to {url} ...", url=url)`), never positional `{0}`. `ui/connection_dialog.py` is the worked example; the other screens are still unwrapped. `python scripts/extract_strings.py de` lists strings missing from `locales/de.json` (`--update` adds empty keys). The language comes from `AppSettings.ui_language` (`auto|en|de`, env `TEAI_LANG`) and is applied once at start-up, so changes need a restart.
 
 ## Testing Guidelines
 - Run `pytest -q` from the repository root; it collects `tests/` (desktop), `remote/relay/tests`, `remote/gpu-agent/tests`, and `remote/tests` (end-to-end with a fake vLLM).

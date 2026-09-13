@@ -5,11 +5,16 @@ import tkinter as tk
 from tkinter import ttk
 
 from core.remote_service import RemoteService, normalise_api_key
-from core.settings import BACKEND_LABELS, BACKEND_OLLAMA, BACKEND_REMOTE
+from core.settings import BACKEND_LABELS, BACKEND_OLLAMA, BACKEND_REMOTE, UI_LANGUAGES
+from .i18n import LANGUAGE_LABELS, tr
 
 
 class ConnectionDialog(tk.Toplevel):
-    """Edit backend/relay settings with a live connection test."""
+    """Edit backend/relay settings with a live connection test, plus UI preferences.
+
+    Strings in this dialog are wrapped in ``tr()`` as the worked example for
+    localisation; the other screens follow later.
+    """
 
     def __init__(self, parent, settings, on_save, remote_factory=None):
         super().__init__(parent)
@@ -17,7 +22,7 @@ class ConnectionDialog(tk.Toplevel):
         self.on_save = on_save
         self.remote_factory = remote_factory or self._default_remote_factory
         self._test_token = 0
-        self.title("Connection settings")
+        self.title(tr("Connection settings"))
         self.transient(parent)
         self.resizable(False, False)
         self._build_widgets()
@@ -49,50 +54,46 @@ class ConnectionDialog(tk.Toplevel):
         body = ttk.Frame(self, padding=12)
         body.pack(fill=tk.BOTH, expand=True)
 
-        backend_box = ttk.LabelFrame(body, text="Where should the model run?", padding=8)
+        backend_box = ttk.LabelFrame(body, text=tr("Where should the model run?"), padding=8)
         backend_box.pack(fill=tk.X)
         self.backend_var = tk.StringVar(value=self.settings.backend)
         ttk.Radiobutton(
             backend_box,
-            text="{0} — models installed on this computer".format(
-                BACKEND_LABELS[BACKEND_OLLAMA]
-            ),
+            text=tr("{backend} — models installed on this computer", backend=BACKEND_LABELS[BACKEND_OLLAMA]),
             value=BACKEND_OLLAMA,
             variable=self.backend_var,
             command=self._update_remote_state,
         ).pack(anchor="w")
         ttk.Radiobutton(
             backend_box,
-            text="{0} — a GPU server reached through your relay".format(
-                BACKEND_LABELS[BACKEND_REMOTE]
-            ),
+            text=tr("{backend} — a GPU server reached through your relay", backend=BACKEND_LABELS[BACKEND_REMOTE]),
             value=BACKEND_REMOTE,
             variable=self.backend_var,
             command=self._update_remote_state,
         ).pack(anchor="w")
 
-        self.remote_box = ttk.LabelFrame(body, text="Remote relay", padding=8)
+        self.remote_box = ttk.LabelFrame(body, text=tr("Remote relay"), padding=8)
         self.remote_box.pack(fill=tk.X, pady=(10, 0))
         self.remote_box.columnconfigure(1, weight=1)
 
-        ttk.Label(self.remote_box, text="Relay URL:").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.remote_box, text=tr("Relay URL:")).grid(row=0, column=0, sticky="w")
         self.url_var = tk.StringVar(value=self.settings.remote_url)
         self.url_entry = ttk.Entry(self.remote_box, textvariable=self.url_var, width=46)
         self.url_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(6, 0))
 
-        ttk.Label(self.remote_box, text="API key:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(self.remote_box, text=tr("API key:")).grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.key_var = tk.StringVar(value=self.settings.remote_api_key)
         self.key_entry = ttk.Entry(self.remote_box, textvariable=self.key_var, show="•", width=36)
         self.key_entry.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(6, 0))
         self.show_key_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             self.remote_box,
-            text="Show",
+            text=tr("Show"),
             variable=self.show_key_var,
             command=self._toggle_key_visibility,
         ).grid(row=1, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
 
-        ttk.Label(self.remote_box, text="Max output tokens:").grid(
+        ttk.Label(self.remote_box, text=tr("Max output tokens:")).grid(
             row=2, column=0, sticky="w", pady=(6, 0)
         )
         self.max_tokens_var = tk.StringVar(value=str(self.settings.remote_max_tokens))
@@ -109,14 +110,14 @@ class ConnectionDialog(tk.Toplevel):
         self.thinking_var = tk.BooleanVar(value=self.settings.remote_enable_thinking)
         self.thinking_check = ttk.Checkbutton(
             self.remote_box,
-            text="Allow the model to think before answering (slower, may improve quality)",
+            text=tr("Allow the model to think before answering (slower, may improve quality)"),
             variable=self.thinking_var,
         )
         self.thinking_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         test_row = ttk.Frame(self.remote_box)
         test_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        self.test_button = ttk.Button(test_row, text="Test connection", command=self.test_connection)
+        self.test_button = ttk.Button(test_row, text=tr("Test connection"), command=self.test_connection)
         self.test_button.pack(side=tk.LEFT)
         self.test_status_var = tk.StringVar(value="")
         self.test_status_label = ttk.Label(test_row, textvariable=self.test_status_var, wraplength=360)
@@ -134,9 +135,29 @@ class ConnectionDialog(tk.Toplevel):
         )
         self.details.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(6, 0))
 
+        preferences = ttk.LabelFrame(body, text=tr("Preferences"), padding=8)
+        preferences.pack(fill=tk.X, pady=(10, 0))
+        preferences.columnconfigure(1, weight=1)
+        ttk.Label(preferences, text=tr("Language:")).grid(row=0, column=0, sticky="w")
+        self._language_codes = [code for code in UI_LANGUAGES if code in LANGUAGE_LABELS]
+        self.language_var = tk.StringVar(value=self._language_label(self.settings.ui_language))
+        self.language_combo = ttk.Combobox(
+            preferences,
+            textvariable=self.language_var,
+            values=[self._language_label(code) for code in self._language_codes],
+            state="readonly",
+            width=14,
+        )
+        self.language_combo.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self.language_combo.bind("<<ComboboxSelected>>", self._on_language_selected)
+        self.language_status_var = tk.StringVar(value="")
+        ttk.Label(preferences, textvariable=self.language_status_var, foreground="#555555").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+
         ttk.Label(
             body,
-            text=(
+            text=tr(
                 "Settings are saved next to the application in "
                 "TextEnhanceAI-settings.json (the API key is stored in plain text)."
             ),
@@ -146,11 +167,31 @@ class ConnectionDialog(tk.Toplevel):
 
         buttons = ttk.Frame(body)
         buttons.pack(fill=tk.X, pady=(12, 0))
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
-        self.save_button = ttk.Button(buttons, text="Save", command=self.save, style="Primary.TButton")
+        ttk.Button(buttons, text=tr("Cancel"), command=self.destroy).pack(side=tk.RIGHT)
+        self.save_button = ttk.Button(buttons, text=tr("Save"), command=self.save, style="Primary.TButton")
         self.save_button.pack(side=tk.RIGHT, padx=(0, 6))
 
     # --------------------------------------------------------------- actions
+    def _language_label(self, code):
+        # Language names are shown in their own language, so they are not translated.
+        return LANGUAGE_LABELS.get(code) or LANGUAGE_LABELS[self._language_codes[0]]
+
+    def _selected_language(self):
+        label = self.language_var.get()
+        for code in self._language_codes:
+            if self._language_label(code) == label:
+                return code
+        return self.settings.ui_language
+
+    def _on_language_selected(self, event=None):
+        """Persist the language immediately; it takes effect after a restart."""
+        code = self._selected_language()
+        if code == self.settings.ui_language:
+            return
+        self.settings.ui_language = code
+        error = self.settings.save()
+        self.language_status_var.set(error or tr("Restart TextEnhanceAI to apply the language."))
+
     def _toggle_key_visibility(self):
         self.key_entry.configure(show="" if self.show_key_var.get() else "•")
 
@@ -199,12 +240,12 @@ class ConnectionDialog(tk.Toplevel):
     def test_connection(self):
         url = self.url_var.get().strip()
         if not url:
-            self.test_status_var.set("Enter the relay URL first.")
+            self.test_status_var.set(tr("Enter the relay URL first."))
             return
         self._test_token += 1
         token = self._test_token
         self.test_button.configure(state=tk.DISABLED)
-        self.test_status_var.set("Connecting to {0} ...".format(url))
+        self.test_status_var.set(tr("Connecting to {url} ...", url=url))
         self._set_details("")
 
         def worker():
@@ -248,7 +289,7 @@ class ConnectionDialog(tk.Toplevel):
         backend = self.backend_var.get()
         url = self.url_var.get().strip()
         if backend == BACKEND_REMOTE and not url:
-            self.test_status_var.set("Enter the relay URL before saving.")
+            self.test_status_var.set(tr("Enter the relay URL before saving."))
             self.test_status_label.configure(foreground="#9b1c1c")
             return
         self.settings.backend = backend
@@ -264,27 +305,28 @@ def describe_status(status, models):
     """Render a compact multi-line description of a relay status document."""
     lines = []
     if models:
-        lines.append("Models: " + ", ".join(models))
+        lines.append(tr("Models: {models}", models=", ".join(models)))
     else:
-        lines.append("Models: none available yet")
+        lines.append(tr("Models: none available yet"))
     agents = (status or {}).get("agents") or []
     if not agents:
         if status is None:
-            lines.append("The server did not expose /status (plain OpenAI-compatible endpoint).")
+            lines.append(tr("The server did not expose /status (plain OpenAI-compatible endpoint)."))
         else:
-            lines.append("GPU agents: none connected")
+            lines.append(tr("GPU agents: none connected"))
     for agent in agents:
         parts = [agent.get("name", "agent"), agent.get("state", "unknown")]
         in_flight = agent.get("in_flight")
         if in_flight is not None:
-            parts.append("{0}/{1} busy".format(in_flight, agent.get("max_concurrency", "?")))
+            parts.append(tr("{busy}/{limit} busy", busy=in_flight, limit=agent.get("max_concurrency", "?")))
         agent_models = agent.get("models") or []
         if agent_models:
             parts.append(", ".join(str(m.get("id", m)) if isinstance(m, dict) else str(m) for m in agent_models))
-        lines.append("Agent: " + " · ".join(str(part) for part in parts))
+        lines.append(tr("Agent: {details}", details=" · ".join(str(part) for part in parts)))
     relay = (status or {}).get("relay") or {}
     if relay.get("version"):
-        lines.append("Relay version {0}, {1} requests served".format(
-            relay.get("version"), relay.get("requests_total", 0)
+        lines.append(tr(
+            "Relay version {version}, {count} requests served",
+            version=relay.get("version"), count=relay.get("requests_total", 0),
         ))
     return "\n".join(lines)
