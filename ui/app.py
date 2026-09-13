@@ -12,8 +12,8 @@ from core.backend import EditCancelled, OutputTruncated
 from core.diff_engine import build_edit_session, render_reviewed_text
 from core.ollama_service import OllamaService
 from core.prompts import EDITING_MODES, PROMPTS, build_instruction
-from core.remote_service import RemoteService
 from core.scratchpad import ScratchpadLogger
+from core.services import build_service
 from core.settings import (
     BACKEND_LABELS,
     BACKEND_OLLAMA,
@@ -84,12 +84,7 @@ class EditorApp:
 
     # --------------------------------------------------------------- services
     def _remote_from_settings(self):
-        return RemoteService(
-            self.settings.remote_url,
-            self.settings.remote_api_key,
-            max_tokens=self.settings.remote_max_tokens,
-            enable_thinking=self.settings.remote_enable_thinking,
-        )
+        return build_service(self.settings, BACKEND_REMOTE)
 
     def _configure_style(self):
         apply_theme(self.root)
