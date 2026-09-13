@@ -83,18 +83,13 @@ class OllamaService:
                 names.append(str(name))
         return sorted(set(names))
 
-    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None):
-        """Return an edited document while honoring a cancellation event.
-
-        ``on_progress`` (optional) receives the number of characters received
-        so far and is called from the worker thread.
-        """
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None):
+        """Stream one chat completion and return its text, honoring cancellation."""
         if self.client is None:
             raise OllamaUnavailable("The Ollama Python package is not installed.")
         if cancel_event.is_set():
             raise EditCancelled("Editing was cancelled.")
 
-        messages = build_messages(instruction, text)
         done_reason = None
         try:
             stream = self.client.chat(
@@ -102,7 +97,7 @@ class OllamaService:
                 messages=messages,
                 stream=True,
                 options={
-                    "num_predict": self.max_tokens,
+                    "num_predict": max_tokens or self.max_tokens,
                     "temperature": TEMPERATURE,
                     "top_p": TOP_P,
                 },
@@ -134,11 +129,23 @@ class OllamaService:
         except EditCancelled:
             raise
         except Exception as exc:
+            if cancel_event.is_set():
+                raise EditCancelled("Editing was cancelled.")
             raise OllamaUnavailable("Ollama could not complete the edit: {0}".format(exc)) from exc
 
         if done_reason == "length":
             raise OutputTruncated(truncated_message(model))
-        result = strip_thinking("".join(chunks))
+        return strip_thinking("".join(chunks))
+
+    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None):
+        """Return an edited document while honoring a cancellation event.
+
+        ``on_progress`` (optional) receives the number of characters received
+        so far and is called from the worker thread.
+        """
+        result = self.generate(
+            model, build_messages(instruction, text), cancel_event, on_progress=on_progress
+        )
         if not result.strip():
             raise OllamaUnavailable("Ollama returned an empty response.")
         return result

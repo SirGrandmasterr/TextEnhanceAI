@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 - Root files: `TextEnhanceAI.py` (main app), `README.md`, `LICENSE`, screenshots `TextEnhanceAI-*.png`.
 - Runtime artifacts: scratchpads `TextEnhanceAI-scratchpad_*.md` are generated next to the script.
-- `core/` holds editing logic and model backends (`backend.py` contract, `ollama_service.py`, `remote_service.py`, `settings.py`); `ui/` holds Tkinter screens (`app.py`, `review_panel.py`, `connection_dialog.py`).
+- `core/` holds editing logic and model backends (`backend.py` contract, `ollama_service.py`, `remote_service.py`, `settings.py`), manuscript splitting (`chunking.py`) and the automatic review model, runner and persistence (`workflow.py`); `ui/` holds Tkinter screens (`app.py`, `review_panel.py`, `connection_dialog.py`, `workflow_screen.py`) and the shared `theme.py`. Keep Tk out of `core/` so it stays testable.
 - `remote/` holds the self-hosted relay (`remote/relay`, runs on a public server) and the GPU stack (`remote/gpu-agent`, vLLM + agent). Each is a self-contained Docker Compose deployment; the wire protocol is in `remote/PROTOCOL.md`.
 
 ## Build, Test, and Development Commands

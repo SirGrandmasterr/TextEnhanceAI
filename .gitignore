@@ -19,3 +19,6 @@ Thumbs.db
 # Runtime artifacts
 TextEnhanceAI-scratchpad_*.md
 TextEnhanceAI-settings.json
+
+# Automatic-review projects (live next to the manuscript)
+*.teai/

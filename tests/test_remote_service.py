@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from core.backend import EditCancelled, OutputTruncated, strip_thinking
-from core.remote_service import RemoteService, RemoteUnavailable, build_ssl_context
+from core.remote_service import RemoteService, RemoteUnavailable, build_ssl_context, normalise_api_key
 
 
 def sse(event):
@@ -291,3 +291,40 @@ def test_ssl_context_verifies_hostnames_and_has_trust_anchors():
     assert context.check_hostname is True
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert len(context.get_ca_certs()) > 0
+
+
+def test_pasted_bearer_prefix_is_stripped_from_api_key(relay):
+    assert normalise_api_key("  Bearer secret ") == "secret"
+    assert normalise_api_key("bearer secret") == "secret"
+    assert RemoteService(relay.url, "Bearer secret").list_models()
+
+
+def test_internal_http_client_failure_after_cancel_is_reported_as_cancelled(relay, monkeypatch):
+    """Regression: tearing the socket down mid-read used to surface http.client's
+    "'NoneType' object has no attribute 'close'" instead of EditCancelled."""
+    relay.mode = "slow"
+    service = RemoteService(relay.url, "secret")
+    cancel = threading.Event()
+    original_iter = RemoteService._iter_sse_events
+
+    def flaky_iter(response):
+        for payload in original_iter(response):
+            yield payload
+            cancel.set()
+            raise AttributeError("'NoneType' object has no attribute 'close'")
+
+    monkeypatch.setattr(RemoteService, "_iter_sse_events", staticmethod(flaky_iter))
+    with pytest.raises(EditCancelled):
+        service.stream_edit("qwen-27b", "i", "t", cancel)
+
+
+def test_generate_returns_raw_text_for_custom_messages(relay):
+    service = RemoteService(relay.url, "secret")
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+
+    result = service.generate("qwen-27b", messages, threading.Event(), max_tokens=99)
+
+    assert result == "Edited text."
+    body = relay.requests[-1][3]
+    assert body["messages"] == messages
+    assert body["max_tokens"] == 99

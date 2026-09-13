@@ -32,6 +32,14 @@ DEFAULT_TIMEOUT = 120  # seconds per blocking socket operation; relay keeps aliv
 _SERVER_AUTH_OID = "1.3.6.1.5.5.7.3.1"
 
 
+def normalise_api_key(value):
+    """Strip whitespace and a pasted ``Bearer`` prefix from an API key."""
+    key = (value or "").strip()
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
+    return key
+
+
 def build_ssl_context():
     """Return a verifying TLS context that ignores stale intermediates on Windows.
 
@@ -77,7 +85,7 @@ class RemoteService:
         timeout=DEFAULT_TIMEOUT,
     ):
         self.base_url = (base_url or "").strip()
-        self.api_key = (api_key or "").strip()
+        self.api_key = normalise_api_key(api_key)
         self.max_tokens = max_tokens
         self.enable_thinking = enable_thinking
         self.timeout = timeout
@@ -267,12 +275,12 @@ class RemoteService:
         return "The connected GPU agent reports no models. Check the vLLM logs."
 
     # ------------------------------------------------------------- generation
-    def _build_request(self, model, instruction, text):
+    def _build_request(self, model, messages, max_tokens=None):
         return {
             "model": model,
-            "messages": build_messages(instruction, text),
+            "messages": messages,
             "stream": True,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens or self.max_tokens,
             "temperature": TEMPERATURE,
             "top_p": TOP_P,
             # Honoured by vLLM/SGLang/llama.cpp; ignored by servers without templates.
@@ -288,7 +296,12 @@ class RemoteService:
         once it knows the response will close the connection.
         """
 
-        def close_connection():
+        def shutdown_sockets():
+            # Only shut the socket down: closing the connection object from
+            # here would also close the response's file object underneath the
+            # reading thread (http.client then fails with "'NoneType' object
+            # has no attribute 'close'"). A shutdown unblocks the read and the
+            # worker cleans up itself.
             sockets = [getattr(conn, "sock", None)] + list(sock_holder)
             for sock in sockets:
                 if sock is None:
@@ -297,17 +310,13 @@ class RemoteService:
                     sock.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
-            try:
-                conn.close()
-            except Exception:  # pragma: no cover - best effort
-                pass
 
         def watch():
             while not done_event.is_set():
                 if cancel_event.wait(0.2):
-                    close_connection()
-                    # http.client re-opens a closed socket on the next request,
-                    # so keep closing until the worker acknowledges the cancel.
+                    shutdown_sockets()
+                    # The socket may not exist yet (request still connecting);
+                    # keep trying until the worker acknowledges the cancel.
                     done_event.wait(0.2)
 
         thread = threading.Thread(target=watch, daemon=True)
@@ -332,13 +341,13 @@ class RemoteService:
         if data_lines:
             yield "\n".join(data_lines)
 
-    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None):
-        """Return the edited document, honoring cancellation mid-stream."""
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None):
+        """Stream one chat completion and return its text, honoring cancellation."""
         self._require_config()
         if cancel_event.is_set():
             raise EditCancelled("Editing was cancelled.")
 
-        body = json.dumps(self._build_request(model, instruction, text)).encode("utf-8")
+        body = json.dumps(self._build_request(model, messages, max_tokens)).encode("utf-8")
         conn = self._connect()
         done_event = threading.Event()
         sock_holder = []
@@ -381,10 +390,17 @@ class RemoteService:
                                 on_progress(received)
                         if choice.get("finish_reason"):
                             finish_reason = choice["finish_reason"]
-            except (OSError, http.client.HTTPException) as exc:
+            except (EditCancelled, RemoteUnavailable):
+                raise
+            except Exception as exc:
+                # After a cancel the watcher tore the socket down, so any
+                # failure here (OSError, IncompleteRead, http.client internals)
+                # simply means "cancelled".
                 if cancel_event.is_set():
                     raise EditCancelled("Editing was cancelled.")
-                raise RemoteUnavailable(self._describe_transport_error(exc)) from exc
+                if isinstance(exc, (OSError, http.client.HTTPException)):
+                    raise RemoteUnavailable(self._describe_transport_error(exc)) from exc
+                raise RemoteUnavailable("The relay stream failed: {0!r}".format(exc)) from exc
         finally:
             done_event.set()
             try:
@@ -396,7 +412,13 @@ class RemoteService:
             raise EditCancelled("Editing was cancelled.")
         if finish_reason == "length":
             raise OutputTruncated(truncated_message(model))
-        result = strip_thinking("".join(chunks))
+        return strip_thinking("".join(chunks))
+
+    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None):
+        """Return the edited document, honoring cancellation mid-stream."""
+        result = self.generate(
+            model, build_messages(instruction, text), cancel_event, on_progress=on_progress
+        )
         if not result.strip():
             raise RemoteUnavailable("The remote model returned an empty response.")
         return result

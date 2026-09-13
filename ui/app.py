@@ -23,11 +23,15 @@ from core.settings import (
 )
 from .connection_dialog import ConnectionDialog
 from .review_panel import ReviewPanel
+from .theme import PALETTE, apply_theme, font, style_text
+from .workflow_screen import WorkflowScreen
 
-COLOR_OK = "#176b32"
-COLOR_WARN = "#9a6700"
-COLOR_ERROR = "#9b1c1c"
-COLOR_NEUTRAL = "#555555"
+COLOR_OK = PALETTE["success"]
+COLOR_WARN = PALETTE["warning"]
+COLOR_ERROR = PALETTE["danger"]
+COLOR_NEUTRAL = PALETTE["header_muted"]
+MODE_QUICK = "quick"
+MODE_AUTO = "auto"
 
 
 class EditorApp:
@@ -62,10 +66,12 @@ class EditorApp:
         self.current_logger = None
         self.last_applied_source = None
         self._suppress_modified = False
+        self.mode = MODE_QUICK
+        self._controls_locked = False
 
-        self.root.title("TextEnhanceAI Editor - V 0.13")
-        self.root.geometry("960x720")
-        self.root.minsize(820, 600)
+        self.root.title("TextEnhanceAI - V 0.13")
+        self.root.geometry("1120x780")
+        self.root.minsize(900, 640)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self._configure_style()
@@ -86,17 +92,36 @@ class EditorApp:
         )
 
     def _configure_style(self):
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("vista")
-        except tk.TclError:
-            pass
-        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"))
+        apply_theme(self.root)
 
     def _build_interface(self):
-        top_bar = ttk.Frame(self.root, padding=(8, 8, 8, 4))
-        top_bar.grid(row=0, column=0, sticky="ew")
-        ttk.Label(top_bar, text="Backend:").pack(side=tk.LEFT)
+        header = ttk.Frame(self.root, style="Header.TFrame", padding=(14, 8))
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text="TextEnhanceAI", style="Header.TLabel").pack(side=tk.LEFT)
+        ttk.Label(header, text="local & remote LLM editing", style="HeaderMuted.TLabel").pack(
+            side=tk.LEFT, padx=(8, 18), pady=(3, 0)
+        )
+        self.mode_buttons = {}
+        for mode, label in ((MODE_QUICK, "Quick edit"), (MODE_AUTO, "Automatic review")):
+            button = ttk.Button(
+                header, text=label, style="Nav.TButton", command=lambda m=mode: self.switch_mode(m)
+            )
+            button.pack(side=tk.LEFT, padx=(0, 4))
+            self.mode_buttons[mode] = button
+        self.connection_var = tk.StringVar(value="Checking...")
+        self.connection_label = tk.Label(
+            header,
+            textvariable=self.connection_var,
+            anchor="e",
+            font=font(9, "bold"),
+            background=PALETTE["header"],
+            foreground=PALETTE["header_muted"],
+        )
+        self.connection_label.pack(side=tk.RIGHT)
+
+        top_bar = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(12, 6))
+        top_bar.grid(row=1, column=0, sticky="ew")
+        ttk.Label(top_bar, text="Backend", style="Toolbar.TLabel").pack(side=tk.LEFT)
         self.backend_var = tk.StringVar(value=BACKEND_LABELS[self.settings.backend])
         self.backend_combo = ttk.Combobox(
             top_bar,
@@ -105,10 +130,10 @@ class EditorApp:
             width=18,
             values=[BACKEND_LABELS[key] for key in (BACKEND_OLLAMA, BACKEND_REMOTE)],
         )
-        self.backend_combo.pack(side=tk.LEFT, padx=(5, 10))
+        self.backend_combo.pack(side=tk.LEFT, padx=(6, 14))
         self.backend_combo.bind("<<ComboboxSelected>>", self._on_backend_selected)
 
-        ttk.Label(top_bar, text="Model:").pack(side=tk.LEFT)
+        ttk.Label(top_bar, text="Model", style="Toolbar.TLabel").pack(side=tk.LEFT)
         self.model_var = tk.StringVar(value=self.settings.preferred_model())
         self.model_combo = ttk.Combobox(
             top_bar,
@@ -117,7 +142,7 @@ class EditorApp:
             width=30,
             values=(self.model_var.get(),) if self.model_var.get() else (),
         )
-        self.model_combo.pack(side=tk.LEFT, padx=(5, 6))
+        self.model_combo.pack(side=tk.LEFT, padx=(6, 6))
         self.model_combo.bind("<<ComboboxSelected>>", self._on_model_selected)
         self.refresh_button = ttk.Button(
             top_bar, text="Refresh models", command=self.refresh_models
@@ -127,36 +152,22 @@ class EditorApp:
             top_bar, text="Connection...", command=self.open_connection_dialog
         )
         self.connection_button.pack(side=tk.LEFT, padx=(6, 0))
-        self.connection_var = tk.StringVar(value="Checking...")
-        self.connection_label = tk.Label(
-            top_bar,
-            textvariable=self.connection_var,
-            anchor="e",
-            font=("Segoe UI", 9, "bold"),
-        )
-        self.connection_label.pack(side=tk.RIGHT)
 
         self.content = ttk.Frame(self.root)
-        self.content.grid(row=1, column=0, sticky="nsew")
+        self.content.grid(row=2, column=0, sticky="nsew")
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, weight=1)
 
-        self.editor_frame = ttk.Frame(self.content, padding=(8, 4, 8, 4))
+        self.editor_frame = ttk.Frame(self.content, padding=(12, 10, 12, 4))
         self.editor_frame.pack(fill=tk.BOTH, expand=True)
         editor_heading = ttk.Label(
             self.editor_frame,
             text="Text to improve",
-            font=("Segoe UI", 11, "bold"),
+            style="Title.TLabel",
         )
-        editor_heading.grid(row=0, column=0, sticky="w", pady=(0, 4))
-        self.text_area = scrolledtext.ScrolledText(
-            self.editor_frame,
-            wrap=tk.WORD,
-            undo=True,
-            font=("Segoe UI", 11),
-            padx=8,
-            pady=8,
-        )
+        editor_heading.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.text_area = scrolledtext.ScrolledText(self.editor_frame, undo=True)
+        style_text(self.text_area, size=11)
         self.text_area.grid(row=1, column=0, sticky="nsew")
         self.text_area.bind("<<Modified>>", self._on_text_modified)
         self.editor_frame.columnconfigure(0, weight=1)
@@ -208,9 +219,11 @@ class EditorApp:
             on_back=self.discard_review,
             on_status=self.set_status,
         )
+        self.workflow_screen = WorkflowScreen(self.content, host=self)
+        self._update_mode_buttons()
 
-        bottom = ttk.Frame(self.root, padding=(8, 4, 8, 8))
-        bottom.grid(row=2, column=0, sticky="ew")
+        bottom = ttk.Frame(self.root, padding=(12, 6, 12, 8))
+        bottom.grid(row=3, column=0, sticky="ew")
         self.progress = ttk.Progressbar(bottom, mode="indeterminate", length=160)
         self.progress.pack(side=tk.LEFT)
         self.cancel_button = ttk.Button(
@@ -220,7 +233,7 @@ class EditorApp:
         self.status_var = tk.StringVar(
             value="Paste text, choose an editing mode, then review suggestions."
         )
-        self.status_label = ttk.Label(bottom, textvariable=self.status_var, anchor="w")
+        self.status_label = ttk.Label(bottom, textvariable=self.status_var, anchor="w", style="Status.TLabel")
         self.status_label.pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=6
         )
@@ -236,11 +249,18 @@ class EditorApp:
         self.root.bind_all("<Alt-KeyPress-R>", self._reject_shortcut)
         self.root.bind_all("<Alt-Left>", self._previous_shortcut)
         self.root.bind_all("<Alt-Right>", self._next_shortcut)
+        self.root.bind_all("<Alt-Up>", self._up_shortcut)
+        self.root.bind_all("<Alt-Down>", self._down_shortcut)
 
     def _in_review(self):
         return bool(self.current_session)
 
+    def _in_auto(self):
+        return self.mode == MODE_AUTO
+
     def _primary_shortcut(self, event=None):
+        if self._in_auto():
+            return None
         if self._in_review():
             if self.current_session.pending_count == 0:
                 self.apply_review(self.current_session)
@@ -249,24 +269,87 @@ class EditorApp:
         return "break"
 
     def _accept_shortcut(self, event=None):
+        if self._in_auto():
+            return self.workflow_screen.accept_current(event)
         if self._in_review():
             return self.review_panel.accept_current(event)
         return None
 
     def _reject_shortcut(self, event=None):
+        if self._in_auto():
+            return self.workflow_screen.reject_current(event)
         if self._in_review():
             return self.review_panel.reject_current(event)
         return None
 
     def _previous_shortcut(self, event=None):
+        if self._in_auto():
+            return self.workflow_screen.previous(event)
         if self._in_review():
             return self.review_panel.previous(event)
         return None
 
     def _next_shortcut(self, event=None):
+        if self._in_auto():
+            return self.workflow_screen.next(event)
         if self._in_review():
             return self.review_panel.next(event)
         return None
+
+    def _up_shortcut(self, event=None):
+        if self._in_auto():
+            return self.workflow_screen.select_previous_change(event)
+        return None
+
+    def _down_shortcut(self, event=None):
+        if self._in_auto():
+            return self.workflow_screen.select_next_change(event)
+        return None
+
+    # ------------------------------------------------------------- modes
+    def switch_mode(self, mode):
+        if mode == self.mode:
+            return
+        self.mode = mode
+        if mode == MODE_AUTO:
+            self.editor_frame.pack_forget()
+            self.review_panel.pack_forget()
+            self.workflow_screen.pack(fill=tk.BOTH, expand=True)
+            if not self.workflow_screen.active:
+                self.workflow_screen.start_view.refresh_defaults(self)
+        else:
+            self.workflow_screen.pack_forget()
+            if self.current_session:
+                self.review_panel.pack(fill=tk.BOTH, expand=True)
+            else:
+                self.editor_frame.pack(fill=tk.BOTH, expand=True)
+        self._update_mode_buttons()
+
+    def _update_mode_buttons(self):
+        for mode, button in self.mode_buttons.items():
+            button.configure(style="NavActive.TButton" if mode == self.mode else "Nav.TButton")
+
+    # ------------------------------------------------ host API for screens
+    def get_service(self):
+        return self.service
+
+    def get_model(self):
+        return self.model_var.get().strip()
+
+    def backend_id(self):
+        return self.settings.backend
+
+    def lock_controls(self, locked):
+        """Freeze backend/model selection while a project evaluation runs."""
+        self._controls_locked = bool(locked)
+        self._update_control_states()
+
+    def _update_control_states(self):
+        busy = self.generating or self._controls_locked
+        self.model_combo.configure(state="disabled" if busy else "readonly")
+        self.backend_combo.configure(state="disabled" if busy else "readonly")
+        self.refresh_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        self.connection_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
 
     def _on_text_modified(self, event=None):
         if self._suppress_modified:
@@ -297,7 +380,12 @@ class EditorApp:
 
     def _set_connection(self, message, color):
         self.connection_var.set(message)
-        self.connection_label.configure(foreground=color)
+        header_colors = {
+            COLOR_OK: "#7ee2a8",
+            COLOR_WARN: "#ffd27a",
+            COLOR_ERROR: "#ff9b8f",
+        }
+        self.connection_label.configure(foreground=header_colors.get(color, PALETTE["header_muted"]))
 
     # ------------------------------------------------------- backend switching
     def _save_settings(self):
@@ -314,7 +402,7 @@ class EditorApp:
         self._switch_backend(backend)
 
     def _switch_backend(self, backend):
-        if self.generating:
+        if self.generating or self._controls_locked:
             self.backend_var.set(BACKEND_LABELS[self.settings.backend])
             return
         self.settings.backend = backend
@@ -336,7 +424,7 @@ class EditorApp:
             self._save_settings()
 
     def open_connection_dialog(self):
-        if self.generating:
+        if self.generating or self._controls_locked:
             return
         ConnectionDialog(self.root, self.settings, on_save=self._apply_connection_settings)
 
@@ -483,11 +571,8 @@ class EditorApp:
         self.generating = generating
         editor_state = tk.DISABLED if generating else tk.NORMAL
         self.text_area.configure(state=editor_state)
-        self.model_combo.configure(state="disabled" if generating else "readonly")
-        self.backend_combo.configure(state="disabled" if generating else "readonly")
         self.mode_combo.configure(state="disabled" if generating else "readonly")
-        self.refresh_button.configure(state=tk.DISABLED if generating else tk.NORMAL)
-        self.connection_button.configure(state=tk.DISABLED if generating else tk.NORMAL)
+        self._update_control_states()
         self.review_button.configure(state=tk.DISABLED if generating else tk.NORMAL)
         self.cancel_button.configure(state=tk.NORMAL if generating else tk.DISABLED)
         if generating:
@@ -584,6 +669,8 @@ class EditorApp:
                     self._handle_generation_error(event[1], event[2])
                 elif kind == "generation_cancelled":
                     self._handle_generation_cancelled(event[1])
+                elif kind.startswith("workflow_"):
+                    self.workflow_screen.handle_event(event)
         except queue.Empty:
             pass
 
@@ -656,5 +743,9 @@ class EditorApp:
     def close(self):
         if self.cancel_event:
             self.cancel_event.set()
+        try:
+            self.workflow_screen.shutdown()
+        except Exception:  # never block closing the window
+            pass
         self._save_settings()
         self.root.destroy()

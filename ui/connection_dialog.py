@@ -4,7 +4,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-from core.remote_service import RemoteService
+from core.remote_service import RemoteService, normalise_api_key
 from core.settings import BACKEND_LABELS, BACKEND_OLLAMA, BACKEND_REMOTE
 
 
@@ -172,16 +172,26 @@ class ConnectionDialog(tk.Toplevel):
         self.details.insert("1.0", text)
         self.details.configure(state=tk.DISABLED)
 
+    MAX_OUTPUT_TOKENS = 65536
+
     def _current_max_tokens(self):
         try:
-            return max(256, int(self.max_tokens_var.get().strip()))
+            value = int(self.max_tokens_var.get().strip())
         except ValueError:
             return self.settings.remote_max_tokens
+        value = min(self.MAX_OUTPUT_TOKENS, max(256, value))
+        self.max_tokens_var.set(str(value))
+        return value
+
+    def _current_api_key(self):
+        key = normalise_api_key(self.key_var.get())
+        self.key_var.set(key)
+        return key
 
     def _build_remote(self):
         return self.remote_factory(
             self.url_var.get().strip(),
-            self.key_var.get().strip(),
+            self._current_api_key(),
             self._current_max_tokens(),
             self.thinking_var.get(),
         )
@@ -243,7 +253,7 @@ class ConnectionDialog(tk.Toplevel):
             return
         self.settings.backend = backend
         self.settings.remote_url = url
-        self.settings.remote_api_key = self.key_var.get().strip()
+        self.settings.remote_api_key = self._current_api_key()
         self.settings.remote_max_tokens = self._current_max_tokens()
         self.settings.remote_enable_thinking = bool(self.thinking_var.get())
         self.destroy()
