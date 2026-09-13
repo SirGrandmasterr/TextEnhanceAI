@@ -9,7 +9,9 @@ import pytest
 
 from core.backend import BackendUnavailable, EditCancelled, OutputTruncated
 from core.models import ACCEPTED, PENDING, REJECTED
+from core.change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS, levenshtein
 from core.workflow import (
+    CHANGE_KINDS as WORKFLOW_CHANGE_KINDS,
     CHECK_EXPRESSION,
     CHECK_GRAMMAR,
     CHECK_SPELLING,
@@ -33,6 +35,7 @@ from core.workflow import (
     applied_changes,
     build_explanation_messages,
     change_states,
+    classify_change,
     create_project,
     extract_changes,
     parse_explanations,
@@ -72,6 +75,91 @@ def test_insertions_and_deletions_get_zero_or_full_spans():
 
     changes = extract_changes("I saw dog", "I saw a dog", CHECK_GRAMMAR)
     assert any(c.original_text == "" and "a" in c.proposed_text for c in changes)
+
+
+# ----------------------------------------------------------------- kinds
+KIND_EXAMPLES = [
+    ("whitespace", "a  b", "a b"),
+    ("whitespace", "word\n", " word "),
+    ("punctuation", "", ","),
+    ("punctuation", "word.", "word,"),
+    ("punctuation", "Hallo Welt", "Hallo, Welt"),
+    ("capitalization", "hello", "Hello"),
+    ("capitalization", "the river", "The River"),
+    ("spelling", "teh", "the"),
+    ("spelling", "Grossmutter", "Großmutter"),  # ß is not a case change
+    ("spelling", "recieved", "received"),
+    ("word_choice", "were", "was"),
+    ("word_choice", "very very", "extremely"),
+    ("word_choice", "at this point", "now"),
+    ("insertion", "", "a "),
+    ("insertion", " ", "sehr "),
+    ("deletion", "the ", ""),
+    ("deletion", " die, dass", "  "),
+    ("rewrite", "in the event that it might possibly rain", "in case it rained"),
+    ("rewrite", "Die Tatsache der Sachlage", "Tatsächlich, so"),
+    ("rewrite", "at this point in", "now"),  # one side longer than three words
+]
+
+
+@pytest.mark.parametrize("kind, original, proposed", KIND_EXAMPLES, ids=[
+    "{0}:{1!r}->{2!r}".format(*example) for example in KIND_EXAMPLES
+])
+def test_classify_change_examples(kind, original, proposed):
+    assert classify_change(original, proposed) == kind
+
+
+def test_change_kinds_are_fixed_order_and_labelled():
+    assert CHANGE_KINDS == (
+        "whitespace", "punctuation", "capitalization", "spelling",
+        "word_choice", "insertion", "deletion", "rewrite",
+    )
+    assert WORKFLOW_CHANGE_KINDS is CHANGE_KINDS
+    assert set(CHANGE_KIND_LABELS) == set(CHANGE_KINDS)
+    assert all(classify_change(o, p) in CHANGE_KINDS for _, o, p in KIND_EXAMPLES)
+
+
+def test_levenshtein_helper():
+    assert levenshtein("", "") == 0
+    assert levenshtein("abc", "") == 3
+    assert levenshtein("kitten", "sitting") == 3
+    assert levenshtein("teh", "the") == 2
+    assert levenshtein("flaw", "lawn") == 2
+    assert levenshtein("Straße", "Strasse") == 2
+
+
+def test_mixed_german_sentence_is_classified_per_change():
+    original = "Er wusste nicht ob der Zug kommt, und die Tatsache der Sachlage war die, dass er müde war."
+    proposed = "Er wusste nicht, ob der Zug kommt, und tatsächlich war er müde."
+
+    changes = extract_changes(original, proposed, CHECK_GRAMMAR)
+
+    assert [(c.original_text, c.proposed_text, c.kind) for c in changes] == [
+        ("", ",", "punctuation"),
+        ("die Tatsache der Sachlage", "tatsächlich", "rewrite"),
+        (" die, dass", "", "deletion"),
+        (" war", "", "deletion"),
+    ]
+
+    typo = extract_changes("Er hatte kaum geschlaffen.", "Er hatte kaum geschlafen.", CHECK_SPELLING)
+    assert [(c.original_text, c.kind) for c in typo] == [("geschlaffen", "spelling")]
+
+
+def test_kind_round_trips_and_is_recomputed_when_missing_or_unknown():
+    change = Change("grammar-1", CHECK_GRAMMAR, 15, 15, "", ",")
+    assert change.kind == "punctuation"
+    data = change.to_dict()
+    assert data["kind"] == "punctuation"
+    assert Change.from_dict(data) == change
+
+    legacy = {key: value for key, value in data.items() if key != "kind"}
+    assert Change.from_dict(legacy).kind == "punctuation"
+    assert Change.from_dict(dict(data, kind="")).kind == "punctuation"
+    assert Change.from_dict(dict(data, kind="banana")).kind == "punctuation"
+
+    # A stored, valid kind is trusted even if the heuristic would now differ.
+    assert Change.from_dict(dict(data, kind="rewrite")).kind == "rewrite"
+    assert Change("x", CHECK_SPELLING, 0, 3, "teh", "the", kind="word_choice").kind == "word_choice"
 
 
 def make_segment():
@@ -320,6 +408,12 @@ def test_runner_evaluates_everything_and_results_round_trip(tmp_path):
     assert stats["per_check"][CHECK_SPELLING]["accepted"] == stats["per_check"][CHECK_SPELLING]["changes"] >= 1
     assert stats["per_check"][CHECK_GRAMMAR]["changes"] >= 1
     assert stats["pending"] > 0  # grammar/expression are not auto-accepted
+    assert set(stats["per_kind"]) == set(CHANGE_KINDS)
+    assert sum(kind["changes"] for kind in stats["per_kind"].values()) == stats["changes"]
+    assert stats["per_kind"]["spelling"]["accepted"] == stats["per_kind"]["spelling"]["changes"] >= 1  # Teh -> The
+    assert stats["per_kind"]["word_choice"]["changes"] >= 2  # were -> was, very very -> extremely
+    assert stats["per_check"][CHECK_SPELLING]["by_kind"]["spelling"] == stats["per_check"][CHECK_SPELLING]["changes"]
+    assert stats["per_check"][CHECK_EXPRESSION]["by_kind"]["word_choice"] >= 1
 
     project.save()
     reloaded = Project.load(project.root)
@@ -338,6 +432,8 @@ def test_runner_evaluates_everything_and_results_round_trip(tmp_path):
     report = paths["report"].read_text(encoding="utf-8")
     assert "# Review report: novel" in report
     assert "[Spelling] `Teh` → `The` — applied — Reason" in report
+    assert "  - Spelling: 1 proposed, 1 accepted, 0 rejected\n    - by kind: spelling 1\n" in report
+    assert "    - by kind: word choice 1\n" in report  # expression: very very -> extremely
     assert (reloaded.root / "reviewed" / "01 - Kapitel 1.txt").exists()
 
 
