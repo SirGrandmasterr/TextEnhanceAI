@@ -1,9 +1,9 @@
-"""Persisted application settings (backend choice, remote relay, last models).
+"""Persisted application settings (backend choice, remote relay, last models, UI language).
 
 Settings live in ``TextEnhanceAI-settings.json`` next to the application, the
 same place the scratchpads go, and are ignored by Git. Environment variables
-seed a value when the file has none, so ``TEAI_REMOTE_URL`` and friends still
-work for scripted setups, but anything saved from the Connection dialog wins.
+seed a value when the file has none, so ``TEAI_REMOTE_URL``, ``TEAI_LANG`` and
+friends still work for scripted setups, but anything saved from the Connection dialog wins.
 
 Note: the relay API key is stored in plain text in that file. Keep the file
 private, or rely on the ``TEAI_REMOTE_API_KEY`` environment variable instead.
@@ -23,6 +23,8 @@ BACKEND_LABELS = {
     BACKEND_REMOTE: "Remote GPU (relay)",
 }
 DEFAULT_OLLAMA_MODEL = "llama3.1:8b"
+UI_LANGUAGE_AUTO = "auto"
+UI_LANGUAGES = (UI_LANGUAGE_AUTO, "en", "de")  # "auto" follows the OS locale
 
 _ENV_TRUE = {"1", "true", "yes", "on"}
 
@@ -50,6 +52,7 @@ class AppSettings:
     remote_api_key: str = ""
     remote_max_tokens: int = 4096
     remote_enable_thinking: bool = False
+    ui_language: str = UI_LANGUAGE_AUTO
     path: Path = field(default=None, repr=False, compare=False)
     load_error: str = field(default="", repr=False, compare=False)
 
@@ -60,6 +63,7 @@ class AppSettings:
         "remote_api_key",
         "remote_max_tokens",
         "remote_enable_thinking",
+        "ui_language",
     )
 
     # ------------------------------------------------------------ persistence
@@ -104,6 +108,8 @@ class AppSettings:
                 environ.get("TEAI_REMOTE_THINKING"), False
             )
         settings.remote_max_tokens = max(256, settings.remote_max_tokens)
+        language = str(data.get("ui_language") or environ.get("TEAI_LANG", "") or "").strip().lower()
+        settings.ui_language = language if language in UI_LANGUAGES else UI_LANGUAGE_AUTO
 
         env_model = environ.get("TEAI_MODEL", "").strip()
         if settings.backend not in settings.models and env_model:

@@ -22,6 +22,7 @@ from core.settings import (
     AppSettings,
 )
 from .connection_dialog import ConnectionDialog
+from .i18n import current_language, resolve_language, set_language, tr
 from .review_panel import ReviewPanel
 from .theme import PALETTE, apply_theme, font, style_text
 from .workflow_screen import WorkflowScreen
@@ -48,6 +49,7 @@ class EditorApp:
         self.root = root
         self.app_directory = Path(app_directory or Path.cwd())
         self.settings = settings or AppSettings.load(self.app_directory / SETTINGS_FILENAME)
+        set_language(self.settings.ui_language)  # before any widget text is built
         self.services = {
             BACKEND_OLLAMA: ollama_service or OllamaService(),
             BACKEND_REMOTE: remote_service or self._remote_from_settings(),
@@ -433,6 +435,8 @@ class EditorApp:
         self.services[BACKEND_REMOTE] = self._remote_from_settings()
         self._save_settings()
         self._switch_backend(settings.backend)
+        if resolve_language(settings.ui_language) != current_language():
+            self.set_status(tr("Restart TextEnhanceAI to apply the language."))
 
     # --------------------------------------------------------- model discovery
     def refresh_models(self):
