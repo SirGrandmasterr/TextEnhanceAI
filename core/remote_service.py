@@ -11,6 +11,7 @@ import http.client
 import json
 import socket
 import ssl
+import sys
 import threading
 from urllib.parse import urlsplit
 
@@ -28,6 +29,33 @@ from .backend import (
 
 USER_AGENT = "TextEnhanceAI/0.13"
 DEFAULT_TIMEOUT = 120  # seconds per blocking socket operation; relay keeps alive every 15s
+_SERVER_AUTH_OID = "1.3.6.1.5.5.7.3.1"
+
+
+def build_ssl_context():
+    """Return a verifying TLS context that ignores stale intermediates on Windows.
+
+    ``ssl.create_default_context()`` on Windows also trusts every certificate in
+    the intermediate "CA" store. That store often still holds the ISRG Root X2
+    cross-certificate that expired in September 2025, which makes valid Let's
+    Encrypt chains fail with "certificate has expired". Trusting only the
+    "ROOT" store (as browsers do) avoids that; servers still send their chain.
+    """
+    if sys.platform == "win32":
+        try:
+            pems = []
+            for cert, encoding, trust in ssl.enum_certificates("ROOT"):
+                if encoding != "x509_asn":
+                    continue
+                if trust is True or (isinstance(trust, (set, frozenset)) and _SERVER_AUTH_OID in trust):
+                    pems.append(ssl.DER_cert_to_PEM_cert(cert))
+            if pems:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.load_verify_locations(cadata="".join(pems))
+                return context
+        except Exception:  # pragma: no cover - fall back to Python's default
+            pass
+    return ssl.create_default_context()
 
 
 class RemoteUnavailable(BackendUnavailable):
@@ -97,7 +125,7 @@ class RemoteService:
                 parsed["host"],
                 parsed["port"],
                 timeout=self.timeout,
-                context=ssl.create_default_context(),
+                context=build_ssl_context(),
             )
         return http.client.HTTPConnection(
             parsed["host"], parsed["port"], timeout=self.timeout

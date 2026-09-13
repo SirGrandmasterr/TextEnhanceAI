@@ -64,8 +64,9 @@ curl https://relay.example.com/health  # {"ok": true, "agents": 0, ...}
 
 `RELAY_DOMAIN` must be a DNS name pointing at the server; Caddy fetches the
 certificate automatically. Put one key per GPU server in `RELAY_AGENT_KEYS` and
-one key per user in `RELAY_CLIENT_KEYS` (`name:key,name:key`). Details:
-[relay/README.md](relay/README.md).
+one key per user in `RELAY_CLIENT_KEYS` (`name:key,name:key`). If the server
+already runs nginx, use `docker-compose.nginx.yml` + `nginx-site.example.conf`
+instead of Caddy. Details: [relay/README.md](relay/README.md).
 
 ### 2. vLLM + agent on the GPU server
 

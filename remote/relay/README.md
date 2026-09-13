@@ -26,6 +26,30 @@ Without a domain (LAN or testing only): set `RELAY_DOMAIN=:80` so Caddy serves
 plain HTTP, then use `http://<ip>` on the clients and `AGENT_TLS_VERIFY=true`
 stays irrelevant because no TLS is involved.
 
+## Behind an existing nginx (or another reverse proxy)
+
+If the host already runs nginx on ports 80/443, skip Caddy: publish the relay
+on localhost and add a site to nginx.
+
+```bash
+cp docker-compose.nginx.yml docker-compose.override.yml   # auto-loaded by compose
+echo "RELAY_BIND_PORT=8084" >> .env                        # any free localhost port
+docker compose up -d --build
+curl http://127.0.0.1:8084/health
+
+cp nginx-site.example.conf /etc/nginx/sites-available/relay.conf   # edit server_name + port
+ln -s /etc/nginx/sites-available/relay.conf /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
+certbot --nginx -d relay.example.com --key-type rsa
+```
+
+`nginx-site.example.conf` keeps buffering off for SSE and uses long timeouts for
+the agent WebSocket; a generic proxy snippet with `proxy_buffering on` or a
+60 s read timeout would break streaming. `--key-type rsa` keeps the certificate
+chain on ISRG Root X1, which every Windows trust store has; Python clients on
+Windows frequently fail to verify Let's Encrypt's ECDSA chain because of a stale
+cross-signed intermediate in the local store.
+
 ## Run without Docker
 
 ```bash

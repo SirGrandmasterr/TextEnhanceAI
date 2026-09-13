@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from core.backend import EditCancelled, OutputTruncated, strip_thinking
-from core.remote_service import RemoteService, RemoteUnavailable
+from core.remote_service import RemoteService, RemoteUnavailable, build_ssl_context
 
 
 def sse(event):
@@ -282,3 +282,12 @@ def test_strip_thinking_removes_reasoning_blocks():
     assert strip_thinking("<think>\nplan\n</think>\n\nEdited.") == "Edited."
     assert strip_thinking("Plain text") == "Plain text"
     assert strip_thinking("<think>unterminated") == ""
+
+
+def test_ssl_context_verifies_hostnames_and_has_trust_anchors():
+    import ssl
+
+    context = build_ssl_context()
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert len(context.get_ca_certs()) > 0

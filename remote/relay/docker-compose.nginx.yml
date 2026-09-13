@@ -1,0 +1,20 @@
+# Use this instead of Caddy when the host already runs a reverse proxy (nginx,
+# Traefik, ...) that terminates TLS. The relay is published on localhost only
+# and Caddy is parked behind a profile so it never starts.
+#
+#   cp docker-compose.nginx.yml docker-compose.override.yml   # auto-loaded
+#   docker compose up -d --build
+#
+# or, without copying:
+#   docker compose -f docker-compose.yml -f docker-compose.nginx.yml up -d --build
+#
+# Point the reverse proxy at http://127.0.0.1:${RELAY_BIND_PORT} (see
+# nginx-site.example.conf). RELAY_DOMAIN in .env is still required by the
+# parked Caddy service definition; set it to the public host name.
+
+services:
+  relay:
+    ports:
+      - "127.0.0.1:${RELAY_BIND_PORT:-8080}:8080"
+  caddy:
+    profiles: ["caddy"]
