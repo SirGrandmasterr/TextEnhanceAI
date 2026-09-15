@@ -351,6 +351,15 @@ class EditorApp:
         """Protected terms that pre-fill a new review project."""
         return list(self.settings.default_glossary)
 
+    def default_evaluation_mode(self):
+        """Evaluation mode ("combined" or "separate") pre-selected for a new review project."""
+        return self.settings.default_evaluation_mode
+
+    def remember_evaluation_mode(self, mode):
+        if mode and mode != self.settings.default_evaluation_mode:
+            self.settings.default_evaluation_mode = mode
+            self._save_settings()
+
     def remember_glossary(self, glossary):
         """Keep the last used protected terms as the default for the next project."""
         glossary = list(glossary or [])

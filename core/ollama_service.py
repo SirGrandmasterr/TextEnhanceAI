@@ -83,25 +83,32 @@ class OllamaService:
                 names.append(str(name))
         return sorted(set(names))
 
-    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None):
-        """Stream one chat completion and return its text, honoring cancellation."""
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
+        """Stream one chat completion and return its text, honoring cancellation.
+
+        ``response_format`` (a JSON schema dict) is passed as Ollama's ``format``
+        so the answer is constrained to that schema.
+        """
         if self.client is None:
             raise OllamaUnavailable("The Ollama Python package is not installed.")
         if cancel_event.is_set():
             raise EditCancelled("Editing was cancelled.")
 
+        request = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "num_predict": max_tokens or self.max_tokens,
+                "temperature": TEMPERATURE,
+                "top_p": TOP_P,
+            },
+        }
+        if response_format is not None:
+            request["format"] = response_format
         done_reason = None
         try:
-            stream = self.client.chat(
-                model=model,
-                messages=messages,
-                stream=True,
-                options={
-                    "num_predict": max_tokens or self.max_tokens,
-                    "temperature": TEMPERATURE,
-                    "top_p": TOP_P,
-                },
-            )
+            stream = self.client.chat(**request)
             chunks = []
             received = 0
             for response in stream:

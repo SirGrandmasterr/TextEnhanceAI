@@ -4,14 +4,17 @@
 Runs every ``tests/recorded/samples/*.txt`` through ``run_check`` for each of
 the three checks (with explanations) against the backend configured in
 ``TextEnhanceAI-settings.json`` and writes one cassette per sample to
-``tests/recorded/<sample>.<model-slug>.json``. ``tests/test_recorded.py`` then
-replays those cassettes offline.
+``tests/recorded/<sample>.<model-slug>.json``; with ``--mode combined`` (or
+``both``) it also records the single combined request of
+``run_segment_combined`` into ``<sample>.<model-slug>.combined.json``.
+``tests/test_recorded.py`` then replays those cassettes offline.
 
 Examples::
 
     python scripts/record_responses.py                       # settings file, saved model
     python scripts/record_responses.py --backend remote --model Qwen/Qwen3-32B-AWQ
     python scripts/record_responses.py --samples de_brief en_harbor
+    python scripts/record_responses.py --mode both           # separate and combined cassettes
 
 Not run in CI: it needs a live relay or Ollama. Re-record whenever a prompt in
 ``core/backend.py`` or ``core/workflow.py`` changes or a new sample is added.
@@ -29,7 +32,15 @@ sys.path.insert(0, str(ROOT))
 from core.backend import BackendUnavailable  # noqa: E402
 from core.services import build_service  # noqa: E402
 from core.settings import BACKENDS, SETTINGS_FILENAME, AppSettings  # noqa: E402
-from core.workflow import CHECKS, FALLBACK_EXPLANATIONS, SAME_LANGUAGE, run_check  # noqa: E402
+from core.workflow import (  # noqa: E402
+    CHECKS,
+    EVALUATION_COMBINED,
+    FALLBACK_EXPLANATIONS,
+    SAME_LANGUAGE,
+    ProjectOptions,
+    run_check,
+    run_segment_combined,
+)
 from tests.recorded_service import (  # noqa: E402
     RECORDED_DIR,
     SAMPLES_DIR,
@@ -58,6 +69,10 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--out", type=Path, default=RECORDED_DIR, help="cassette directory (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--mode", choices=("separate", "combined", "both"), default="separate",
+        help="record the three separate checks, the single combined request, or both (default: separate)",
     )
     return parser.parse_args(argv)
 
@@ -103,6 +118,36 @@ def record_sample(service, model, sample, language):
     return recorder, rows
 
 
+def record_sample_combined(service, model, sample, language):
+    """Run the combined request on one sample; returns (recorder, [row, ...])."""
+    text = load_sample(sample, SAMPLES_DIR)
+    recorder = RecordingService(service)
+    options = ProjectOptions(language=language, evaluation_mode=EVALUATION_COMBINED)
+    started = time.time()
+    results = run_segment_combined(recorder, model, text, options, threading.Event())
+    seconds = time.time() - started
+    rows = []
+    for check in CHECKS:
+        result = results[check]
+        explained = sum(
+            1 for change in result.changes if change.explanation != FALLBACK_EXPLANATIONS[check]
+        )
+        status = result.status if result.method == EVALUATION_COMBINED else "fallback"
+        rows.append({
+            "sample": sample + " (combined)",
+            "check": check,
+            "status": status,
+            "changes": len(result.changes),
+            "explained": "{0}/{1}".format(explained, len(result.changes)) if result.changes else "-",
+            "seconds": seconds,
+            "error": result.error,
+        })
+        print("  {0:<10} {1:<8} {2:>3} change(s)  {3:5.1f}s  {4}".format(
+            check, status, len(result.changes), seconds, result.error
+        ).rstrip())
+    return recorder, rows
+
+
 def print_summary(rows):
     print()
     print("{0:<14} {1:<10} {2:<6} {3:>7}  {4:<9} {5}".format(
@@ -144,13 +189,23 @@ def main(argv=None):
 
     all_rows = []
     for sample in names:
-        print("\n{0}".format(sample))
-        recorder, rows = record_sample(service, model, sample, args.language)
-        all_rows.extend(rows)
-        path = write_cassette(
-            cassette_path(sample, model, args.out), model, backend, recorder.entries.values(), sample
-        )
-        print("  -> {0} ({1} request(s))".format(_display_path(path), len(recorder.entries)))
+        if args.mode in ("separate", "both"):
+            print("\n{0}".format(sample))
+            recorder, rows = record_sample(service, model, sample, args.language)
+            all_rows.extend(rows)
+            path = write_cassette(
+                cassette_path(sample, model, args.out), model, backend, recorder.entries.values(), sample
+            )
+            print("  -> {0} ({1} request(s))".format(_display_path(path), len(recorder.entries)))
+        if args.mode in ("combined", "both"):
+            print("\n{0} (combined)".format(sample))
+            recorder, rows = record_sample_combined(service, model, sample, args.language)
+            all_rows.extend(rows)
+            path = write_cassette(
+                cassette_path(sample, model, args.out, combined=True), model, backend,
+                recorder.entries.values(), sample,
+            )
+            print("  -> {0} ({1} request(s))".format(_display_path(path), len(recorder.entries)))
 
     print_summary(all_rows)
     failed = [row for row in all_rows if row["status"] != "done"]

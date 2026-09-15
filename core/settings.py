@@ -55,6 +55,7 @@ class AppSettings:
     ui_language: str = UI_LANGUAGE_AUTO
     default_style_guide: str = ""  # pre-fills "Author's instructions" for new review projects
     default_glossary: list = field(default_factory=list)  # pre-fills "Protected terms"
+    default_evaluation_mode: str = "combined"  # "combined" or "separate", see core.workflow
     path: Path = field(default=None, repr=False, compare=False)
     load_error: str = field(default="", repr=False, compare=False)
 
@@ -68,6 +69,7 @@ class AppSettings:
         "ui_language",
         "default_style_guide",
         "default_glossary",
+        "default_evaluation_mode",
     )
 
     # ------------------------------------------------------------ persistence
@@ -121,6 +123,8 @@ class AppSettings:
         settings.default_glossary = [
             " ".join(str(term).split()) for term in (glossary or []) if str(term).strip()
         ] if isinstance(glossary, list) else []
+        mode = str(data.get("default_evaluation_mode") or environ.get("TEAI_EVALUATION_MODE", "") or "").strip().lower()
+        settings.default_evaluation_mode = mode if mode in ("combined", "separate") else "combined"
 
         env_model = environ.get("TEAI_MODEL", "").strip()
         if settings.backend not in settings.models and env_model:
