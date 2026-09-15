@@ -71,6 +71,11 @@ def levenshtein(a, b):
     return previous[-1]
 
 
+def edit_distance(original_text, proposed_text):
+    """Return the Levenshtein distance between the whitespace-collapsed texts."""
+    return levenshtein(collapse_whitespace(original_text), collapse_whitespace(proposed_text))
+
+
 def classify_change(original_text, proposed_text):
     """Return the ``CHANGE_KINDS`` entry describing an edit of ``original_text`` into ``proposed_text``."""
     original = collapse_whitespace(original_text)
@@ -91,7 +96,7 @@ def classify_change(original_text, proposed_text):
     proposed_words = proposed.split()
     if (
         len(original_words) == 1 and len(proposed_words) == 1
-        and levenshtein(original, proposed) <= SPELLING_MAX_DISTANCE
+        and edit_distance(original, proposed) <= SPELLING_MAX_DISTANCE
     ):
         return KIND_SPELLING
     if len(original_words) <= WORD_CHOICE_MAX_WORDS and len(proposed_words) <= WORD_CHOICE_MAX_WORDS:
