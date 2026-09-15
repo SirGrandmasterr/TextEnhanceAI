@@ -12,6 +12,10 @@ where the model runs:
   ``EditCancelled``/``BackendUnavailable``. ``text_first`` puts the text before
   the instruction so consecutive requests on the same segment share a prompt
   prefix (see ``build_messages``).
+- ``generate(model, messages, cancel_event, on_progress=None, max_tokens=None,
+  response_format=None)``: one raw chat completion. ``response_format`` is a
+  JSON schema dict the answer must follow; a server that cannot honour it
+  raises ``StructuredOutputUnsupported``.
 """
 
 import re
@@ -27,6 +31,10 @@ class EditCancelled(RuntimeError):
 
 class OutputTruncated(BackendUnavailable):
     """Raised when the model stopped because the output token limit was hit."""
+
+
+class StructuredOutputUnsupported(BackendUnavailable):
+    """Raised when the server rejects a ``response_format`` JSON schema request."""
 
 
 SYSTEM_PROMPT = (

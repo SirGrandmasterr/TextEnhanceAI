@@ -26,6 +26,7 @@ from .backend import (
     strip_thinking,
     truncated_message,
 )
+from .backend import StructuredOutputUnsupported as _StructuredOutputUnsupported
 
 USER_AGENT = "TextEnhanceAI/0.13"
 DEFAULT_TIMEOUT = 120  # seconds per blocking socket operation; relay keeps alive every 15s
@@ -68,6 +69,13 @@ def build_ssl_context():
 
 class RemoteUnavailable(BackendUnavailable):
     """Raised when the relay cannot be reached, rejects us, or fails a request."""
+
+
+class StructuredOutputUnsupported(RemoteUnavailable, _StructuredOutputUnsupported):
+    """The server answered 400 to a ``response_format`` request (no guided decoding)."""
+
+
+_STRUCTURED_HINTS = ("response_format", "guided", "structured", "json_schema")
 
 
 class RemoteService:
@@ -275,8 +283,8 @@ class RemoteService:
         return "The connected GPU agent reports no models. Check the vLLM logs."
 
     # ------------------------------------------------------------- generation
-    def _build_request(self, model, messages, max_tokens=None):
-        return {
+    def _build_request(self, model, messages, max_tokens=None, response_format=None):
+        request = {
             "model": model,
             "messages": messages,
             "stream": True,
@@ -286,6 +294,20 @@ class RemoteService:
             # Honoured by vLLM/SGLang/llama.cpp; ignored by servers without templates.
             "chat_template_kwargs": {"enable_thinking": bool(self.enable_thinking)},
         }
+        if response_format is not None:
+            request["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "teai_edits", "schema": response_format},
+            }
+        return request
+
+    @staticmethod
+    def _rejects_structured_output(status, body):
+        """Return whether a 400 answer complains about the response_format field."""
+        if status != 400:
+            return False
+        text = body.decode("utf-8", "replace").lower() if body else ""
+        return any(hint in text for hint in _STRUCTURED_HINTS)
 
     @staticmethod
     def _start_cancel_watcher(cancel_event, done_event, conn, sock_holder):
@@ -341,13 +363,18 @@ class RemoteService:
         if data_lines:
             yield "\n".join(data_lines)
 
-    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None):
-        """Stream one chat completion and return its text, honoring cancellation."""
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
+        """Stream one chat completion and return its text, honoring cancellation.
+
+        ``response_format`` (a JSON schema dict) is sent as an OpenAI-style
+        ``json_schema`` response format; a 400 that mentions it raises
+        ``StructuredOutputUnsupported`` so callers can stop asking for it.
+        """
         self._require_config()
         if cancel_event.is_set():
             raise EditCancelled("Editing was cancelled.")
 
-        body = json.dumps(self._build_request(model, messages, max_tokens)).encode("utf-8")
+        body = json.dumps(self._build_request(model, messages, max_tokens, response_format)).encode("utf-8")
         conn = self._connect()
         done_event = threading.Event()
         sock_holder = []
@@ -364,9 +391,10 @@ class RemoteService:
                     sock_holder.append(conn.sock)
                 response = conn.getresponse()
                 if response.status != 200:
-                    raise RemoteUnavailable(
-                        self._error_message(response.status, response.read())
-                    )
+                    error_body = response.read()
+                    if response_format is not None and self._rejects_structured_output(response.status, error_body):
+                        raise StructuredOutputUnsupported(self._error_message(response.status, error_body))
+                    raise RemoteUnavailable(self._error_message(response.status, error_body))
                 for payload in self._iter_sse_events(response):
                     if cancel_event.is_set():
                         raise EditCancelled("Editing was cancelled.")

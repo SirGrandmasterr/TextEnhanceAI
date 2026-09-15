@@ -1,7 +1,9 @@
 """Record and replay model answers for the automatic review pipeline.
 
 A *cassette* is one JSON file per sample text and model in
-``tests/recorded/<sample>.<model-slug>.json``::
+``tests/recorded/<sample>.<model-slug>.json`` (the three separate checks) or
+``tests/recorded/<sample>.<model-slug>.combined.json`` (the single combined
+request of ``run_segment_combined``)::
 
     {"format": 1, "model": "...", "backend": "remote", "sample": "de_bahnhof",
      "recorded_at": "...", "requests": [{"key": "<sha256>", "check": "spelling",
@@ -53,13 +55,18 @@ def model_slug(model):
     return slug or "model"
 
 
-def cassette_path(sample, model, directory=RECORDED_DIR):
-    return Path(directory) / "{0}.{1}.json".format(sample, model_slug(model))
+COMBINED_SUFFIX = ".combined.json"
 
 
-def cassettes_for(sample, directory=RECORDED_DIR):
-    """Return the cassette files recorded for a sample name, sorted."""
-    return sorted(Path(directory).glob("{0}.*.json".format(sample)))
+def cassette_path(sample, model, directory=RECORDED_DIR, combined=False):
+    suffix = COMBINED_SUFFIX if combined else ".json"
+    return Path(directory) / "{0}.{1}{2}".format(sample, model_slug(model), suffix)
+
+
+def cassettes_for(sample, directory=RECORDED_DIR, combined=False):
+    """Return the cassette files recorded for a sample name (separate or combined mode), sorted."""
+    paths = Path(directory).glob("{0}.*.json".format(sample))
+    return sorted(path for path in paths if path.name.endswith(COMBINED_SUFFIX) == combined)
 
 
 def sample_names(directory=SAMPLES_DIR):
@@ -102,6 +109,8 @@ def check_name(messages):
         for check, label in CHECK_LABELS.items():
             if label.lower() == match.group(1).lower():
                 return check + "-explanation"
+    if user.startswith("Review the text below"):
+        return "combined"
     return "unknown"
 
 
@@ -179,7 +188,7 @@ class RecordedService:
             check_name(messages), preview, model, where, RERECORD_HINT
         )
 
-    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None):
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
         if cancel_event.is_set():
             raise EditCancelled("Editing was cancelled.")
         key = request_key(model, messages, max_tokens)
@@ -230,30 +239,36 @@ class RecordingService:
         return self.service.no_models_hint()
 
     @staticmethod
-    def _entry(model, messages, max_tokens, key):
-        return {
+    def _entry(model, messages, max_tokens, key, response_format=None):
+        entry = {
             "key": key,
             "check": check_name(messages),
             "model": model,
             "max_tokens": max_tokens,
             "messages": messages,
         }
+        if response_format is not None:
+            entry["structured"] = True
+        return entry
 
-    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None):
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
         key = request_key(model, messages, max_tokens)
         try:
             response = self.service.generate(
-                model, messages, cancel_event, on_progress=on_progress, max_tokens=max_tokens
+                model, messages, cancel_event, on_progress=on_progress, max_tokens=max_tokens,
+                response_format=response_format,
             )
         except EditCancelled:
             raise
         except BackendUnavailable as exc:
             with self._lock:
                 if key not in self.entries:
-                    self.entries[key] = dict(self._entry(model, messages, max_tokens, key), error=str(exc))
+                    self.entries[key] = dict(
+                        self._entry(model, messages, max_tokens, key, response_format), error=str(exc)
+                    )
             raise
         with self._lock:
-            self.entries[key] = dict(self._entry(model, messages, max_tokens, key), response=response)
+            self.entries[key] = dict(self._entry(model, messages, max_tokens, key, response_format), response=response)
         return response
 
     def stream_edit(self, model, instruction, text, cancel_event, on_progress=None, text_first=False):

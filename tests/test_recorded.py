@@ -20,10 +20,14 @@ from core.workflow import (
     CHECK_INSTRUCTIONS,
     CHECK_SPELLING,
     CHECKS,
+    EVALUATION_COMBINED,
     FALLBACK_EXPLANATIONS,
+    ProjectOptions,
+    build_combined_messages,
     build_explanation_messages,
     extract_changes,
     run_check,
+    run_segment_combined,
     sanity_check_proposal,
 )
 from recorded_service import (
@@ -150,6 +154,53 @@ def test_explanations_are_mostly_model_written(replay):
     )
 
 
+# ------------------------------------------------------- combined mode
+def _combined_cases():
+    for sample in sample_names():
+        cassettes = cassettes_for(sample, combined=True)
+        if not cassettes:
+            reason = "no combined cassette for {0}; run scripts/record_responses.py --mode combined".format(sample)
+            yield pytest.param((sample, None), id=sample + "-combined", marks=pytest.mark.skip(reason=reason))
+        for path in cassettes:
+            yield pytest.param((sample, path), id=path.stem)
+
+
+_COMBINED_REPLAYS = {}
+
+
+@pytest.fixture(params=list(_combined_cases()))
+def combined_replay(request):
+    """Run the single combined request for one (sample, cassette) once and share the results."""
+    sample, path = request.param
+    if path not in _COMBINED_REPLAYS:
+        service = RecordedService(path)
+        text = load_sample(sample)
+        options = ProjectOptions(evaluation_mode=EVALUATION_COMBINED)
+        results = run_segment_combined(service, service.model, text, options, threading.Event())
+        _COMBINED_REPLAYS[path] = (sample, text, service, results)
+    return _COMBINED_REPLAYS[path]
+
+
+def test_combined_answer_is_used_without_fallback(combined_replay):
+    sample, text, service, results = combined_replay
+    assert [name for name, _ in service.calls] == ["combined"], "the combined request fell back to separate checks"
+    for check in CHECKS:
+        assert results[check].status == "done" and results[check].method == EVALUATION_COMBINED, (sample, check)
+        sanity_check_proposal(text, results[check].proposed_text)
+
+
+def test_combined_answer_fixes_the_typo_and_keeps_the_proper_noun(combined_replay):
+    sample, text, _, results = combined_replay
+    typo = PLANTED[sample]["typo"]
+    noun = PLANTED[sample]["proper_noun"]
+    assert any(typo in change.original_text for change in results[CHECK_SPELLING].changes), sample
+    for check in CHECKS:
+        assert noun in results[check].proposed_text, (sample, check)
+        assert not any(noun in change.original_text for change in results[check].changes), (sample, check)
+    changes = [change for result in results.values() for change in result.changes]
+    assert changes and all(change.explanation for change in changes)
+
+
 # ------------------------------------------------------- harness itself
 class ScriptedBackend:
     """Deterministic stand-in for a live backend used to exercise record/replay."""
@@ -170,7 +221,7 @@ class ScriptedBackend:
     def no_models_hint(self):
         return "none"
 
-    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None):
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
         self.generate_calls += 1
         if self.fail_first > 0:
             self.fail_first -= 1
@@ -301,6 +352,17 @@ def test_keys_ignore_nothing_that_the_backends_send():
     assert request_key("m", build_messages("Do it", "Text ")) != request_key("m", messages)
     # The two message orders are different requests (and different cassette entries).
     assert request_key("m", build_messages("Do it", "Text", text_first=True)) != request_key("m", messages)
+
+
+def test_combined_cassettes_are_kept_apart_from_separate_ones(tmp_path):
+    separate = cassette_path("demo", "m", tmp_path)
+    combined = cassette_path("demo", "m", tmp_path, combined=True)
+    assert separate.name == "demo.m.json" and combined.name == "demo.m.combined.json"
+    for path in (separate, combined):
+        path.write_text('{"model": "m", "requests": []}', encoding="utf-8")
+    assert cassettes_for("demo", tmp_path) == [separate]
+    assert cassettes_for("demo", tmp_path, combined=True) == [combined]
+    assert check_name(build_combined_messages("t", ProjectOptions())) == "combined"
 
 
 def test_helpers_name_checks_and_slug_models():

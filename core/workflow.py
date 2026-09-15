@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .backend import BackendUnavailable, EditCancelled, OutputTruncated
+from .backend import BackendUnavailable, EditCancelled, OutputTruncated, StructuredOutputUnsupported
 from .change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS, classify_change
 from .chunking import (
     DEFAULT_MAX_CHAPTER_CHARS,
@@ -147,6 +147,47 @@ wodurch wohl wollen wollte wollten worden wurde wurden würde würden zwar zwisc
 """.split())
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
+# Evaluation modes: one combined request per segment that returns every
+# category at once, or the classic three separate requests per segment.
+EVALUATION_COMBINED = "combined"
+EVALUATION_SEPARATE = "separate"
+EVALUATION_MODES = (EVALUATION_COMBINED, EVALUATION_SEPARATE)
+EVALUATION_LABELS = {
+    EVALUATION_COMBINED: "One combined request per segment (faster)",
+    EVALUATION_SEPARATE: "Three separate requests (more thorough)",
+}
+COMBINED_SYSTEM_PROMPT = (
+    "You are a careful text editor reviewing one segment of a manuscript. Preserve the "
+    "original language, meaning, paragraphs, quotations and formatting. Answer with a "
+    "single JSON object and nothing else."
+)
+COMBINED_MAX_TOKENS = 4096
+COMBINED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "edits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "enum": list(CHECKS)},
+                    "original": {"type": "string"},
+                    "replacement": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["category", "original", "replacement", "reason"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["edits"],
+    "additionalProperties": False,
+}
+COMBINED_EXAMPLE = (
+    '{"edits": [{"category": "spelling", "original": "teh dog", "replacement": "the dog", '
+    '"reason": "Typo."}]}'
+)
+
 STATUS_QUEUED = "queued"
 STATUS_ERROR = "error"
 STATUS_CLEAN = "clean"
@@ -232,6 +273,7 @@ class CheckResult:
     duration: float = 0.0
     explained: bool = False
     suppressed: List[Change] = field(default_factory=list)  # dropped by the glossary post-filter
+    method: str = EVALUATION_SEPARATE  # "combined" (one request for all checks) or "separate"
 
     def to_dict(self):
         return {
@@ -244,16 +286,19 @@ class CheckResult:
             "duration": round(self.duration, 2),
             "explained": self.explained,
             "suppressed": [change.to_dict() for change in self.suppressed],
+            "method": self.method,
         }
 
     @classmethod
     def from_dict(cls, data):
+        method = data.get("method")
         return cls(
             data["check"], data.get("status", "done"), data.get("proposed", ""),
             [Change.from_dict(item) for item in data.get("changes", [])],
             data.get("error", ""), data.get("model", ""), float(data.get("duration", 0.0)),
             bool(data.get("explained", False)),
             [Change.from_dict(item) for item in data.get("suppressed", []) or []],
+            method if method in EVALUATION_MODES else EVALUATION_SEPARATE,
         )
 
 
@@ -367,9 +412,14 @@ class ProjectOptions:
     parallelism: int = 2
     style_guide: str = ""  # author's standing instructions, see build_check_instruction
     glossary: List[str] = field(default_factory=list)  # protected terms, see glossary_matcher
+    evaluation_mode: str = EVALUATION_COMBINED  # see EVALUATION_MODES
 
     def enabled_checks(self):
         return [check for check in CHECKS if self.checks.get(check)]
+
+    @property
+    def combined(self):
+        return self.evaluation_mode == EVALUATION_COMBINED
 
     def to_dict(self):
         return {
@@ -384,6 +434,7 @@ class ProjectOptions:
             "parallelism": self.parallelism,
             "style_guide": self.style_guide,
             "glossary": list(self.glossary),
+            "evaluation_mode": self.evaluation_mode,
         }
 
     @classmethod
@@ -397,6 +448,8 @@ class ProjectOptions:
                 options.style_guide = str(value or "")
             elif key == "glossary":
                 options.glossary = parse_glossary(value)
+            elif key == "evaluation_mode":
+                options.evaluation_mode = value if value in EVALUATION_MODES else EVALUATION_COMBINED
             elif hasattr(options, key):
                 setattr(options, key, value)
         return options
@@ -427,17 +480,32 @@ class Project:
     def enabled(self):
         return self.options.checks
 
+    def pending_checks(self, segment):
+        """Return the enabled checks that still lack a successful result for ``segment``."""
+        return [
+            check for check in self.options.enabled_checks()
+            if segment.results.get(check) is None or segment.results[check].status == "error"
+        ]
+
     def pending_tasks(self):
-        """Return (chapter_index, segment_index, check) tuples still to evaluate."""
+        """Return the evaluation tasks still to run, in (chapter, segment, check) order.
+
+        In separate mode every missing (segment, check) pair is one task; in
+        combined mode a segment with any missing check is one task whose check
+        is ``None`` (one request answers all its checks).
+        """
         tasks = []
         for chapter in self.chapters:
             for segment in chapter.segments:
                 if segment.is_blank:
                     continue
-                for check in self.options.enabled_checks():
-                    result = segment.results.get(check)
-                    if result is None or result.status == "error":
-                        tasks.append((chapter.index, segment.index, check))
+                pending = self.pending_checks(segment)
+                if not pending:
+                    continue
+                if self.options.combined:
+                    tasks.append((chapter.index, segment.index, None))
+                else:
+                    tasks.extend((chapter.index, segment.index, check) for check in pending)
         return tasks
 
     def find(self, chapter_index, segment_index):
@@ -455,6 +523,7 @@ class Project:
             "segments": 0, "queued": 0, "error": 0, "clean": 0, "ready": 0, "reviewed": 0,
             "tasks_total": 0, "tasks_done": 0, "changes": 0, "accepted": 0, "rejected": 0, "pending": 0,
             "suppressed": 0, "flagged": 0, "flagged_pending": 0, "words": 0,
+            "methods": {mode: 0 for mode in EVALUATION_MODES},
             "per_check": {
                 check: {
                     "changes": 0, "accepted": 0, "rejected": 0, "suppressed": 0, "flagged": 0,
@@ -478,7 +547,10 @@ class Project:
             )
             for check in checks:
                 result = segment.results.get(check)
-                if result is not None and result.status == "done" and result.suppressed:
+                if result is None or result.status != "done":
+                    continue
+                stats["methods"][result.method] = stats["methods"].get(result.method, 0) + 1
+                if result.suppressed:
                     stats["suppressed"] += len(result.suppressed)
                     stats["per_check"][check]["suppressed"] += len(result.suppressed)
             for change in segment.changes(enabled):
@@ -596,6 +668,9 @@ class Project:
             "- Source: `{0}`".format(self.source_path),
             "- Model: `{0}` ({1})".format(self.model or "?", self.backend or "?"),
             "- Checks: {0}".format(", ".join(CHECK_LABELS[c] for c in self.options.enabled_checks()) or "none"),
+            "- Evaluation: {0} ({1} results combined, {2} separate)".format(
+                self.options.evaluation_mode, stats["methods"][EVALUATION_COMBINED], stats["methods"][EVALUATION_SEPARATE]
+            ),
             "- Chapters: {0} ({1}), segments: {2}, words: {3}".format(
                 len(self.chapters), self.method or "?", stats["segments"], stats["words"]
             ),
@@ -1121,6 +1196,163 @@ def run_check(service, model, text, check, cancel_event, explain=True, language=
     )
 
 
+# --------------------------------------------------------- combined pass
+def _language_clause(language):
+    return "in the same language as the text" if language == SAME_LANGUAGE else "in " + language
+
+
+def build_combined_messages(text, options=None):
+    """Build the single request that returns the edits of every enabled check at once."""
+    options = options or ProjectOptions()
+    checks = options.enabled_checks() or list(CHECKS)
+    rules = "\n".join(
+        "{0}. {1}: {2}".format(number, check, CHECK_INSTRUCTIONS[check])
+        for number, check in enumerate(checks, 1)
+    )
+    extras = format_style_guide(options.style_guide) + format_glossary(options.glossary)
+    content = (
+        "Review the text below and list every correction you would make, in the order in which "
+        "they occur in the text. Assign each edit exactly one of these categories:\n{rules}{extras}\n\n"
+        "Text:\n{text}\n\n"
+        "Return a JSON object of this shape (one entry per edit):\n{example}\n"
+        "Rules: \"original\" must be an exact substring of the text, with the same spelling, punctuation "
+        "and spacing; when it occurs more than once, extend it with the neighbouring words until it is "
+        "unique. \"replacement\" is the text that takes its place (repeat the context words unchanged; "
+        "an empty string deletes). \"reason\" is one short sentence {language} explaining why the new "
+        "version is better. Return {{\"edits\": []}} when nothing needs to change."
+    ).format(rules=rules, extras=extras, text=text, example=COMBINED_EXAMPLE,
+             language=_language_clause(options.language))
+    return [
+        {"role": "system", "content": COMBINED_SYSTEM_PROMPT},
+        {"role": "user", "content": content},
+    ]
+
+
+def _anchor(text, snippet, cursor):
+    """Return the unique position of ``snippet`` at/after ``cursor`` (else anywhere), or -1."""
+    position = text.find(snippet, cursor)
+    if position != -1 and text.find(snippet, position + 1) == -1:
+        return position
+    if position == -1:
+        position = text.find(snippet)
+        if position != -1 and text.find(snippet, position + 1) == -1:
+            return position
+    return -1
+
+
+def apply_changes(text, changes):
+    """Return ``text`` with every change applied (changes must not overlap)."""
+    output = []
+    position = 0
+    for change in sorted(changes, key=lambda change: (change.start, change.end)):
+        output.append(text[position:change.start])
+        output.append(change.proposed_text)
+        position = change.end
+    output.append(text[position:])
+    return "".join(output)
+
+
+def parse_combined(text, answer, options=None):
+    """Turn the combined answer into one ``CheckResult`` per enabled check.
+
+    Every edit is anchored by an exact ``find`` of its ``original`` from a
+    moving cursor (falling back to a unique match anywhere); the snippet is
+    then diffed against its replacement so the changes are word-level, like
+    the separate mode's. Returns ``None`` when the JSON is malformed or any
+    edit cannot be anchored unambiguously, so the caller can fall back.
+    """
+    options = options or ProjectOptions()
+    checks = options.enabled_checks() or list(CHECKS)
+    data = _parse_json_object(answer)
+    if not isinstance(data, dict) or not isinstance(data.get("edits"), list):
+        return None
+    per_check = {check: [] for check in checks}
+    cursor = 0
+    for item in data["edits"]:
+        if not isinstance(item, dict):
+            return None
+        category = str(item.get("category", "")).strip().lower()
+        original = item.get("original")
+        replacement = item.get("replacement")
+        if category not in CHECKS or not isinstance(original, str) or not isinstance(replacement, str):
+            return None
+        if not original:
+            return None  # an insertion without context cannot be placed
+        position = _anchor(text, original, cursor)
+        if position == -1:
+            return None
+        cursor = max(cursor, position + len(original))
+        if category not in per_check or original == replacement:
+            continue
+        reason = " ".join(str(item.get("reason") or "").split())[:200]
+        existing = per_check[category]
+        for change in extract_changes(original, replacement, category):
+            change.start += position
+            change.end += position
+            if any(overlaps(change, other) for other in existing):
+                continue  # the model listed the same words twice for one category
+            change.explanation = reason
+            existing.append(change)
+
+    matcher = glossary_matcher(options.glossary)
+    results = {}
+    for check in checks:
+        changes = sorted(per_check[check], key=lambda change: (change.start, change.end))
+        for number, change in enumerate(changes, 1):
+            change.change_id = "{0}-{1}".format(check, number)
+        kept, suppressed = suppress_glossary_changes(text, changes, matcher)
+        flag_changes(text, kept)
+        for change in kept:
+            change.explanation = change.explanation or FALLBACK_EXPLANATIONS[check]
+        results[check] = CheckResult(
+            check, "done", apply_changes(text, kept), kept, explained=any(
+                change.explanation != FALLBACK_EXPLANATIONS[check] for change in kept
+            ), suppressed=suppressed, method=EVALUATION_COMBINED,
+        )
+    return results
+
+
+def run_segment_combined(service, model, text, options, cancel_event, structured=True,
+                         on_structured_unsupported=None):
+    """Evaluate every enabled check of one segment with a single request.
+
+    Falls back to ``run_check`` per check (results marked ``separate``) when
+    the answer cannot be parsed or anchored, when the backend fails, or when
+    it rejects the JSON schema; in the last case ``on_structured_unsupported``
+    is called so the runner can stop asking for structured output.
+    """
+    started = time.time()
+    checks = options.enabled_checks() or list(CHECKS)
+    messages = build_combined_messages(text, options)
+    results = None
+    try:
+        answer = service.generate(
+            model, messages, cancel_event, max_tokens=COMBINED_MAX_TOKENS,
+            response_format=COMBINED_SCHEMA if structured else None,
+        )
+        results = parse_combined(text, strip_fences(answer), options)
+    except EditCancelled:
+        raise
+    except StructuredOutputUnsupported:
+        if on_structured_unsupported is not None:
+            on_structured_unsupported()
+    except Exception:  # any backend failure: the separate mode has its own retries
+        results = None
+    if results is not None:
+        duration = time.time() - started
+        for result in results.values():
+            result.model = model
+            result.duration = duration
+        return results
+    return {
+        check: run_check(
+            service, model, text, check, cancel_event, explain=options.explain,
+            language=options.language, style_guide=options.style_guide, glossary=options.glossary,
+        )
+        for check in checks
+    }
+
+
 class ProjectRunner:
     """Evaluate every missing (segment, check) pair on background threads.
 
@@ -1129,6 +1361,12 @@ class ProjectRunner:
     CheckResult)`` followed by ``("workflow_progress", done, total, running)``
     when it ends, and finally ``("workflow_finished", cancelled)``. The caller applies results to the
     project on its own thread, so the runner never mutates project state.
+
+    In combined mode a task covers a whole segment: one request answers every
+    pending check, and the runner still emits one ``workflow_started`` and one
+    ``workflow_result`` per check so the UI needs no special case. When the
+    server rejects the JSON schema once, ``structured_output`` turns off for
+    the rest of the run.
     """
 
     def __init__(self, project, service, model, events, parallelism=None):
@@ -1147,6 +1385,7 @@ class ProjectRunner:
         self._lock = threading.Lock()
         self._threads = []
         self.started_at = None
+        self.structured_output = True  # cleared when the backend rejects response_format
 
     @property
     def active(self):
@@ -1193,28 +1432,44 @@ class ProjectRunner:
                 _, segment = self.project.find(chapter_index, segment_index)
                 if segment is None:
                     continue
+                checks = self.project.pending_checks(segment) if check is None else [check]
+                if not checks:
+                    continue
                 with self._lock:
                     self.running += 1
-                self.events.put(("workflow_started", chapter_index, segment_index, check))
+                for pending in checks:
+                    self.events.put(("workflow_started", chapter_index, segment_index, pending))
                 try:
-                    result = run_check(
-                        self.service, self.model, segment.text, check, self.cancel_event,
-                        explain=options.explain, language=options.language, style_guide=options.style_guide,
-                        glossary=options.glossary,
-                    )
+                    if check is None:
+                        results = run_segment_combined(
+                            self.service, self.model, segment.text, options, self.cancel_event,
+                            structured=self.structured_output,
+                            on_structured_unsupported=self._disable_structured_output,
+                        )
+                        results = {pending: results[pending] for pending in checks}
+                    else:
+                        results = {check: run_check(
+                            self.service, self.model, segment.text, check, self.cancel_event,
+                            explain=options.explain, language=options.language, style_guide=options.style_guide,
+                            glossary=options.glossary,
+                        )}
                 except EditCancelled:
                     with self._lock:
                         self.running -= 1
                     break
                 except Exception as exc:  # defensive: a crash must not kill the worker
-                    result = CheckResult(check, "error", error="Unexpected error: {0!r}".format(exc), model=self.model)
+                    results = {
+                        pending: CheckResult(pending, "error", error="Unexpected error: {0!r}".format(exc), model=self.model)
+                        for pending in checks
+                    }
                 with self._lock:
                     self.running -= 1
                     self.done += 1
-                    if result.status == "error":
+                    if any(result.status == "error" for result in results.values()):
                         self.failed += 1
                     done, running = self.done, self.running
-                self.events.put(("workflow_result", chapter_index, segment_index, check, result))
+                for pending in checks:
+                    self.events.put(("workflow_result", chapter_index, segment_index, pending, results[pending]))
                 self.events.put(("workflow_progress", done, self.total, running))
         finally:
             with self._lock:
@@ -1222,6 +1477,9 @@ class ProjectRunner:
                 last = self._active_workers == 0
             if last:
                 self.events.put(("workflow_finished", self.cancel_event.is_set()))
+
+    def _disable_structured_output(self):
+        self.structured_output = False
 
     def eta_seconds(self):
         """Rough remaining time based on the throughput so far."""
