@@ -121,6 +121,9 @@ def apply_theme(root):
     # Amber badge for changes the hallucination guard flagged.
     style.configure("Flag.Badge.TLabel", background=PALETTE["warning_soft"], foreground=PALETTE["warning"],
                     font=(family, 9, "bold"), padding=(6, 1))
+    # Grey tag naming the kind of edit (punctuation, spelling, ...).
+    style.configure("Kind.Badge.TLabel", background=PALETTE["surface_alt"], foreground=PALETTE["muted"],
+                    font=(family, 9), padding=(6, 1))
 
     style.configure("TButton", background=PALETTE["surface"], foreground=PALETTE["text"], padding=(10, 5),
                     borderwidth=1, bordercolor=PALETTE["border"], relief="flat")

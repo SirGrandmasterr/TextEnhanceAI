@@ -272,15 +272,19 @@ class Segment:
     def is_blank(self):
         return not self.text.strip()
 
-    def changes(self, enabled):
-        """Return changes of enabled, successful checks sorted by position."""
+    def changes(self, enabled, hidden_kinds=()):
+        """Return changes of enabled, successful checks sorted by position.
+
+        ``hidden_kinds`` is a display filter for the UI only: status(),
+        progress() and render_segment() always see every change.
+        """
         found = []
         for check in CHECKS:
             if not enabled.get(check):
                 continue
             result = self.results.get(check)
             if result and result.status == "done":
-                found.extend(result.changes)
+                found.extend(change for change in result.changes if change.kind not in hidden_kinds)
         return sorted(found, key=lambda change: (change.start, change.priority, change.end))
 
     def find_change(self, change_id):
@@ -369,6 +373,7 @@ class ProjectOptions:
     parallelism: int = 2
     style_guide: str = ""  # author's standing instructions, see build_check_instruction
     glossary: List[str] = field(default_factory=list)  # protected terms, see glossary_matcher
+    hidden_kinds: List[str] = field(default_factory=list)  # change kinds hidden in the review (view filter)
 
     def enabled_checks(self):
         return [check for check in CHECKS if self.checks.get(check)]
@@ -386,6 +391,7 @@ class ProjectOptions:
             "parallelism": self.parallelism,
             "style_guide": self.style_guide,
             "glossary": list(self.glossary),
+            "hidden_kinds": list(self.hidden_kinds),
         }
 
     @classmethod
@@ -399,6 +405,8 @@ class ProjectOptions:
                 options.style_guide = str(value or "")
             elif key == "glossary":
                 options.glossary = parse_glossary(value)
+            elif key == "hidden_kinds":
+                options.hidden_kinds = [kind for kind in (value or []) if kind in CHANGE_KINDS]
             elif hasattr(options, key):
                 setattr(options, key, value)
         return options
@@ -451,6 +459,18 @@ class Project:
                     if segment.index == segment_index:
                         return chapter, segment
         return None, None
+
+    def changes_by_kind(self, kind, decision=None):
+        """Return (chapter, segment, change) for every change of ``kind`` in document order.
+
+        ``decision`` restricts the list to changes with that decision.
+        """
+        found = []
+        for chapter, segment in self.all_segments():
+            for change in segment.changes(self.enabled):
+                if change.kind == kind and (decision is None or change.decision == decision):
+                    found.append((chapter, segment, change))
+        return found
 
     def progress(self):
         """Return counters for progress displays and reports."""
@@ -533,6 +553,19 @@ class Project:
         if len(self.decision_log) > DECISION_LOG_LIMIT:
             del self.decision_log[:-DECISION_LOG_LIMIT]
         return entry
+
+    def decide_kind(self, kind, decision, group=None):
+        """Apply ``decision`` to every pending change of ``kind`` as one undoable group.
+
+        Returns the log entries that were written.
+        """
+        group = group or new_decision_group()
+        entries = []
+        for chapter, segment, change in self.changes_by_kind(kind, decision=PENDING):
+            entry = self.decide(chapter.index, segment.index, change, decision, group=group)
+            if entry is not None:
+                entries.append(entry)
+        return entries
 
     def undo(self):
         """Revert the most recent decision, or the whole group it belongs to.

@@ -1012,3 +1012,59 @@ def test_decision_log_round_trips_through_save_and_load(tmp_path):
     # projects saved before the log existed load with an empty one
     del data["decision_log"]
     assert Project.from_dict(data).decision_log == []
+
+
+# -------------------------------------------------------------- kind filters
+def test_hidden_kinds_only_filter_the_view():
+    segment = make_segment()
+    all_changes = segment.changes(ALL)
+    kinds = {change.kind for change in all_changes}
+    assert len(kinds) > 1
+    hidden = sorted(kinds)[0]
+    shown = segment.changes(ALL, hidden_kinds=[hidden])
+    assert shown and all(change.kind != hidden for change in shown)
+    assert len(shown) < len(all_changes)
+    # the filter never changes what is applied, counted or reported
+    for change in all_changes:
+        change.decision = ACCEPTED
+    assert render_segment(segment, ALL) == "The dog was enormous and it ran fast."
+    assert segment.status(ALL) == STATUS_REVIEWED
+    assert len(change_states(segment, ALL)) == len(all_changes)
+
+
+def test_hidden_kinds_round_trip_and_drop_unknown_kinds():
+    options = ProjectOptions(hidden_kinds=["punctuation", "spelling"])
+    data = options.to_dict()
+    assert data["hidden_kinds"] == ["punctuation", "spelling"]
+    assert ProjectOptions.from_dict(data).hidden_kinds == ["punctuation", "spelling"]
+    assert ProjectOptions.from_dict({"hidden_kinds": ["spelling", "bogus", 3]}).hidden_kinds == ["spelling"]
+    assert ProjectOptions.from_dict({}).hidden_kinds == []
+
+
+def test_changes_by_kind_and_bulk_decide_only_touch_pending_changes_of_that_kind(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    changes = segment.changes(ALL)
+    by_kind = {}
+    for change in changes:
+        by_kind.setdefault(change.kind, []).append(change)
+    kind, targets = max(by_kind.items(), key=lambda item: len(item[1]))
+    others = [change for change in changes if change.kind != kind]
+    assert others, "need a second kind to prove the filter"
+    assert [c for _, _, c in project.changes_by_kind(kind)] == targets
+    assert project.changes_by_kind("bogus") == []
+
+    # one already decided change of that kind stays as it is
+    project.decide(chapter.index, segment.index, targets[0], REJECTED)
+    entries = project.decide_kind(kind, ACCEPTED)
+    assert len(entries) == len(targets) - 1
+    assert len({entry["group"] for entry in entries}) == 1 and entries[0]["group"] is not None
+    assert targets[0].decision == REJECTED
+    assert all(change.decision == ACCEPTED for change in targets[1:])
+    assert all(change.decision == PENDING for change in others)
+    assert project.changes_by_kind(kind, decision=PENDING) == []
+    assert project.decide_kind(kind, ACCEPTED) == []  # nothing pending any more
+
+    undone = project.undo()
+    assert len(undone) == len(targets) - 1
+    assert all(change.decision == PENDING for change in targets[1:])
+    assert targets[0].decision == REJECTED  # the earlier single decision survives

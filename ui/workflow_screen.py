@@ -7,6 +7,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from core.backend import EditCancelled
+from core.change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS
 from core.chunking import read_text_file, split_document, word_count
 from core.models import ACCEPTED, PENDING, REJECTED
 from core.workflow import (
@@ -909,6 +910,8 @@ class ChangeCard(ttk.Frame):
         self.badge.pack(side=tk.LEFT)
         self.state_label = ttk.Label(top, text=STATE_LABELS[state], style="{0}.State.TLabel".format(state.title()))
         self.state_label.pack(side=tk.LEFT, padx=8)
+        self.kind_tag = ttk.Label(top, text=CHANGE_KIND_LABELS.get(change.kind, change.kind), style="Kind.Badge.TLabel")
+        self.kind_tag.pack(side=tk.LEFT, padx=(0, 8))
         self.flag_badge = None
         if change.flagged:
             # Hallucination guard: the reason ids explain themselves in the tooltip.
@@ -1016,6 +1019,7 @@ class ProjectView(ttk.Frame):
         self.cards = {}
         self.selected_change_id = None
         self.filter_vars = {check: tk.BooleanVar(value=True) for check in CHECKS}
+        self.kind_vars = {kind: tk.BooleanVar(value=True) for kind in CHANGE_KINDS}  # True = shown
         self.preview_var = tk.BooleanVar(value=False)
         self._build()
 
@@ -1063,6 +1067,12 @@ class ProjectView(ttk.Frame):
         for check in CHECKS:
             ttk.Checkbutton(checks_row, text=CHECK_LABELS[check], variable=self.filter_vars[check],
                             command=self.render_segment).pack(side=tk.LEFT, padx=(8, 0))
+        self.kinds_button = ttk.Menubutton(checks_row, text="Kinds ▾", style="Small.TButton")
+        self.kinds_menu = tk.Menu(self.kinds_button, tearoff=False, postcommand=self._fill_kinds_menu)
+        self.kinds_button.configure(menu=self.kinds_menu)
+        self.kinds_button.pack(side=tk.LEFT, padx=(12, 0))
+        Tooltip(self.kinds_button, "Hide kinds of edits from the review, or accept/reject every pending "
+                                   "change of one kind across the project (Alt+Z reverts).")
         self.hint_var = tk.StringVar(value="Alt+A accept · Alt+R reject · Alt+Z undo · Alt+↑/↓ change · Alt+←/→ segment")
         ttk.Label(checks_row, textvariable=self.hint_var, style="Muted.TLabel", font=font(9)).pack(side=tk.RIGHT)
 
@@ -1133,6 +1143,8 @@ class ProjectView(ttk.Frame):
         self.title_var.set(project.name)
         for check in CHECKS:
             self.check_vars[check].set(bool(project.options.checks.get(check)))
+        for kind in CHANGE_KINDS:
+            self.kind_vars[kind].set(kind not in project.options.hidden_kinds)
         self.tree.delete(*self.tree.get_children())
         for chapter in project.chapters:
             chapter_id = "c{0}".format(chapter.index)
@@ -1263,6 +1275,64 @@ class ProjectView(ttk.Frame):
         self.project.options.checks[check] = bool(self.check_vars[check].get())
         self.on_checks_changed()
 
+    # -------------------------------------------------------------- kinds
+    def _fill_kinds_menu(self):
+        """Rebuild the Kinds menu with current counts every time it opens."""
+        menu = self.kinds_menu
+        menu.delete(0, tk.END)
+        if self.project is None:
+            return
+        stats = self.project.progress()
+        menu.add_command(label="Show kinds", state=tk.DISABLED)
+        for kind in CHANGE_KINDS:
+            menu.add_checkbutton(
+                label="{0} ({1})".format(CHANGE_KIND_LABELS[kind], stats["per_kind"][kind]["changes"]),
+                variable=self.kind_vars[kind], onvalue=True, offvalue=False,
+                command=lambda k=kind: self._toggle_kind(k),
+            )
+        menu.add_separator()
+        for decision, label in ((ACCEPTED, "Accept all…"), (REJECTED, "Reject all…")):
+            submenu = tk.Menu(menu, tearoff=False)
+            for kind in CHANGE_KINDS:
+                pending = len(self.project.changes_by_kind(kind, decision=PENDING))
+                submenu.add_command(
+                    label="{0} ({1} pending)".format(CHANGE_KIND_LABELS[kind], pending),
+                    state=tk.NORMAL if pending else tk.DISABLED,
+                    command=lambda k=kind, d=decision: self.decide_kind_everywhere(k, d),
+                )
+            menu.add_cascade(label=label, menu=submenu)
+
+    def _toggle_kind(self, kind):
+        if self.project is None:
+            return
+        hidden = [k for k in CHANGE_KINDS if not self.kind_vars[k].get()]
+        self.project.options.hidden_kinds = hidden
+        self.kinds_button.configure(text="Kinds ▾" if not hidden else "Kinds ({0} hidden) ▾".format(len(hidden)))
+        self.master.schedule_save()
+        self.render_segment()
+
+    def decide_kind_everywhere(self, kind, decision):
+        """Accept or reject every pending change of ``kind`` in the project (one undo group)."""
+        if self.project is None:
+            return
+        pending = self.project.changes_by_kind(kind, decision=PENDING)
+        label = CHANGE_KIND_LABELS[kind].lower()
+        verb = "Accept" if decision == ACCEPTED else "Reject"
+        if not pending:
+            self.master.host.set_status("No pending {0} changes.".format(label))
+            return
+        if not messagebox.askyesno(
+            "{0} all {1} changes?".format(verb, label),
+            "{0} {1} pending {2} change(s) across the whole project?\n\nAlt+Z (Undo) reverts them all at once."
+            .format(verb, len(pending), label),
+        ):
+            return
+        entries = self.project.decide_kind(kind, decision)
+        self.refresh_all()
+        self._after_decision()
+        self.master.host.set_status("{0}ed {1} {2} change(s). Alt+Z reverts them.".format(
+            verb, len(entries), label))
+
     # ------------------------------------------------------------ segment
     def _tree_selected(self, event=None):
         selection = self.tree.selection()
@@ -1295,7 +1365,7 @@ class ProjectView(ttk.Frame):
         for check in CHECKS:
             if not self.filter_vars[check].get():
                 enabled[check] = False
-        return segment.changes(enabled)
+        return segment.changes(enabled, hidden_kinds=self.project.options.hidden_kinds)
 
     def render_segment(self):
         chapter, segment = self._current_segment()
