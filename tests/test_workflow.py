@@ -17,6 +17,10 @@ from core.workflow import (
     CHECK_INSTRUCTIONS,
     CHECK_SPELLING,
     CHECKS,
+    FLAG_GROWTH,
+    FLAG_NOVEL_WORDS,
+    FLAG_REPORT_MARK,
+    FLAG_REWRITE_IN_STRICT_CHECK,
     GLOSSARY_EXPLANATION,
     GLOSSARY_HEADER,
     GLOSSARY_MAX_CHARS,
@@ -46,11 +50,14 @@ from core.workflow import (
     classify_change,
     create_project,
     extract_changes,
+    flag_changes,
+    flag_suspicious,
     format_glossary,
     format_style_guide,
     glossary_matcher,
     glossary_prompt_terms,
     normalise_style_guide,
+    novel_words,
     parse_explanations,
     parse_glossary,
     parse_outline,
@@ -540,6 +547,136 @@ def test_prompt_lists_protected_terms_up_to_the_caps():
     # beyond the caps the post-filter still protects the term
     hit = glossary_matcher(many + ["Kestenholz"])
     assert hit("Kestenholz") and "Kestenholz" not in format_glossary(many + ["Kestenholz"])
+
+
+# ---------------------------------------------------- hallucination guard
+def _single(segment, proposed, check):
+    changes = extract_changes(segment, proposed, check)
+    assert len(changes) == 1, changes
+    return changes[0]
+
+
+def test_growth_rule_fires_on_added_clauses():
+    segment = "The dog sat on the mat."
+    change = _single(segment, "The dog sat on the mat, watching the stranger approach slowly.", CHECK_EXPRESSION)
+    assert change.original_text == "" and len(change.proposed_text) > 12
+    assert flag_suspicious(segment, change) == FLAG_GROWTH
+
+    # a long replacement of a short phrase also counts
+    change = Change("x", CHECK_EXPRESSION, 4, 7, "sat", "settled down comfortably for the evening")
+    assert flag_suspicious(segment, change) == FLAG_GROWTH
+    # exactly at the limit does not fire: 1.6 * 3 + 12 = 16.8 → 16 characters are fine
+    assert flag_suspicious(segment, Change("x", CHECK_EXPRESSION, 4, 7, "sat", "s" * 16)) != FLAG_GROWTH
+
+
+def test_novel_words_rule_needs_two_unknown_content_words():
+    segment = "The dog sat on the mat while the children played."
+    # two content words absent from the segment, but not long enough to trip growth
+    change = Change("x", CHECK_EXPRESSION, 4, 7, "dog", "golden retriever")
+    assert flag_suspicious(segment, change) == FLAG_NOVEL_WORDS
+    assert novel_words(segment, "golden retriever") == ["golden", "retriever"]
+    # one novel word is a normal rephrase
+    assert flag_suspicious(segment, Change("x", CHECK_EXPRESSION, 4, 7, "dog", "the retriever")) is None
+    # stopwords and words already in the segment (any case) never count
+    assert novel_words(segment, "While THE Children played") == []
+    assert novel_words("Er kam nach Hause.", "obwohl er dennoch nach Hause kam") == []
+    assert flag_suspicious(segment, Change("x", CHECK_GRAMMAR, 0, 3, "The", "Although they")) is None
+
+
+def test_rewrite_rule_only_fires_for_strict_checks():
+    segment = "Die Tatsache der Sachlage war die, dass er müde war."
+    proposed = "Tatsächlich war er müde."
+    grammar = extract_changes(segment, proposed, CHECK_GRAMMAR)
+    rewrite = next(c for c in grammar if c.kind == "rewrite")
+    assert flag_suspicious(segment, rewrite) == FLAG_REWRITE_IN_STRICT_CHECK
+    assert [flag_suspicious(segment, c) for c in grammar if c.kind != "rewrite"] == [None, None]
+    spelling = next(c for c in extract_changes(segment, proposed, CHECK_SPELLING) if c.kind == "rewrite")
+    assert flag_suspicious(segment, spelling) == FLAG_REWRITE_IN_STRICT_CHECK
+    expression = next(c for c in extract_changes(segment, proposed, CHECK_EXPRESSION) if c.kind == "rewrite")
+    assert flag_suspicious(segment, expression) is None
+
+
+def test_ordinary_corrections_are_not_flagged():
+    assert flag_suspicious("Teh dog sat.", _single("Teh dog sat.", "The dog sat.", CHECK_SPELLING)) is None
+    german = "Er wusste nicht ob der Zug kommt."
+    assert flag_suspicious(german, _single(german, "Er wusste nicht, ob der Zug kommt.", CHECK_GRAMMAR)) is None
+    segment = "It were very very big."
+    assert flag_suspicious(segment, _single(segment, "It were extremely big.", CHECK_EXPRESSION)) is None
+    assert flag_suspicious(segment, Change("x", CHECK_EXPRESSION, 8, 17, "very very", "really quite")) is None
+    assert flag_suspicious("He run fast.", _single("He run fast.", "He ran fast.", CHECK_GRAMMAR)) is None
+    assert flag_suspicious("a b", Change("x", CHECK_GRAMMAR, 1, 2, " b", "")) is None  # deletion
+
+
+def test_flags_persist_and_default_to_empty():
+    change = Change("g-1", CHECK_GRAMMAR, 0, 3, "dog", "golden retriever", flags=[FLAG_NOVEL_WORDS])
+    assert change.flagged and change.to_dict()["flags"] == [FLAG_NOVEL_WORDS]
+    assert Change.from_dict(change.to_dict()) == change
+    legacy = {key: value for key, value in change.to_dict().items() if key != "flags"}
+    restored = Change.from_dict(legacy)
+    assert restored.flags == [] and not restored.flagged
+    assert Change.from_dict(dict(legacy, flags=None)).flags == []
+    plain = Change("g-2", CHECK_GRAMMAR, 0, 3, "teh", "the")
+    assert plain.flags == [] and plain.to_dict()["flags"] == []
+
+
+class InventingService(FakeService):
+    """Fake backend whose expression check appends a clause the text never had."""
+
+    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None, text_first=False):
+        if instruction.startswith("Improve expression"):
+            return text.replace("It run fast.", "It run fast, chasing the stranger.")
+        return super().stream_edit(model, instruction, text, cancel_event, on_progress, text_first)
+
+
+def test_run_check_flags_after_the_glossary_filter_and_reports(tmp_path):
+    text = "Teh dog were very very big. It run fast."
+    result = run_check(InventingService(), "m", text, CHECK_EXPRESSION, threading.Event())
+    flagged = [c for c in result.changes if c.flagged]
+    assert len(flagged) == 1 and flagged[0].flags == [FLAG_GROWTH]
+    assert "stranger" in flagged[0].proposed_text
+    assert result.status == "done" and len(result.changes) == 1
+
+    # a suppressed change is not flagged (the glossary filter runs first; "fast" sits next to the insertion)
+    result = run_check(InventingService(), "m", text, CHECK_EXPRESSION, threading.Event(), glossary=["fast"])
+    assert result.suppressed and not any(c.flagged for c in result.suppressed)
+    assert not any(c.flagged for c in result.changes)
+
+    project = make_project(tmp_path)
+    events = queue.Queue()
+    ProjectRunner(project, InventingService(), "m", events, parallelism=2).start()
+    for event in drain(events):
+        if event[0] == "workflow_result":
+            apply_result(project, *event[1:])
+    stats = project.progress()
+    assert stats["flagged"] == stats["flagged_pending"] == 1
+    assert stats["per_check"][CHECK_EXPRESSION]["flagged"] == 1
+    assert stats["per_check"][CHECK_SPELLING]["flagged"] == 0
+    report = project.build_report()
+    assert FLAG_REPORT_MARK + " (growth)" in report
+    assert "    - " + FLAG_REPORT_MARK + ": 1 change(s) flagged" in report
+    assert report.count(FLAG_REPORT_MARK) == 2
+
+    project.save()
+    reloaded = Project.load(project.root)
+    assert reloaded.progress()["flagged"] == 1
+    the_change = next(c for _, s in reloaded.all_segments() for c in s.changes(ALL) if c.flagged)
+    the_change.decision = REJECTED
+    assert reloaded.progress()["flagged_pending"] == 0 and reloaded.progress()["flagged"] == 1
+
+
+def test_flag_changes_is_idempotent():
+    segment = "The dog sat on the mat."
+    change = Change("x", CHECK_EXPRESSION, 4, 7, "dog", "golden retriever")
+    assert flag_changes(segment, [change]) == [change]
+    flag_changes(segment, [change])
+    assert change.flags == [FLAG_NOVEL_WORDS]
+
+
+def test_instructions_forbid_invented_content():
+    assert CHECK_INSTRUCTIONS[CHECK_EXPRESSION].endswith(
+        "Never add facts, names, clauses or sentences that are not already in the text."
+    )
+    assert CHECK_INSTRUCTIONS[CHECK_GRAMMAR].endswith("Do not rewrite sentences.")
 
 
 def test_run_check_produces_changes_with_explanations_and_strips_fences():

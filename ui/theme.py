@@ -118,6 +118,9 @@ def apply_theme(root):
     ):
         style.configure("{0}.State.TLabel".format(name), background=bg, foreground=fg,
                         font=(family, 9, "bold"), padding=(6, 1))
+    # Amber badge for changes the hallucination guard flagged.
+    style.configure("Flag.Badge.TLabel", background=PALETTE["warning_soft"], foreground=PALETTE["warning"],
+                    font=(family, 9, "bold"), padding=(6, 1))
 
     style.configure("TButton", background=PALETTE["surface"], foreground=PALETTE["text"], padding=(10, 5),
                     borderwidth=1, bordercolor=PALETTE["border"], relief="flat")
@@ -212,6 +215,59 @@ def _borrow_native_indicators(style):
                 ("Radiobutton.label", {"sticky": "nswe"})]}),
         ]}),
     ])
+
+
+class Tooltip:
+    """Show ``text`` in a small window while the pointer rests on ``widget``."""
+
+    def __init__(self, widget, text, delay=450):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._after = None
+        self._window = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, event=None):
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except tk.TclError:
+                pass
+            self._after = None
+
+    def _show(self):
+        self._after = None
+        if self._window is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            self._window = tk.Toplevel(self.widget)
+            self._window.wm_overrideredirect(True)
+            self._window.wm_geometry("+{0}+{1}".format(x, y))
+            tk.Label(
+                self._window, text=self.text, justify=tk.LEFT, wraplength=320,
+                background=PALETTE["text"], foreground=PALETTE["surface"],
+                font=(font_family(), 9), padx=8, pady=5,
+            ).pack()
+        except tk.TclError:
+            self._window = None
+
+    def _hide(self, event=None):
+        self._cancel()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except tk.TclError:
+                pass
+            self._window = None
 
 
 def style_text(widget, size=11, background=None, readonly=False):

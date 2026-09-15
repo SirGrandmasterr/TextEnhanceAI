@@ -13,6 +13,7 @@ from core.workflow import (
     CHECK_DESCRIPTIONS,
     CHECK_LABELS,
     CHECKS,
+    FLAG_LABELS,
     PROJECT_DIR_SUFFIX,
     PROJECT_FILE,
     SAME_LANGUAGE,
@@ -38,7 +39,7 @@ from core.workflow import (
     parse_outline,
     render_segment,
 )
-from .theme import CHECK_COLORS, PALETTE, STATUS_COLORS, ScrollableFrame, font, style_text
+from .theme import CHECK_COLORS, PALETTE, STATUS_COLORS, ScrollableFrame, Tooltip, font, style_text
 
 STATUS_LABELS = {
     STATUS_QUEUED: "Queued",
@@ -70,6 +71,15 @@ GLOSSARY_PLACEHOLDER = "Thalbrück\nMeret Aubinger\nhyper*"
 GLOSSARY_HINT = ("Protected terms: names, invented words and technical terms the checks must never change, one per "
                  "line. A trailing * protects every word starting with it (hyper* covers hyperdrive). Changes that "
                  "touch a protected term are dropped before you see them.")
+
+
+def flag_tooltip(change):
+    """Human-readable reasons behind a change's hallucination-guard flags."""
+    return "\n".join(FLAG_LABELS.get(flag, flag) for flag in change.flags) or "Possibly invented content."
+
+
+def _flagged_note(stats):
+    return " \u00b7 {0} flagged \u26a0".format(stats["flagged"]) if stats.get("flagged") else ""
 
 
 def _suppressed_note(stats):
@@ -787,6 +797,12 @@ class ChangeCard(ttk.Frame):
         self.badge.pack(side=tk.LEFT)
         self.state_label = ttk.Label(top, text=STATE_LABELS[state], style="{0}.State.TLabel".format(state.title()))
         self.state_label.pack(side=tk.LEFT, padx=8)
+        self.flag_badge = None
+        if change.flagged:
+            # Hallucination guard: the reason ids explain themselves in the tooltip.
+            self.flag_badge = ttk.Label(top, text="\u26a0 check this", style="Flag.Badge.TLabel")
+            self.flag_badge.pack(side=tk.LEFT, padx=(0, 8))
+            Tooltip(self.flag_badge, flag_tooltip(change))
         self.glossary_link = None
         if on_add_to_glossary is not None and change.original_text.strip():
             # A small link: reject this change and protect the original wording from now on.
@@ -987,6 +1003,9 @@ class ProjectView(ttk.Frame):
         ttk.Button(actions, text="Next to review", style="Small.TButton", command=self.jump_to_next_pending).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Reject all shown", style="Small.Danger.TButton", command=lambda: self.decide_all(REJECTED)).pack(side=tk.RIGHT)
         ttk.Button(actions, text="Accept all shown", style="Small.Success.TButton", command=lambda: self.decide_all(ACCEPTED)).pack(side=tk.RIGHT, padx=(0, 6))
+        self.reject_flagged_button = ttk.Button(actions, text="Reject flagged \u26a0", style="Small.TButton",
+                                                command=self.reject_flagged)
+        self.reject_flagged_button.pack(side=tk.RIGHT, padx=(0, 6))
         self.retry_button = ttk.Button(actions, text="Retry failed", style="Small.TButton", command=self.on_retry)
 
         self.cards_frame = ScrollableFrame(right)
@@ -1069,7 +1088,8 @@ class ProjectView(ttk.Frame):
             "{0} chapters · {1} segments · {2:,} words   |   {3} changes proposed · {4} accepted · {5} rejected · "
             "{6} pending{7}"
         ).format(len(self.project.chapters), stats["segments"], stats["words"], stats["changes"],
-                 stats["accepted"], stats["rejected"], stats["pending"], _suppressed_note(stats))
+                 stats["accepted"], stats["rejected"], stats["pending"],
+                 _flagged_note(stats) + _suppressed_note(stats))
 
     def refresh_all(self):
         if self.project is None:
@@ -1104,7 +1124,10 @@ class ProjectView(ttk.Frame):
             label = "{0} pending".format(pending)
         elif status == STATUS_REVIEWED:
             label = "Reviewed ({0})".format(len(changes))
-        self.tree.item(iid, values=("{0} {1}".format(STATUS_SYMBOLS[status], label),), tags=(status,))
+        glyph = STATUS_SYMBOLS[status]
+        if any(change.flagged and change.decision == PENDING for change in changes):
+            glyph = "\u26a0"  # pending changes the hallucination guard flagged
+        self.tree.item(iid, values=("{0} {1}".format(glyph, label),), tags=(status,))
 
     def segment_updated(self, chapter_index, segment_index):
         chapter, segment = self.project.find(chapter_index, segment_index)
@@ -1204,6 +1227,10 @@ class ProjectView(ttk.Frame):
                     self.text.see(start)
         self.text.configure(state=tk.DISABLED)
 
+        self.reject_flagged_button.configure(
+            state=tk.NORMAL if any(c.flagged and c.decision == PENDING for c in changes) else tk.DISABLED
+        )
+
         # --- cards
         self.cards_frame.clear()
         self.cards = {}
@@ -1293,8 +1320,23 @@ class ProjectView(ttk.Frame):
         self.render_segment()
         self._after_decision()
 
+    def reject_flagged(self):
+        """Reject every shown change the hallucination guard flagged that is still pending."""
+        chapter, segment = self._current_segment()
+        if segment is None:
+            return
+        flagged = [c for c in self._visible_changes(segment) if c.flagged and c.decision == PENDING]
+        for change in flagged:
+            change.decision = REJECTED
+        if flagged:
+            self.render_segment()
+            self._after_decision()
+
     def _after_decision(self):
         self.summary_var.set(self._summary_line(self.project.progress()))
+        chapter, segment = self._current_segment()
+        if segment is not None:
+            self._refresh_tree_row(chapter, segment)
         self.master.schedule_save()
 
     def step_change(self, delta, pending_only=False):
