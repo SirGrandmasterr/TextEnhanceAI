@@ -34,6 +34,7 @@ from core.workflow import (
     build_outline_messages,
     change_states,
     create_project,
+    new_decision_group,
     normalise_style_guide,
     parse_glossary,
     parse_outline,
@@ -182,6 +183,87 @@ class StyleGuideDialog(tk.Toplevel):
         self.on_save(text, glossary)
 
 
+class DecisionLogDialog(tk.Toplevel):
+    """Read-only list of every accept/reject the author made; double-click jumps to the change."""
+
+    COLUMNS = (
+        ("time", "Time", 130),
+        ("chapter", "Chapter", 150),
+        ("segment", "Segment", 70),
+        ("change", "Original → proposed", 320),
+        ("decision", "Before → after", 150),
+    )
+
+    def __init__(self, parent, project, on_jump):
+        super().__init__(parent)
+        self.title("Decisions · {0}".format(project.name))
+        self.transient(parent.winfo_toplevel())
+        self.geometry("880x420")
+        self.project = project
+        self.on_jump = on_jump
+        self.entries = {}
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        ttk.Label(frame, text="Newest decision first. Double-click a row to jump to the change.",
+                  style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        self.tree = ttk.Treeview(frame, columns=[key for key, _, _ in self.COLUMNS], show="headings",
+                                 selectmode="browse")
+        for key, heading, width in self.COLUMNS:
+            self.tree.heading(key, text=heading, anchor="w")
+            self.tree.column(key, width=width, stretch=(key == "change"), anchor="w")
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.tree.bind("<Double-1>", self._jump)
+        self.tree.bind("<Return>", self._jump)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="Go to change", command=self._jump).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Close", style="Ghost.TButton", command=self.destroy).pack(side=tk.LEFT, padx=(6, 0))
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.refresh()
+
+    def refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        self.entries = {}
+        log = self.project.decision_log
+        if not log:
+            self.tree.insert("", tk.END, values=("", "", "", "No decisions yet.", ""))
+            return
+        for position, entry in enumerate(reversed(log)):
+            chapter, segment = self.project.find(entry["chapter"], entry["segment"])
+            change = segment.find_change(entry["change_id"]) if segment is not None else None
+            if change is not None:
+                text = "{0} → {1}".format(_one_line(change.original_text) or "∅",
+                                              _one_line(change.proposed_text) or "∅")
+            else:
+                text = "(change no longer exists)"
+            iid = "d{0}".format(position)
+            self.tree.insert("", tk.END, iid=iid, values=(
+                str(entry.get("ts", "")).replace("T", " "),
+                chapter.title if chapter is not None else str(entry["chapter"]),
+                entry["segment"],
+                text,
+                "{0} → {1}".format(entry["before"], entry["after"]),
+            ))
+            self.entries[iid] = entry
+
+    def _jump(self, event=None):
+        selection = self.tree.selection()
+        entry = self.entries.get(selection[0]) if selection else None
+        if entry is not None:
+            self.on_jump(entry["chapter"], entry["segment"], entry["change_id"])
+        return "break"
+
+
+def _one_line(text, limit=60):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 class WorkflowScreen(ttk.Frame):
     """Container that switches between the start view and the project view."""
 
@@ -197,6 +279,7 @@ class WorkflowScreen(ttk.Frame):
                                         on_export=self.export_project, on_retry=self.resume_runner,
                                         on_checks_changed=self.checks_changed, on_options=self.edit_options,
                                         on_add_to_glossary=self.add_to_glossary)
+        self.decision_dialog = None
         self.start_view.pack(fill=tk.BOTH, expand=True)
 
     # ----------------------------------------------------------- lifecycle
@@ -422,6 +505,9 @@ class WorkflowScreen(ttk.Frame):
         self._save_now()
         self.project = None
         self.runner = None
+        if self.decision_dialog is not None and self.decision_dialog.winfo_exists():
+            self.decision_dialog.destroy()
+        self.decision_dialog = None
         self.host.lock_controls(False)
         self.show_start()
         self.host.set_status("Project closed. Progress was saved; open it again any time.")
@@ -516,6 +602,32 @@ class WorkflowScreen(ttk.Frame):
         if self.active:
             self.project_view.decide_selected(REJECTED)
         return "break" if event else None
+
+    def undo(self, event=None):
+        """Revert the last decision (Alt+Z) and show the change it belonged to."""
+        if self.active:
+            undone = self.project_view.undo()
+            if undone is None:
+                self.host.set_status("Nothing to undo.")
+            else:
+                self.host.set_status("Undid {0} decision(s).".format(len(undone)))
+                self._refresh_decision_dialog()
+        return "break" if event else None
+
+    def show_decisions(self):
+        """Open (or raise) the decision log window."""
+        if not self.active:
+            return
+        if self.decision_dialog is not None and self.decision_dialog.winfo_exists():
+            self.decision_dialog.project = self.project
+            self.decision_dialog.refresh()
+            self.decision_dialog.lift()
+            return
+        self.decision_dialog = DecisionLogDialog(self, self.project, on_jump=self.project_view.show_change)
+
+    def _refresh_decision_dialog(self):
+        if self.decision_dialog is not None and self.decision_dialog.winfo_exists():
+            self.decision_dialog.refresh()
 
     def previous(self, event=None):
         if self.active:
@@ -924,6 +1036,7 @@ class ProjectView(ttk.Frame):
         self.pause_button = ttk.Button(buttons, text="Pause", command=self.on_pause)
         self.pause_button.pack(side=tk.LEFT)
         ttk.Button(buttons, text="Options...", command=self.on_options).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(buttons, text="Decisions...", command=lambda: self.master.show_decisions()).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(buttons, text="Export...", style="Accent.TButton", command=self.on_export).pack(side=tk.LEFT, padx=6)
         ttk.Button(buttons, text="Close project", style="Ghost.TButton", command=self.on_close).pack(side=tk.LEFT)
 
@@ -950,7 +1063,7 @@ class ProjectView(ttk.Frame):
         for check in CHECKS:
             ttk.Checkbutton(checks_row, text=CHECK_LABELS[check], variable=self.filter_vars[check],
                             command=self.render_segment).pack(side=tk.LEFT, padx=(8, 0))
-        self.hint_var = tk.StringVar(value="Alt+A accept · Alt+R reject · Alt+↑/↓ change · Alt+←/→ segment")
+        self.hint_var = tk.StringVar(value="Alt+A accept · Alt+R reject · Alt+Z undo · Alt+↑/↓ change · Alt+←/→ segment")
         ttk.Label(checks_row, textvariable=self.hint_var, style="Muted.TLabel", font=font(9)).pack(side=tk.RIGHT)
 
         paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
@@ -1003,6 +1116,9 @@ class ProjectView(ttk.Frame):
         ttk.Button(actions, text="Next to review", style="Small.TButton", command=self.jump_to_next_pending).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Reject all shown", style="Small.Danger.TButton", command=lambda: self.decide_all(REJECTED)).pack(side=tk.RIGHT)
         ttk.Button(actions, text="Accept all shown", style="Small.Success.TButton", command=lambda: self.decide_all(ACCEPTED)).pack(side=tk.RIGHT, padx=(0, 6))
+        self.undo_button = ttk.Button(actions, text="Undo", style="Small.TButton", command=lambda: self.master.undo())
+        self.undo_button.pack(side=tk.RIGHT, padx=(0, 6))
+        Tooltip(self.undo_button, "Revert the last accept/reject (a bulk action is reverted as a whole). Alt+Z")
         self.reject_flagged_button = ttk.Button(actions, text="Reject flagged \u26a0", style="Small.TButton",
                                                 command=self.reject_flagged)
         self.reject_flagged_button.pack(side=tk.RIGHT, padx=(0, 6))
@@ -1157,9 +1273,9 @@ class ProjectView(ttk.Frame):
             chapter_index, segment_index = iid[1:].split("-")
             self.select_segment(int(chapter_index), int(segment_index), from_tree=True)
 
-    def select_segment(self, chapter_index, segment_index, from_tree=False):
+    def select_segment(self, chapter_index, segment_index, from_tree=False, change_id=None):
         self.current = (chapter_index, segment_index)
-        self.selected_change_id = None
+        self.selected_change_id = change_id
         if not from_tree:
             iid = self._segment_iid(chapter_index, segment_index)
             try:
@@ -1293,8 +1409,11 @@ class ProjectView(ttk.Frame):
         )
 
     # ---------------------------------------------------------- decisions
-    def decide(self, change, decision):
-        change.decision = decision
+    def decide(self, change, decision, group=None):
+        chapter, segment = self._current_segment()
+        if segment is None:
+            return
+        self.project.decide(chapter.index, segment.index, change, decision, group=group)
         self.selected_change_id = change.change_id
         self._refresh_cards_only()
         self._after_decision()
@@ -1315,8 +1434,9 @@ class ProjectView(ttk.Frame):
         chapter, segment = self._current_segment()
         if segment is None:
             return
+        group = new_decision_group()
         for change in self._visible_changes(segment):
-            change.decision = decision
+            self.project.decide(chapter.index, segment.index, change, decision, group=group)
         self.render_segment()
         self._after_decision()
 
@@ -1326,11 +1446,36 @@ class ProjectView(ttk.Frame):
         if segment is None:
             return
         flagged = [c for c in self._visible_changes(segment) if c.flagged and c.decision == PENDING]
+        group = new_decision_group()
         for change in flagged:
-            change.decision = REJECTED
+            self.project.decide(chapter.index, segment.index, change, REJECTED, group=group)
         if flagged:
             self.render_segment()
             self._after_decision()
+
+    def undo(self):
+        """Revert the last decision (group) and show the first change it touched.
+
+        Returns the reverted log entries, or None when the log was empty.
+        """
+        if self.project is None:
+            return None
+        undone = self.project.undo()
+        if not undone:
+            return None
+        first = undone[0]
+        self.show_change(first["chapter"], first["segment"], first["change_id"])
+        self._after_decision()
+        return undone
+
+    def show_change(self, chapter_index, segment_index, change_id):
+        """Select ``change_id`` in its segment and scroll it into view."""
+        if self.project is None or self.project.find(chapter_index, segment_index)[1] is None:
+            return
+        self.select_segment(chapter_index, segment_index, change_id=change_id)
+        card = self.cards.get(change_id)
+        if card is not None:
+            self.cards_frame.scroll_to_widget(card)
 
     def _after_decision(self):
         self.summary_var.set(self._summary_line(self.project.progress()))

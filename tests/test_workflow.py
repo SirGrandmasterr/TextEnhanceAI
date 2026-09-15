@@ -17,6 +17,7 @@ from core.workflow import (
     CHECK_INSTRUCTIONS,
     CHECK_SPELLING,
     CHECKS,
+    DECISION_LOG_LIMIT,
     FLAG_GROWTH,
     FLAG_NOVEL_WORDS,
     FLAG_REPORT_MARK,
@@ -56,6 +57,7 @@ from core.workflow import (
     format_style_guide,
     glossary_matcher,
     glossary_prompt_terms,
+    new_decision_group,
     normalise_style_guide,
     novel_words,
     parse_explanations,
@@ -902,3 +904,111 @@ def test_runner_with_nothing_to_do_finishes_immediately(tmp_path):
     events = queue.Queue()
     assert ProjectRunner(project, FakeService(), "m", events).start() == 0
     assert events.get(timeout=1) == ("workflow_finished", False)
+
+
+# ------------------------------------------------------------ decision log
+def make_reviewed_project(tmp_path):
+    """A project whose first non-blank segment carries the three checks of make_segment()."""
+    project = make_project(tmp_path)
+    chapter, segment = next((c, s) for c, s in project.all_segments() if not s.is_blank)
+    reviewed = make_segment()
+    segment.text = reviewed.text
+    segment.results = reviewed.results
+    return project, chapter, segment
+
+
+def test_decide_records_and_applies_and_undo_reverts_one_entry(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    change = segment.changes(ALL)[0]
+    assert project.decision_log == []
+
+    entry = project.decide(chapter.index, segment.index, change, ACCEPTED)
+    assert change.decision == ACCEPTED
+    assert entry["chapter"] == chapter.index and entry["segment"] == segment.index
+    assert entry["change_id"] == change.change_id
+    assert (entry["before"], entry["after"], entry["group"]) == (PENDING, ACCEPTED, None)
+    assert entry["ts"]
+    assert project.decision_log == [entry]
+
+    # deciding the same thing again is not a decision and leaves the log alone
+    assert project.decide(chapter.index, segment.index, change, ACCEPTED) is None
+    assert len(project.decision_log) == 1
+
+    second = project.decide(chapter.index, segment.index, change, REJECTED)
+    assert change.decision == REJECTED
+    assert (second["before"], second["after"]) == (ACCEPTED, REJECTED)
+    assert project.undo() == [second]
+    assert change.decision == ACCEPTED
+    assert len(project.decision_log) == 1
+    assert project.undo() == [entry]
+    assert change.decision == PENDING
+    assert project.decision_log == []
+
+
+def test_undo_reverts_a_whole_group_but_not_the_decision_before_it(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    changes = segment.changes(ALL)
+    assert len(changes) >= 3
+    first = project.decide(chapter.index, segment.index, changes[0], REJECTED)
+
+    group = new_decision_group()
+    assert group and group != new_decision_group()
+    for change in changes:
+        project.decide(chapter.index, segment.index, change, ACCEPTED, group=group)
+    assert all(change.decision == ACCEPTED for change in changes)
+    assert len(project.decision_log) == 1 + len(changes)
+
+    undone = project.undo()
+    assert [entry["change_id"] for entry in undone] == [change.change_id for change in changes]
+    assert all(entry["group"] == group for entry in undone)
+    assert changes[0].decision == REJECTED  # back to the single decision made before the group
+    assert all(change.decision == PENDING for change in changes[1:])
+    assert len(project.decision_log) == 1 and project.decision_log[0]["group"] is None
+
+    assert project.undo() == [first]
+    assert changes[0].decision == PENDING
+    assert project.undo() is None
+
+
+def test_undo_on_an_empty_log_returns_none(tmp_path):
+    project, _, _ = make_reviewed_project(tmp_path)
+    assert project.undo() is None
+    assert project.decision_log == []
+
+
+def test_decision_log_is_capped_at_the_limit_dropping_the_oldest(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    change = segment.changes(ALL)[0]
+    decisions = [ACCEPTED, REJECTED]
+    for index in range(DECISION_LOG_LIMIT + 7):
+        project.decide(chapter.index, segment.index, change, decisions[index % 2])
+    assert len(project.decision_log) == DECISION_LOG_LIMIT
+    # the newest entry is kept, the oldest seven were dropped
+    assert project.decision_log[-1]["after"] == decisions[(DECISION_LOG_LIMIT + 6) % 2]
+    assert project.decision_log[0]["after"] == decisions[7 % 2]
+
+
+def test_decision_log_round_trips_through_save_and_load(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    changes = segment.changes(ALL)
+    project.decide(chapter.index, segment.index, changes[0], ACCEPTED)
+    group = new_decision_group()
+    project.decide(chapter.index, segment.index, changes[1], REJECTED, group=group)
+    project.decide(chapter.index, segment.index, changes[2], REJECTED, group=group)
+    project.save()
+
+    data = json.loads(project.project_file.read_text(encoding="utf-8"))
+    assert data["decision_log"] == project.decision_log
+    reloaded = Project.load(project.root)
+    assert reloaded.decision_log == project.decision_log
+
+    # the reloaded log still undoes against the reloaded changes
+    undone = reloaded.undo()
+    assert [entry["change_id"] for entry in undone] == [changes[1].change_id, changes[2].change_id]
+    _, reloaded_segment = reloaded.find(chapter.index, segment.index)
+    assert reloaded_segment.find_change(changes[1].change_id).decision == PENDING
+    assert reloaded_segment.find_change(changes[0].change_id).decision == ACCEPTED
+
+    # projects saved before the log existed load with an empty one
+    del data["decision_log"]
+    assert Project.from_dict(data).decision_log == []

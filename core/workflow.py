@@ -18,6 +18,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,7 @@ from .models import ACCEPTED, PENDING, REJECTED, ReviewItem
 PROJECT_FORMAT = 1
 PROJECT_DIR_SUFFIX = ".teai"
 PROJECT_FILE = "project.json"
+DECISION_LOG_LIMIT = 5000  # oldest decisions are dropped beyond this
 
 CHECK_SPELLING = "spelling"
 CHECK_GRAMMAR = "grammar"
@@ -414,6 +416,8 @@ class Project:
     model: str = ""
     backend: str = ""
     method: str = ""
+    # one dict per accept/reject the author made, oldest first; see decide() for the keys
+    decision_log: List[dict] = field(default_factory=list)
     root: Optional[Path] = field(default=None, repr=False, compare=False)
 
     # ------------------------------------------------------------ queries
@@ -505,6 +509,56 @@ class Project:
                     stats["pending"] += 1
         return stats
 
+    # ---------------------------------------------------------- decisions
+    def decide(self, chapter_index, segment_index, change, decision, group=None):
+        """Set ``change.decision`` and record it so that it can be undone.
+
+        Bulk actions pass the same ``group`` (see ``new_decision_group``) for
+        every change they touch so that one undo reverts them together.
+        Returns the log entry, or None when the change already had that decision.
+        """
+        if change.decision == decision:
+            return None
+        entry = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "chapter": chapter_index,
+            "segment": segment_index,
+            "change_id": change.change_id,
+            "before": change.decision,
+            "after": decision,
+            "group": group,
+        }
+        change.decision = decision
+        self.decision_log.append(entry)
+        if len(self.decision_log) > DECISION_LOG_LIMIT:
+            del self.decision_log[:-DECISION_LOG_LIMIT]
+        return entry
+
+    def undo(self):
+        """Revert the most recent decision, or the whole group it belongs to.
+
+        Returns the reverted entries in the order they were made, or None when
+        there is nothing to undo.
+        """
+        if not self.decision_log:
+            return None
+        group = self.decision_log[-1]["group"]
+        undone = []
+        while self.decision_log:
+            entry = self.decision_log[-1]
+            if undone and (group is None or entry["group"] != group):
+                break
+            self.decision_log.pop()
+            _, segment = self.find(entry["chapter"], entry["segment"])
+            change = segment.find_change(entry["change_id"]) if segment is not None else None
+            if change is not None:
+                change.decision = entry["before"]
+            undone.append(entry)
+            if group is None:
+                break
+        undone.reverse()
+        return undone
+
     # -------------------------------------------------------- persistence
     @property
     def project_file(self):
@@ -522,6 +576,7 @@ class Project:
             "method": self.method,
             "options": self.options.to_dict(),
             "chapters": [chapter.to_dict() for chapter in self.chapters],
+            "decision_log": [dict(entry) for entry in self.decision_log],
         }
 
     @classmethod
@@ -532,7 +587,9 @@ class Project:
             data["name"], data.get("source_path", ""), data.get("created_at", ""),
             ProjectOptions.from_dict(data.get("options")),
             [Chapter.from_dict(item) for item in data.get("chapters", [])],
-            data.get("model", ""), data.get("backend", ""), data.get("method", ""), root,
+            data.get("model", ""), data.get("backend", ""), data.get("method", ""),
+            decision_log=[dict(entry) for entry in data.get("decision_log") or []],
+            root=root,
         )
 
     def save(self):
@@ -1230,6 +1287,11 @@ class ProjectRunner:
         elapsed = time.time() - self.started_at
         remaining = self.total - self.done
         return elapsed / self.done * remaining
+
+
+def new_decision_group():
+    """Return a fresh id that ties the decisions of one bulk action together."""
+    return uuid.uuid4().hex
 
 
 def apply_result(project, chapter_index, segment_index, check, result):
