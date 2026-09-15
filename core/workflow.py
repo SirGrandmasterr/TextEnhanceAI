@@ -12,12 +12,14 @@ the same words, the earlier check wins (spelling > grammar > expression) and
 the other is reported as *superseded* instead of being applied.
 """
 
+import hashlib
 import json
 import os
 import queue
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +33,8 @@ from .chunking import (
     DEFAULT_TARGET_CHARS,
     chapters_from_outline,
     paragraph_outline,
+    paragraphs,
+    read_text_file,
     split_document,
     split_segments,
     word_count,
@@ -41,21 +45,30 @@ from .models import ACCEPTED, PENDING, REJECTED, ReviewItem
 PROJECT_FORMAT = 1
 PROJECT_DIR_SUFFIX = ".teai"
 PROJECT_FILE = "project.json"
+DECISION_LOG_LIMIT = 5000  # oldest decisions are dropped beyond this
 
 CHECK_SPELLING = "spelling"
 CHECK_GRAMMAR = "grammar"
 CHECK_EXPRESSION = "expression"
-CHECKS = (CHECK_SPELLING, CHECK_GRAMMAR, CHECK_EXPRESSION)  # also the priority order
+CHECKS = (CHECK_SPELLING, CHECK_GRAMMAR, CHECK_EXPRESSION)  # the model checks, also their priority order
+# The author's own corrections live under a pseudo-check that is always enabled,
+# never queued for the model and beats every model check when changes overlap.
+CHECK_AUTHOR = "author"
+ALL_CHECKS = (CHECK_AUTHOR,) + CHECKS  # priority order for merging
 CHECK_LABELS = {
+    CHECK_AUTHOR: "Author",
     CHECK_SPELLING: "Spelling",
     CHECK_GRAMMAR: "Grammar",
     CHECK_EXPRESSION: "Expression",
 }
 CHECK_DESCRIPTIONS = {
+    CHECK_AUTHOR: "Corrections you added yourself while reviewing.",
     CHECK_SPELLING: "Typos, misspellings, capitalization, accents and umlauts.",
     CHECK_GRAMMAR: "Agreement, tense, cases, articles, commas and sentence structure.",
     CHECK_EXPRESSION: "Clearer, more natural wording where a phrase is awkward or vague.",
 }
+AUTHOR_EXPLANATION = "Author's correction"
+EDITED_REPORT_MARK = "✎ edited by the author"
 CHECK_INSTRUCTIONS = {
     CHECK_SPELLING: (
         "Correct spelling mistakes and typos only: misspelled words, wrong or "
@@ -78,6 +91,7 @@ CHECK_INSTRUCTIONS = {
     ),
 }
 FALLBACK_EXPLANATIONS = {
+    CHECK_AUTHOR: AUTHOR_EXPLANATION + ".",
     CHECK_SPELLING: "Spelling correction.",
     CHECK_GRAMMAR: "Grammar or punctuation fix.",
     CHECK_EXPRESSION: "Clearer, more natural expression.",
@@ -236,6 +250,10 @@ class Change:
     ``kind`` (see ``change_kinds.CHANGE_KINDS``) describes what the edit does
     regardless of which check proposed it; it is derived from the two texts
     whenever it is missing or unknown, so older project files need no upgrade.
+
+    ``proposed_text`` is what gets applied; when the author reworded a
+    suggestion (``edited``), ``model_proposed_text`` still holds what the
+    model originally proposed.
     """
 
     change_id: str
@@ -248,11 +266,16 @@ class Change:
     decision: str = PENDING
     kind: str = ""
     flags: List[str] = field(default_factory=list)  # hallucination-guard reason ids, see flag_suspicious
+    model_proposed_text: Optional[str] = None  # None = same as proposed_text (never edited)
+    edited: bool = False
 
     def __post_init__(self):
         if self.kind not in CHANGE_KINDS:
             self.kind = classify_change(self.original_text, self.proposed_text)
         self.flags = [str(flag) for flag in (self.flags or []) if flag]
+        if self.model_proposed_text is None:
+            self.model_proposed_text = self.proposed_text
+        self.edited = bool(self.edited)
 
     @property
     def flagged(self):
@@ -265,7 +288,11 @@ class Change:
 
     @property
     def priority(self):
-        return CHECKS.index(self.check)
+        return ALL_CHECKS.index(self.check)
+
+    @property
+    def is_author(self):
+        return self.check == CHECK_AUTHOR
 
     def to_dict(self):
         return {
@@ -279,6 +306,8 @@ class Change:
             "decision": self.decision,
             "kind": self.kind,
             "flags": list(self.flags),
+            "model_proposed": self.model_proposed_text,
+            "edited": self.edited,
         }
 
     @classmethod
@@ -288,6 +317,7 @@ class Change:
             data.get("original", ""), data.get("proposed", ""),
             data.get("explanation", ""), data.get("decision", PENDING),
             data.get("kind") or "", list(data.get("flags") or []),
+            data.get("model_proposed"), bool(data.get("edited", False)),
         )
 
 
@@ -346,16 +376,28 @@ class Segment:
     def is_blank(self):
         return not self.text.strip()
 
-    def changes(self, enabled):
-        """Return changes of enabled, successful checks sorted by position."""
+    def changes(self, enabled, hidden_kinds=()):
+        """Return changes of enabled, successful checks sorted by position.
+
+        ``hidden_kinds`` is a display filter for the UI only: status(),
+        progress() and render_segment() always see every change.
+        """
         found = []
-        for check in CHECKS:
-            if not enabled.get(check):
+        for check in ALL_CHECKS:
+            if check != CHECK_AUTHOR and not enabled.get(check):
                 continue
             result = self.results.get(check)
             if result and result.status == "done":
-                found.extend(result.changes)
+                found.extend(change for change in result.changes if change.kind not in hidden_kinds)
         return sorted(found, key=lambda change: (change.start, change.priority, change.end))
+
+    def author_result(self, create=False):
+        """Return the pseudo-result holding the author's own corrections (created on demand)."""
+        result = self.results.get(CHECK_AUTHOR)
+        if result is None and create:
+            result = CheckResult(CHECK_AUTHOR, "done", explained=True)
+            self.results[CHECK_AUTHOR] = result
+        return result
 
     def find_change(self, change_id):
         for result in self.results.values():
@@ -443,6 +485,7 @@ class ProjectOptions:
     parallelism: int = 2
     style_guide: str = ""  # author's standing instructions, see build_check_instruction
     glossary: List[str] = field(default_factory=list)  # protected terms, see glossary_matcher
+    hidden_kinds: List[str] = field(default_factory=list)  # change kinds hidden in the review (view filter)
     evaluation_mode: str = EVALUATION_COMBINED  # see EVALUATION_MODES
 
     def enabled_checks(self):
@@ -465,6 +508,7 @@ class ProjectOptions:
             "parallelism": self.parallelism,
             "style_guide": self.style_guide,
             "glossary": list(self.glossary),
+            "hidden_kinds": list(self.hidden_kinds),
             "evaluation_mode": self.evaluation_mode,
         }
 
@@ -479,6 +523,8 @@ class ProjectOptions:
                 options.style_guide = str(value or "")
             elif key == "glossary":
                 options.glossary = parse_glossary(value)
+            elif key == "hidden_kinds":
+                options.hidden_kinds = [kind for kind in (value or []) if kind in CHANGE_KINDS]
             elif key == "evaluation_mode":
                 options.evaluation_mode = value if value in EVALUATION_MODES else EVALUATION_COMBINED
             elif hasattr(options, key):
@@ -498,7 +544,13 @@ class Project:
     model: str = ""
     backend: str = ""
     method: str = ""
+    # one dict per accept/reject the author made, oldest first; see decide() for the keys
+    decision_log: List[dict] = field(default_factory=list)
+    source_sha256: str = ""  # fingerprint of the manuscript text the project was split from
+    source_mtime: float = 0.0
+    consistency: list = field(default_factory=list)  # consistency.Finding objects, see core/consistency.py
     root: Optional[Path] = field(default=None, repr=False, compare=False)
+    source_check_reason: str = field(default="", repr=False, compare=False)  # set by source_changed()
 
     # ------------------------------------------------------------ queries
     def all_segments(self):
@@ -547,6 +599,49 @@ class Project:
                         return chapter, segment
         return None, None
 
+    def invalidate(self, chapter_index, segment_index=None, checks=None):
+        """Drop the results of one segment (or a whole chapter) so they are evaluated again.
+
+        ``checks`` limits the drop to those checks (default: every stored
+        result). Decisions on the dropped changes are gone with the results;
+        their decision-log entries stay but are marked ``"stale": True`` so
+        the Decisions view can grey them out and undo() skips them.
+        Returns the removed (chapter_index, segment_index, check) tuples, which
+        are exactly the tasks pending_tasks() will report for enabled checks.
+        """
+        removed = []
+        for chapter in self.chapters:
+            if chapter.index != chapter_index:
+                continue
+            for segment in chapter.segments:
+                if segment_index is not None and segment.index != segment_index:
+                    continue
+                for check in list(segment.results):
+                    if checks is not None and check not in checks:
+                        continue
+                    if checks is None and check == CHECK_AUTHOR:
+                        continue  # the author's corrections are not model results
+                    result = segment.results.pop(check)
+                    removed.append((chapter.index, segment.index, check))
+                    stale_ids = {change.change_id for change in result.changes}
+                    for entry in self.decision_log:
+                        if (entry["chapter"], entry["segment"]) == (chapter.index, segment.index) \
+                                and entry["change_id"] in stale_ids:
+                            entry["stale"] = True
+        return removed
+
+    def changes_by_kind(self, kind, decision=None):
+        """Return (chapter, segment, change) for every change of ``kind`` in document order.
+
+        ``decision`` restricts the list to changes with that decision.
+        """
+        found = []
+        for chapter, segment in self.all_segments():
+            for change in segment.changes(self.enabled):
+                if change.kind == kind and (decision is None or change.decision == decision):
+                    found.append((chapter, segment, change))
+        return found
+
     def progress(self):
         """Return counters for progress displays and reports."""
         enabled = self.enabled
@@ -560,8 +655,9 @@ class Project:
                     "changes": 0, "accepted": 0, "rejected": 0, "suppressed": 0, "flagged": 0,
                     "by_kind": {kind: 0 for kind in CHANGE_KINDS},
                 }
-                for check in CHECKS
+                for check in ALL_CHECKS
             },
+            "edited": 0,
             "per_kind": {kind: {"changes": 0, "accepted": 0, "rejected": 0} for kind in CHANGE_KINDS},
         }
         checks = self.options.enabled_checks()
@@ -591,6 +687,8 @@ class Project:
                 per_check["changes"] += 1
                 per_check["by_kind"][change.kind] += 1
                 per_kind["changes"] += 1
+                if change.edited:
+                    stats["edited"] += 1
                 if change.flagged:
                     stats["flagged"] += 1
                     per_check["flagged"] += 1
@@ -607,6 +705,179 @@ class Project:
                 else:
                     stats["pending"] += 1
         return stats
+
+    # ------------------------------------------------------------- source
+    def source_changed(self):
+        """Whether the manuscript file differs from the text this project was split from.
+
+        False when the file is missing or the project has no fingerprint; the
+        reason is left in ``source_check_reason`` ("missing", "unknown",
+        "unchanged" or "changed").
+        """
+        path = Path(self.source_path) if self.source_path else None
+        if path is None or not path.is_file():
+            self.source_check_reason = "missing"
+            return False
+        if not self.source_sha256:
+            self.source_check_reason = "unknown"
+            return False
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            self.source_check_reason = "missing"
+            return False
+        if self.source_mtime and abs(mtime - self.source_mtime) < 1e-6:
+            self.source_check_reason = "unchanged"
+            return False
+        try:
+            digest = text_fingerprint(read_text_file(path))
+        except (OSError, UnicodeError):
+            self.source_check_reason = "missing"
+            return False
+        changed = digest != self.source_sha256
+        self.source_check_reason = "changed" if changed else "unchanged"
+        if not changed:
+            self.source_mtime = mtime  # touched but identical: remember so the next check is cheap
+        return changed
+
+    def remember_source(self, text):
+        """Store the fingerprint (and mtime) of ``text`` as the manuscript this project reflects."""
+        self.source_sha256 = text_fingerprint(text)
+        try:
+            self.source_mtime = Path(self.source_path).stat().st_mtime
+        except (OSError, ValueError):
+            self.source_mtime = 0.0
+
+    # ---------------------------------------------------------- decisions
+    def decide(self, chapter_index, segment_index, change, decision, group=None):
+        """Set ``change.decision`` and record it so that it can be undone.
+
+        Bulk actions pass the same ``group`` (see ``new_decision_group``) for
+        every change they touch so that one undo reverts them together.
+        Returns the log entry, or None when the change already had that decision.
+        """
+        if change.decision == decision:
+            return None
+        entry = self._log_entry(chapter_index, segment_index, change, change.decision, decision, group)
+        change.decision = decision
+        self.decision_log.append(entry)
+        self._trim_log()
+        return entry
+
+    def _log_entry(self, chapter_index, segment_index, change, before, after, group, **extra):
+        entry = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "chapter": chapter_index,
+            "segment": segment_index,
+            "change_id": change.change_id,
+            "before": before,
+            "after": after,
+            "group": group,
+        }
+        entry.update(extra)
+        return entry
+
+    def _trim_log(self):
+        if len(self.decision_log) > DECISION_LOG_LIMIT:
+            del self.decision_log[:-DECISION_LOG_LIMIT]
+
+    def edit_change(self, chapter_index, segment_index, change, new_text, group=None):
+        """Replace a suggestion's text with the author's wording and accept it.
+
+        The log entry carries ``before_text``/``after_text`` so undo() restores
+        both the text and the decision. Returns the entry, or None when nothing changed.
+        """
+        new_text = str(new_text)
+        if new_text == change.proposed_text and change.decision == ACCEPTED:
+            return None
+        entry = self._log_entry(chapter_index, segment_index, change, change.decision, ACCEPTED, group,
+                                before_text=change.proposed_text, after_text=new_text)
+        change.proposed_text = new_text
+        change.edited = new_text != change.model_proposed_text
+        change.kind = classify_change(change.original_text, new_text)
+        change.decision = ACCEPTED
+        self.decision_log.append(entry)
+        self._trim_log()
+        return entry
+
+    def add_author_change(self, chapter_index, segment_index, start, end, new_text, group=None):
+        """Record the author's own correction of ``segment.text[start:end]`` as an accepted change.
+
+        Returns the new Change, or None when the span is invalid or the text is unchanged.
+        """
+        _, segment = self.find(chapter_index, segment_index)
+        if segment is None:
+            return None
+        start, end = int(start), int(end)
+        if not 0 <= start <= end <= len(segment.text):
+            return None
+        original = segment.text[start:end]
+        new_text = str(new_text)
+        if new_text == original:
+            return None
+        result = segment.author_result(create=True)
+        numbers = [int(c.change_id.rsplit("-", 1)[1]) for c in result.changes if c.change_id.rsplit("-", 1)[1].isdigit()]
+        change = Change(
+            "{0}-{1}".format(CHECK_AUTHOR, max(numbers, default=0) + 1), CHECK_AUTHOR, start, end,
+            original, new_text, AUTHOR_EXPLANATION, ACCEPTED,
+        )
+        result.changes.append(change)
+        result.changes.sort(key=lambda c: (c.start, c.end))
+        self.decision_log.append(self._log_entry(chapter_index, segment_index, change, "", ACCEPTED, group, created=True))
+        self._trim_log()
+        return change
+
+    def decide_kind(self, kind, decision, group=None):
+        """Apply ``decision`` to every pending change of ``kind`` as one undoable group.
+
+        Returns the log entries that were written.
+        """
+        group = group or new_decision_group()
+        entries = []
+        for chapter, segment, change in self.changes_by_kind(kind, decision=PENDING):
+            entry = self.decide(chapter.index, segment.index, change, decision, group=group)
+            if entry is not None:
+                entries.append(entry)
+        return entries
+
+    def undo(self):
+        """Revert the most recent decision, or the whole group it belongs to.
+
+        Returns the reverted entries in the order they were made, or None when
+        there is nothing to undo.
+        """
+        live = [index for index, entry in enumerate(self.decision_log) if not entry.get("stale")]
+        if not live:
+            return None
+        group = self.decision_log[live[-1]]["group"]
+        indices = []
+        for index in reversed(live):
+            if indices and (group is None or self.decision_log[index]["group"] != group):
+                break
+            indices.append(index)
+            if group is None:
+                break
+        undone = []
+        for index in indices:  # newest first, so the remaining indices stay valid
+            entry = self.decision_log.pop(index)
+            _, segment = self.find(entry["chapter"], entry["segment"])
+            change = segment.find_change(entry["change_id"]) if segment is not None else None
+            if change is not None:
+                if entry.get("created"):
+                    result = segment.author_result()
+                    if result is not None:
+                        result.changes = [c for c in result.changes if c is not change]
+                        if not result.changes:
+                            del segment.results[CHECK_AUTHOR]
+                else:
+                    if "before_text" in entry:
+                        change.proposed_text = entry["before_text"]
+                        change.edited = change.proposed_text != change.model_proposed_text
+                        change.kind = classify_change(change.original_text, change.proposed_text)
+                    change.decision = entry["before"]
+            undone.append(entry)
+        undone.reverse()
+        return undone
 
     # -------------------------------------------------------- persistence
     @property
@@ -625,17 +896,34 @@ class Project:
             "method": self.method,
             "options": self.options.to_dict(),
             "chapters": [chapter.to_dict() for chapter in self.chapters],
+            "decision_log": [dict(entry) for entry in self.decision_log],
+            "source_sha256": self.source_sha256,
+            "source_mtime": self.source_mtime,
+            "consistency": [finding.to_dict() for finding in self.consistency],
         }
 
     @classmethod
     def from_dict(cls, data, root=None):
+        from .consistency import Finding  # consistency imports this module
+
         if data.get("format", PROJECT_FORMAT) > PROJECT_FORMAT:
             raise ValueError("This project was saved by a newer TextEnhanceAI version.")
+        findings = []
+        for item in data.get("consistency") or []:
+            try:
+                findings.append(Finding.from_dict(item))
+            except (KeyError, TypeError, ValueError):
+                continue  # a damaged finding is dropped, the project still loads
         return cls(
             data["name"], data.get("source_path", ""), data.get("created_at", ""),
             ProjectOptions.from_dict(data.get("options")),
             [Chapter.from_dict(item) for item in data.get("chapters", [])],
-            data.get("model", ""), data.get("backend", ""), data.get("method", ""), root,
+            data.get("model", ""), data.get("backend", ""), data.get("method", ""),
+            decision_log=[dict(entry) for entry in data.get("decision_log") or []],
+            source_sha256=str(data.get("source_sha256") or ""),
+            source_mtime=float(data.get("source_mtime") or 0.0),
+            consistency=findings,
+            root=root,
         )
 
     def save(self):
@@ -693,6 +981,8 @@ class Project:
         return {"chapters": written, "document": combined, "report": report}
 
     def build_report(self):
+        from .statistics import project_statistics, statistics_markdown  # statistics imports this module
+
         stats = self.progress()
         lines = [
             "# Review report: {0}\n".format(self.name),
@@ -723,6 +1013,10 @@ class Project:
                 lines.append("    - Glossary suppressed {0} proposed change(s)".format(per["suppressed"]))
             if per["flagged"]:
                 lines.append("    - {0}: {1} change(s) flagged".format(FLAG_REPORT_MARK, per["flagged"]))
+        if stats["per_check"][CHECK_AUTHOR]["changes"]:
+            lines.append("  - Author's corrections: {0}".format(stats["per_check"][CHECK_AUTHOR]["changes"]))
+        if stats["edited"]:
+            lines.append("  - Suggestions reworded by the author: {0}".format(stats["edited"]))
         lines.append("")
         for chapter in self.chapters:
             lines.append("## {0}. {1}\n".format(chapter.index, chapter.title))
@@ -742,8 +1036,12 @@ class Project:
                     )
                     if change.flagged:
                         line += " — {0} ({1})".format(FLAG_REPORT_MARK, ", ".join(change.flags))
+                    if change.edited:
+                        line += " — {0} (model proposed `{1}`)".format(EDITED_REPORT_MARK, _inline(change.model_proposed_text))
                     lines.append(line)
             lines.append("")
+        lines.append(statistics_markdown(project_statistics(self)))
+        lines.append("")
         return "\n".join(lines)
 
 
@@ -821,6 +1119,90 @@ def render_segment(segment, enabled):
     return "".join(output)
 
 
+def render_segment_annotated(segment, enabled, offset=0):
+    """Render a segment like render_segment() and locate every change in the output.
+
+    Returns ``(text, spans)``; each span is a dict with ``start``/``end`` in
+    output coordinates (shifted by ``offset``), the change's ``state`` (see
+    change_states), ``change_id``, ``segment`` index, ``check`` and ``flags``.
+    Applied changes cover their proposed text, all others (pending, rejected,
+    superseded) the original text they would touch — inside an applied
+    replacement that collapses onto the replacement.
+    """
+    text = segment.text
+    applied = applied_changes(segment, enabled)
+    states = change_states(segment, enabled)
+    # start_map[i]/end_map[i]: where original character i begins/ends in the output
+    start_map = [0] * (len(text) + 1)
+    end_map = [0] * (len(text) + 1)
+    output = []
+    out = offset
+    position = 0
+    replaced = {}
+    for change in applied:
+        for index in range(position, change.start):
+            start_map[index] = out
+            out += 1
+            end_map[index] = out
+        replacement_start = out
+        out += len(change.proposed_text)
+        for index in range(change.start, change.end):
+            start_map[index] = replacement_start
+            end_map[index] = out
+        replaced[change.change_id] = (replacement_start, out)
+        output.append(text[position:change.start])
+        output.append(change.proposed_text)
+        position = change.end
+    for index in range(position, len(text)):
+        start_map[index] = out
+        out += 1
+        end_map[index] = out
+    start_map[len(text)] = end_map[len(text)] = out
+    output.append(text[position:])
+
+    spans = []
+    for change in segment.changes(enabled):
+        if change.change_id in replaced:
+            start, end = replaced[change.change_id]
+        elif change.end > change.start:
+            start, end = start_map[change.start], end_map[change.end - 1]
+        else:
+            start = end = start_map[change.start]
+        spans.append({
+            "start": start, "end": end, "state": states[change.change_id], "change_id": change.change_id,
+            "segment": segment.index, "check": change.check, "flags": list(change.flags),
+        })
+    return "".join(output), spans
+
+
+def render_chapter_annotated(project, chapter):
+    """Render a chapter with its heading and locate every change of every segment.
+
+    The text equals ``project.render_chapter(chapter)``; the spans (see
+    render_segment_annotated) use offsets into that text.
+    """
+    enabled = project.enabled
+    parts = [chapter.heading]
+    spans = []
+    offset = len(chapter.heading)
+    for segment in chapter.segments:
+        rendered, segment_spans = render_segment_annotated(segment, enabled, offset)
+        parts.append(rendered)
+        parts.append(segment.trailing)
+        spans.extend(segment_spans)
+        offset += len(rendered) + len(segment.trailing)
+    parts.append(chapter.trailing)
+    return "".join(parts), spans
+
+
+def pending_changes(project):
+    """Yield (chapter, segment, change) for every pending change in document order."""
+    for chapter, segment in project.all_segments():
+        for change in segment.changes(project.enabled):
+            if change.decision == PENDING:
+                yield chapter, segment, change
+
+
 # ------------------------------------------------------------- creation
 def create_project(source_path, text, options, model="", backend="", root=None):
     """Split a manuscript and return an unevaluated project."""
@@ -842,7 +1224,139 @@ def create_project(source_path, text, options, model="", backend="", root=None):
         options, chapters, model, backend, result.method,
         root=Path(root) if root else source_path.with_name(source_path.stem + PROJECT_DIR_SUFFIX),
     )
+    project.remember_source(text)
     return project
+
+
+def text_fingerprint(text):
+    """SHA-256 of the manuscript text (after read_text_file's newline normalisation)."""
+    return hashlib.sha256(text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")).hexdigest()
+
+
+def _chapters_for_resync(project, text):
+    """Split ``text`` the way the project was split; model-chosen boundaries are kept by matching.
+
+    For ``chapter_mode == "model"`` each old chapter's first paragraph is looked
+    up in the new text; when every chapter is found again the old boundaries
+    (and titles) are reused, otherwise the automatic split is the fallback.
+    """
+    options = project.options
+    if options.chapter_mode == "model" and len(project.chapters) > 1:
+        new_paragraphs = [paragraph.strip() for paragraph, _ in paragraphs(text)]
+        starts = []
+        for chapter in project.chapters[1:]:
+            first = next((segment.text for segment in chapter.segments if segment.text.strip()), "")
+            lead = first.strip().split("\n\n")[0].strip()
+            index = next((number for number, paragraph in enumerate(new_paragraphs) if lead and paragraph == lead), None)
+            if index is None or (starts and index <= starts[-1]):
+                starts = None
+                break
+            starts.append(index)
+        if starts:
+            result = chapters_from_outline(text, starts, [chapter.title for chapter in project.chapters])
+            for chapter in result.chapters:
+                chapter.segments = split_segments(chapter.body, options.target_chars, options.max_chars)
+            return result
+    return split_document(
+        text, mode="auto" if options.chapter_mode == "model" else options.chapter_mode,
+        target_chars=options.target_chars, max_chars=options.max_chars, max_chapter_chars=options.max_chapter_chars,
+    )
+
+
+def resync_project(project, new_text):
+    """Re-split the changed manuscript and carry results and decisions over to identical segments.
+
+    Segments are matched by exact text (duplicates pair up in order). Unmatched
+    old segments that still carry pending or accepted changes are written to
+    ``<root>/resync-<timestamp>.md`` before they are dropped. Decision-log
+    entries are re-pointed at the kept segments' new positions, those of
+    dropped segments are marked stale, and a stale "resync" marker entry
+    records the summary. Returns ``{"kept", "new", "removed", "chapters", "report"}``.
+    """
+    result = _chapters_for_resync(project, new_text)
+    pool = {}
+    for chapter in project.chapters:
+        for segment in chapter.segments:
+            pool.setdefault(segment.text, []).append((chapter.index, segment.index, segment))
+    kept = new = 0
+    remap = {}
+    chapters = []
+    for chapter in result.chapters:
+        segments = []
+        for piece in chapter.segments:
+            candidates = pool.get(piece.text)
+            if candidates:
+                old_chapter, old_index, old_segment = candidates.pop(0)
+                segment = Segment(piece.index, piece.text, piece.trailing, old_segment.results)
+                remap[(old_chapter, old_index)] = (chapter.index, piece.index)
+                kept += 1
+            else:
+                segment = Segment(piece.index, piece.text, piece.trailing)
+                if piece.text.strip():
+                    new += 1
+            segments.append(segment)
+        chapters.append(Chapter(chapter.index, chapter.title, chapter.heading, chapter.trailing, segments))
+
+    dropped = [(chapter_index, segment_index, segment) for entries in pool.values()
+               for chapter_index, segment_index, segment in entries if segment.text.strip()]
+    report = None
+    if project.root is not None:
+        report = _write_resync_report(project, dropped)
+    removed = len(dropped)
+    dropped_keys = {(chapter_index, segment_index) for chapter_index, segment_index, _ in dropped}
+    for entry in project.decision_log:
+        key = (entry.get("chapter"), entry.get("segment"))
+        if key in remap:
+            entry["chapter"], entry["segment"] = remap[key]
+        elif key in dropped_keys or entry.get("chapter") is not None:
+            entry["stale"] = True
+    project.chapters = chapters
+    project.method = result.method
+    project.remember_source(new_text)
+    summary = {"kept": kept, "new": new, "removed": removed, "chapters": len(chapters), "report": report}
+    project.decision_log.append({
+        "ts": datetime.now().isoformat(timespec="seconds"), "chapter": None, "segment": None, "change_id": None,
+        "before": None, "after": None, "group": None, "stale": True,
+        "resync": {"kept": kept, "new": new, "removed": removed},
+    })
+    project._trim_log()
+    return summary
+
+
+def _write_resync_report(project, dropped):
+    """List the pending and accepted changes of segments that a re-sync dropped; None when there are none."""
+    enabled = project.enabled
+    lines = []
+    for chapter_index, segment_index, segment in dropped:
+        changes = [change for change in segment.changes(enabled) if change.decision != REJECTED]
+        if not changes:
+            continue
+        chapter, _ = project.find(chapter_index, segment_index)
+        title = chapter.title if chapter is not None else str(chapter_index)
+        lines.append("## {0} · segment {1}\n".format(title, segment_index))
+        lines.append("> " + segment.text.strip().replace("\n", "\n> ") + "\n")
+        states = change_states(segment, enabled)
+        for change in changes:
+            lines.append("- [{0}] `{1}` → `{2}` — {3}".format(
+                CHECK_LABELS[change.check], _inline(change.original_text), _inline(change.proposed_text),
+                states[change.change_id]))
+        lines.append("")
+    if not lines:
+        return None
+    project.root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = project.root / "resync-{0}.md".format(stamp)
+    number = 1
+    while path.exists():
+        number += 1
+        path = project.root / "resync-{0}-{1}.md".format(stamp, number)
+    header = [
+        "# Changes dropped by the re-sync of {0}\n".format(project.name),
+        "The manuscript changed and these segments no longer exist in it. Their pending and accepted "
+        "changes are listed here so that nothing is lost silently.\n",
+    ]
+    path.write_text("\n".join(header + lines), encoding="utf-8")
+    return path
 
 
 def apply_model_outline(project, text, starts, titles=None):
@@ -1551,6 +2065,7 @@ class ProjectRunner:
         self._lock = threading.Lock()
         self._threads = []
         self._explainer = None
+        self._explainer_exiting = False  # set under the lock when the explainer decided to stop
         self.started_at = None
         self.structured_output = True  # cleared when the backend rejects response_format
 
@@ -1562,6 +2077,15 @@ class ProjectRunner:
     @property
     def active(self):
         return any(thread.is_alive() for thread in self._threads)
+
+    def has_work(self):
+        """Whether tasks are queued, running or waiting for explanations.
+
+        A ``workflow_finished`` event seen while this is True is stale: tasks
+        were enqueued after the workers that emitted it had retired.
+        """
+        with self._lock:
+            return self.running > 0 or not self.tasks.empty() or not self.explain_queue.empty()
 
     def start(self):
         """Queue every pending task and start the workers; returns the task count.
@@ -1585,14 +2109,47 @@ class ProjectRunner:
         workers = min(self.parallelism, len(pending))
         self._active_workers = workers
         if self.batches_explanations:
-            self._explainer = threading.Thread(target=self._explainer_loop, name="teai-explain", daemon=True)
-            self._threads.append(self._explainer)
-            self._explainer.start()
-        for number in range(workers):
-            thread = threading.Thread(target=self._worker, name="teai-eval-{0}".format(number), daemon=True)
+            self._start_explainer()
+        self._spawn(workers)
+        return len(pending)
+
+    def enqueue(self, tasks):
+        """Add (chapter, segment, check) tasks to a running evaluation; returns how many were queued.
+
+        Workers retire as soon as the queue is empty, so new workers are started
+        (up to ``parallelism``) for the tasks, and the explainer is restarted if
+        it already stopped. Works after the runner finished, too: the new tasks
+        then produce a second ``workflow_finished`` event.
+        """
+        tasks = list(tasks)
+        if not tasks:
+            return 0
+        if self.started_at is None:
+            self.started_at = time.time()
+        with self._lock:
+            self.total += len(tasks)
+            for task in tasks:
+                self.tasks.put(task)
+            spawn = max(0, min(self.parallelism - self._active_workers, len(tasks)))
+            self._active_workers += spawn
+            restart_explainer = self.batches_explanations and (self._explainer is None or self._explainer_exiting)
+            if restart_explainer:
+                self._explainer_exiting = False
+        if restart_explainer:
+            self._start_explainer()
+        self._spawn(spawn)
+        return len(tasks)
+
+    def _start_explainer(self):
+        self._explainer = threading.Thread(target=self._explainer_loop, name="teai-explain", daemon=True)
+        self._threads.append(self._explainer)
+        self._explainer.start()
+
+    def _spawn(self, count):
+        for _ in range(count):
+            thread = threading.Thread(target=self._worker, name="teai-eval-{0}".format(len(self._threads)), daemon=True)
             self._threads.append(thread)
             thread.start()
-        return len(pending)
 
     def _emit_results(self, chapter_index, segment_index, results):
         """Publish the results of one finished task (one or several checks) plus its progress."""
@@ -1611,22 +2168,40 @@ class ProjectRunner:
     def cancel(self):
         self.cancel_event.set()
 
+    def _next_task(self):
+        """Take the next task and count it as running; None when the queue is empty.
+
+        Both happen under one lock so that has_work() never sees a task that is
+        neither queued nor running.
+        """
+        with self._lock:
+            try:
+                task = self.tasks.get_nowait()
+            except queue.Empty:
+                return None
+            self.running += 1
+            return task
+
+    def _skip_task(self):
+        with self._lock:
+            self.running -= 1
+
     def _worker(self):
         options = self.project.options
         try:
             while not self.cancel_event.is_set():
-                try:
-                    chapter_index, segment_index, check = self.tasks.get_nowait()
-                except queue.Empty:
+                task = self._next_task()
+                if task is None:
                     break
+                chapter_index, segment_index, check = task
                 _, segment = self.project.find(chapter_index, segment_index)
                 if segment is None:
+                    self._skip_task()
                     continue
                 checks = self.project.pending_checks(segment) if check is None else [check]
                 if not checks:
+                    self._skip_task()
                     continue
-                with self._lock:
-                    self.running += 1
                 for pending in checks:
                     self.events.put(("workflow_started", chapter_index, segment_index, pending))
                 deferred = None  # (result, remaining changes) handed to the explainer
@@ -1669,13 +2244,14 @@ class ProjectRunner:
                 self._emit_results(chapter_index, segment_index, {pending: results[pending] for pending in checks})
         finally:
             with self._lock:
+                # Decided and sent under the lock so that enqueue() cannot slip new
+                # tasks in between the count reaching zero and the event being sent.
                 self._active_workers -= 1
-                last = self._active_workers == 0
-            if last:
-                if self._explainer is not None:
-                    self.explain_queue.put(None)  # the explainer emits workflow_finished
-                else:
-                    self.events.put(("workflow_finished", self.cancel_event.is_set()))
+                if self._active_workers == 0:
+                    if self._explainer is not None and not self._explainer_exiting:
+                        self.explain_queue.put(None)  # the explainer emits workflow_finished
+                    else:
+                        self.events.put(("workflow_finished", self.cancel_event.is_set()))
 
     # ------------------------------------------------------------ explainer
     def _explainer_loop(self):
@@ -1693,9 +2269,8 @@ class ProjectRunner:
                 except queue.Empty:
                     continue
                 batch = []
-                if item is None:
-                    finished = True
-                else:
+                sentinel = item is None
+                if not sentinel:
                     batch.append(item)
                 while True:  # take everything that is ready now, so groups form naturally
                     try:
@@ -1703,9 +2278,16 @@ class ProjectRunner:
                     except queue.Empty:
                         break
                     if more is None:
-                        finished = True
+                        sentinel = True
                     else:
                         batch.append(more)
+                if sentinel:
+                    with self._lock:
+                        # enqueue() may have started new workers since the sentinel was sent;
+                        # then this thread keeps serving them instead of stopping.
+                        if self._active_workers == 0:
+                            self._explainer_exiting = True
+                            finished = True
                 if batch:
                     self._explain_batch(batch)
         finally:
@@ -1758,6 +2340,11 @@ class ProjectRunner:
         elapsed = time.time() - self.started_at
         remaining = self.total - self.done
         return elapsed / self.done * remaining
+
+
+def new_decision_group():
+    """Return a fresh id that ties the decisions of one bulk action together."""
+    return uuid.uuid4().hex
 
 
 def apply_result(project, chapter_index, segment_index, check, result):

@@ -1,9 +1,11 @@
 """Tests for the automatic manuscript workflow (core logic, no Tk)."""
 
 import json
+import os
 import queue
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -11,7 +13,10 @@ from core.backend import BackendUnavailable, EditCancelled, OutputTruncated, Str
 from core.models import ACCEPTED, PENDING, REJECTED
 from core.change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS, levenshtein
 from core.workflow import (
+    ALL_CHECKS,
+    AUTHOR_EXPLANATION,
     CHANGE_KINDS as WORKFLOW_CHANGE_KINDS,
+    CHECK_AUTHOR,
     CHECK_EXPRESSION,
     CHECK_GRAMMAR,
     CHECK_INSTRUCTIONS,
@@ -19,6 +24,7 @@ from core.workflow import (
     CHECKS,
     CANNED_EXPLANATIONS,
     COMBINED_SCHEMA,
+    DECISION_LOG_LIMIT,
     EVALUATION_COMBINED,
     EVALUATION_SEPARATE,
     EXPLANATION_GROUP_SIZE,
@@ -47,6 +53,7 @@ from core.workflow import (
     ProjectOptions,
     ProjectRunner,
     Segment,
+    apply_model_outline,
     apply_result,
     applied_changes,
     build_check_instruction,
@@ -68,14 +75,20 @@ from core.workflow import (
     format_style_guide,
     glossary_matcher,
     glossary_prompt_terms,
+    new_decision_group,
     normalise_style_guide,
     novel_words,
     parse_combined,
     parse_explanations,
     parse_glossary,
     parse_outline,
+    pending_changes,
+    render_chapter_annotated,
     render_segment,
+    render_segment_annotated,
     request_explanations,
+    resync_project,
+    text_fingerprint,
     run_check,
     run_segment_combined,
     sanity_check_proposal,
@@ -1388,3 +1401,662 @@ def test_runner_with_nothing_to_do_finishes_immediately(tmp_path):
     events = queue.Queue()
     assert ProjectRunner(project, FakeService(), "m", events).start() == 0
     assert events.get(timeout=1) == ("workflow_finished", False)
+
+
+# ------------------------------------------------------------ decision log
+def make_reviewed_project(tmp_path):
+    """A project whose first non-blank segment carries the three checks of make_segment()."""
+    project = make_project(tmp_path)
+    chapter, segment = next((c, s) for c, s in project.all_segments() if not s.is_blank)
+    reviewed = make_segment()
+    segment.text = reviewed.text
+    segment.results = reviewed.results
+    return project, chapter, segment
+
+
+def test_decide_records_and_applies_and_undo_reverts_one_entry(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    change = segment.changes(ALL)[0]
+    assert project.decision_log == []
+
+    entry = project.decide(chapter.index, segment.index, change, ACCEPTED)
+    assert change.decision == ACCEPTED
+    assert entry["chapter"] == chapter.index and entry["segment"] == segment.index
+    assert entry["change_id"] == change.change_id
+    assert (entry["before"], entry["after"], entry["group"]) == (PENDING, ACCEPTED, None)
+    assert entry["ts"]
+    assert project.decision_log == [entry]
+
+    # deciding the same thing again is not a decision and leaves the log alone
+    assert project.decide(chapter.index, segment.index, change, ACCEPTED) is None
+    assert len(project.decision_log) == 1
+
+    second = project.decide(chapter.index, segment.index, change, REJECTED)
+    assert change.decision == REJECTED
+    assert (second["before"], second["after"]) == (ACCEPTED, REJECTED)
+    assert project.undo() == [second]
+    assert change.decision == ACCEPTED
+    assert len(project.decision_log) == 1
+    assert project.undo() == [entry]
+    assert change.decision == PENDING
+    assert project.decision_log == []
+
+
+def test_undo_reverts_a_whole_group_but_not_the_decision_before_it(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    changes = segment.changes(ALL)
+    assert len(changes) >= 3
+    first = project.decide(chapter.index, segment.index, changes[0], REJECTED)
+
+    group = new_decision_group()
+    assert group and group != new_decision_group()
+    for change in changes:
+        project.decide(chapter.index, segment.index, change, ACCEPTED, group=group)
+    assert all(change.decision == ACCEPTED for change in changes)
+    assert len(project.decision_log) == 1 + len(changes)
+
+    undone = project.undo()
+    assert [entry["change_id"] for entry in undone] == [change.change_id for change in changes]
+    assert all(entry["group"] == group for entry in undone)
+    assert changes[0].decision == REJECTED  # back to the single decision made before the group
+    assert all(change.decision == PENDING for change in changes[1:])
+    assert len(project.decision_log) == 1 and project.decision_log[0]["group"] is None
+
+    assert project.undo() == [first]
+    assert changes[0].decision == PENDING
+    assert project.undo() is None
+
+
+def test_undo_on_an_empty_log_returns_none(tmp_path):
+    project, _, _ = make_reviewed_project(tmp_path)
+    assert project.undo() is None
+    assert project.decision_log == []
+
+
+def test_decision_log_is_capped_at_the_limit_dropping_the_oldest(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    change = segment.changes(ALL)[0]
+    decisions = [ACCEPTED, REJECTED]
+    for index in range(DECISION_LOG_LIMIT + 7):
+        project.decide(chapter.index, segment.index, change, decisions[index % 2])
+    assert len(project.decision_log) == DECISION_LOG_LIMIT
+    # the newest entry is kept, the oldest seven were dropped
+    assert project.decision_log[-1]["after"] == decisions[(DECISION_LOG_LIMIT + 6) % 2]
+    assert project.decision_log[0]["after"] == decisions[7 % 2]
+
+
+def test_decision_log_round_trips_through_save_and_load(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    changes = segment.changes(ALL)
+    project.decide(chapter.index, segment.index, changes[0], ACCEPTED)
+    group = new_decision_group()
+    project.decide(chapter.index, segment.index, changes[1], REJECTED, group=group)
+    project.decide(chapter.index, segment.index, changes[2], REJECTED, group=group)
+    project.save()
+
+    data = json.loads(project.project_file.read_text(encoding="utf-8"))
+    assert data["decision_log"] == project.decision_log
+    reloaded = Project.load(project.root)
+    assert reloaded.decision_log == project.decision_log
+
+    # the reloaded log still undoes against the reloaded changes
+    undone = reloaded.undo()
+    assert [entry["change_id"] for entry in undone] == [changes[1].change_id, changes[2].change_id]
+    _, reloaded_segment = reloaded.find(chapter.index, segment.index)
+    assert reloaded_segment.find_change(changes[1].change_id).decision == PENDING
+    assert reloaded_segment.find_change(changes[0].change_id).decision == ACCEPTED
+
+    # projects saved before the log existed load with an empty one
+    del data["decision_log"]
+    assert Project.from_dict(data).decision_log == []
+
+
+# -------------------------------------------------------------- kind filters
+def test_hidden_kinds_only_filter_the_view():
+    segment = make_segment()
+    all_changes = segment.changes(ALL)
+    kinds = {change.kind for change in all_changes}
+    assert len(kinds) > 1
+    hidden = sorted(kinds)[0]
+    shown = segment.changes(ALL, hidden_kinds=[hidden])
+    assert shown and all(change.kind != hidden for change in shown)
+    assert len(shown) < len(all_changes)
+    # the filter never changes what is applied, counted or reported
+    for change in all_changes:
+        change.decision = ACCEPTED
+    assert render_segment(segment, ALL) == "The dog was enormous and it ran fast."
+    assert segment.status(ALL) == STATUS_REVIEWED
+    assert len(change_states(segment, ALL)) == len(all_changes)
+
+
+def test_hidden_kinds_round_trip_and_drop_unknown_kinds():
+    options = ProjectOptions(hidden_kinds=["punctuation", "spelling"])
+    data = options.to_dict()
+    assert data["hidden_kinds"] == ["punctuation", "spelling"]
+    assert ProjectOptions.from_dict(data).hidden_kinds == ["punctuation", "spelling"]
+    assert ProjectOptions.from_dict({"hidden_kinds": ["spelling", "bogus", 3]}).hidden_kinds == ["spelling"]
+    assert ProjectOptions.from_dict({}).hidden_kinds == []
+
+
+def test_changes_by_kind_and_bulk_decide_only_touch_pending_changes_of_that_kind(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    changes = segment.changes(ALL)
+    by_kind = {}
+    for change in changes:
+        by_kind.setdefault(change.kind, []).append(change)
+    kind, targets = max(by_kind.items(), key=lambda item: len(item[1]))
+    others = [change for change in changes if change.kind != kind]
+    assert others, "need a second kind to prove the filter"
+    assert [c for _, _, c in project.changes_by_kind(kind)] == targets
+    assert project.changes_by_kind("bogus") == []
+
+    # one already decided change of that kind stays as it is
+    project.decide(chapter.index, segment.index, targets[0], REJECTED)
+    entries = project.decide_kind(kind, ACCEPTED)
+    assert len(entries) == len(targets) - 1
+    assert len({entry["group"] for entry in entries}) == 1 and entries[0]["group"] is not None
+    assert targets[0].decision == REJECTED
+    assert all(change.decision == ACCEPTED for change in targets[1:])
+    assert all(change.decision == PENDING for change in others)
+    assert project.changes_by_kind(kind, decision=PENDING) == []
+    assert project.decide_kind(kind, ACCEPTED) == []  # nothing pending any more
+
+    undone = project.undo()
+    assert len(undone) == len(targets) - 1
+    assert all(change.decision == PENDING for change in targets[1:])
+    assert targets[0].decision == REJECTED  # the earlier single decision survives
+
+
+# ------------------------------------------------------------- re-evaluate
+def evaluated_project(tmp_path, **overrides):
+    """A fully evaluated project (FakeService results applied)."""
+    project = make_project(tmp_path, **overrides)
+    events = queue.Queue()
+    ProjectRunner(project, FakeService(), "m", events, parallelism=2).start()
+    for event in drain(events):
+        if event[0] == "workflow_result":
+            apply_result(project, *event[1:])
+    assert project.pending_tasks() == []
+    return project
+
+
+def test_invalidate_counts_and_reports_the_pending_tasks(tmp_path):
+    project = evaluated_project(tmp_path)
+    chapter = project.chapters[0]
+    segments = [segment for segment in chapter.segments if not segment.is_blank]
+    assert len(segments) >= 2
+    first, second = segments[0], segments[1]
+
+    removed = project.invalidate(chapter.index, first.index, [CHECK_GRAMMAR])
+    assert removed == [(chapter.index, first.index, CHECK_GRAMMAR)]
+    assert CHECK_GRAMMAR not in first.results and CHECK_SPELLING in first.results
+    assert project.pending_tasks() == removed
+    assert first.status(ALL) == STATUS_QUEUED
+
+    removed = project.invalidate(chapter.index, second.index)
+    assert sorted(removed) == sorted((chapter.index, second.index, check) for check in CHECKS)
+    assert second.results == {}
+    assert len(project.pending_tasks()) == 1 + len(CHECKS)
+
+    # whole chapter: everything still stored in it goes, other chapters are untouched
+    removed = project.invalidate(chapter.index)
+    assert len(removed) == sum(len(CHECKS) for segment in segments) - 1 - len(CHECKS)
+    assert all(segment.results == {} for segment in chapter.segments)
+    assert all(segment.results for segment in project.chapters[1].segments if not segment.is_blank)
+    assert project.invalidate(chapter.index) == []
+    assert project.invalidate(99) == []
+    assert project.invalidate(project.chapters[1].index, 999) == []
+
+
+def test_invalidate_marks_log_entries_stale_and_undo_skips_them(tmp_path):
+    project = evaluated_project(tmp_path)
+    chapter = project.chapters[0]
+    segment = next(segment for segment in chapter.segments if segment.changes(ALL))
+    change = next(c for c in segment.changes(ALL) if c.check == CHECK_SPELLING)
+    kept_change = next(c for c in segment.changes(ALL) if c.check == CHECK_GRAMMAR)
+
+    kept = project.decide(chapter.index, segment.index, kept_change, REJECTED)
+    doomed = project.decide(chapter.index, segment.index, change, ACCEPTED)
+    project.invalidate(chapter.index, segment.index, [change.check])
+    assert doomed.get("stale") is True and kept.get("stale") is None
+    assert len(project.decision_log) == 2  # nothing is dropped
+
+    # undo skips the stale entry (whose change no longer exists) and reverts the live one
+    assert project.undo() == [kept]
+    assert kept_change.decision == PENDING and CHECK_GRAMMAR in segment.results
+    assert project.decision_log == [doomed]
+    assert project.undo() is None  # only a stale entry is left: nothing to undo
+    assert project.decision_log == [doomed]
+
+    # stale entries survive a save/load round trip
+    project.save()
+    assert Project.load(project.root).decision_log[0]["stale"] is True
+
+    # a re-evaluated result with the same change ids is not touched by the stale entry
+    project.pending_tasks()
+    events = queue.Queue()
+    ProjectRunner(project, FakeService(), "m", events, parallelism=1).start()
+    for event in drain(events):
+        if event[0] == "workflow_result":
+            apply_result(project, *event[1:])
+    fresh = segment.find_change(change.change_id)
+    assert fresh is not None and fresh is not change and fresh.decision == PENDING
+
+
+def test_runner_picks_up_tasks_enqueued_mid_run(tmp_path):
+    project = make_project(tmp_path)
+    chapter = project.chapters[0]
+    target = next(segment for segment in chapter.segments if not segment.is_blank)
+    # pre-fill the target so it is not part of the initial batch ...
+    for check in CHECKS:
+        target.results[check] = CheckResult(check, "done", target.text)
+    initial = project.pending_tasks()
+    assert all(task[:2] != (chapter.index, target.index) for task in initial)
+
+    events = queue.Queue()
+    runner = ProjectRunner(project, FakeService(delay=0.2), "m", events, parallelism=2)
+    assert runner.start() == len(initial)
+    # ... then drop its results while the workers are busy and hand the tasks to the runner
+    removed = project.invalidate(chapter.index, target.index)
+    assert runner.enqueue(removed) == len(CHECKS)
+    assert runner.total == len(initial) + len(CHECKS)
+    assert runner.enqueue([]) == 0
+
+    collected = drain(events, timeout=30)
+    for event in collected:
+        if event[0] == "workflow_result":
+            apply_result(project, *event[1:])
+    finished = [event for event in collected if event[0] == "workflow_finished"]
+    assert finished == [("workflow_finished", False)]
+    started = {event[1:] for event in collected if event[0] == "workflow_started"}
+    assert set(removed) <= started
+    assert project.pending_tasks() == []
+    assert all(target.results[check].status == "done" for check in CHECKS)
+    assert not runner.active and not runner.has_work()
+
+
+def test_enqueue_takes_whole_segment_tasks_in_combined_mode(tmp_path):
+    project = evaluated_project(tmp_path, evaluation_mode=EVALUATION_COMBINED)
+    chapter = project.chapters[0]
+    target = next(segment for segment in chapter.segments if not segment.is_blank)
+    events = queue.Queue()
+    runner = ProjectRunner(project, FakeService(), "m", events, parallelism=2)
+    assert runner.start() == 0
+    assert events.get(timeout=1) == ("workflow_finished", False)
+
+    removed = project.invalidate(chapter.index, target.index)
+    assert len(removed) == len(CHECKS)
+    assert project.pending_tasks() == [(chapter.index, target.index, None)]
+    assert runner.enqueue(project.pending_tasks()) == 1
+    collected = drain(events)
+    for event in collected:
+        if event[0] == "workflow_result":
+            apply_result(project, *event[1:])
+    started = sorted(event[1:] for event in collected if event[0] == "workflow_started")
+    assert started == sorted(removed)  # one task, one started/result event per check
+    assert collected[-1] == ("workflow_finished", False)
+    assert project.pending_tasks() == [] and all(target.results[check].status == "done" for check in CHECKS)
+
+
+def test_enqueue_after_the_runner_finished_starts_new_workers(tmp_path):
+    project = evaluated_project(tmp_path)
+    chapter = project.chapters[0]
+    target = next(segment for segment in chapter.segments if not segment.is_blank)
+    events = queue.Queue()
+    runner = ProjectRunner(project, FakeService(), "m", events, parallelism=2)
+    assert runner.start() == 0
+    assert events.get(timeout=1) == ("workflow_finished", False)
+
+    removed = project.invalidate(chapter.index, target.index, [CHECK_SPELLING])
+    assert runner.enqueue(removed) == 1
+    collected = drain(events)
+    assert [event[1:] for event in collected if event[0] == "workflow_started"] == removed
+    assert collected[-1] == ("workflow_finished", False)
+
+
+# ------------------------------------------------- inline edits and author fixes
+def test_edit_change_uses_the_new_text_and_undo_restores_it(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    change = next(c for c in segment.changes(ALL) if c.original_text == "Teh")
+    assert (change.proposed_text, change.model_proposed_text, change.edited) == ("The", "The", False)
+
+    entry = project.edit_change(chapter.index, segment.index, change, "That")
+    assert (entry["before"], entry["after"]) == (PENDING, ACCEPTED)
+    assert (entry["before_text"], entry["after_text"]) == ("The", "That")
+    assert change.proposed_text == "That" and change.model_proposed_text == "The"
+    assert change.edited and change.decision == ACCEPTED
+    assert change.kind == "word_choice"  # recomputed: Teh -> That is no longer a spelling fix
+    assert render_segment(segment, ALL).startswith("That dog")
+    # the same text again is not a change
+    assert project.edit_change(chapter.index, segment.index, change, "That") is None
+
+    assert project.undo() == [entry]
+    assert change.proposed_text == "The" and not change.edited and change.decision == PENDING
+    assert change.kind == "spelling"
+    assert render_segment(segment, ALL).startswith("Teh dog")
+
+    # reverting to the model's own wording clears the edited flag
+    project.edit_change(chapter.index, segment.index, change, "That")
+    project.edit_change(chapter.index, segment.index, change, "The")
+    assert not change.edited and change.decision == ACCEPTED
+    assert project.progress()["edited"] == 0
+
+
+def test_author_change_beats_an_overlapping_spelling_change_and_is_reported(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    spelling = next(c for c in segment.changes(ALL) if c.original_text == "Teh")
+    spelling.decision = ACCEPTED
+    assert render_segment(segment, ALL).startswith("The dog")
+
+    change = project.add_author_change(chapter.index, segment.index, 0, 3, "Their")
+    assert change is not None and change.check == CHECK_AUTHOR and change.is_author
+    assert change.change_id == "author-1" and change.decision == ACCEPTED
+    assert change.explanation == AUTHOR_EXPLANATION and change.priority == 0
+    assert ALL_CHECKS.index(CHECK_AUTHOR) == 0 and CHECK_AUTHOR not in CHECKS
+    assert render_segment(segment, ALL).startswith("Their dog")
+    states = change_states(segment, ALL)
+    assert states[change.change_id] == STATE_APPLIED and states[spelling.change_id] == STATE_SUPERSEDED
+    # author changes are always listed, even with every model check disabled
+    assert segment.changes({check: False for check in CHECKS}) == [change]
+    assert all(check != CHECK_AUTHOR for _, _, check in project.pending_tasks())  # never queued for the model
+
+    second = project.add_author_change(chapter.index, segment.index, 4, 7, "cat")
+    assert second.change_id == "author-2"
+    assert [c.change_id for c in segment.author_result().changes] == ["author-1", "author-2"]
+    stats = project.progress()
+    assert stats["per_check"][CHECK_AUTHOR]["changes"] == 2 and stats["accepted"] >= 2
+    report = project.build_report()
+    assert "- Author's corrections: 2" in report
+    assert "[Author] `Teh` → `Their` — applied — Author's correction" in report
+
+    # invalid or empty corrections are refused
+    assert project.add_author_change(chapter.index, segment.index, 5, 2, "x") is None
+    assert project.add_author_change(chapter.index, segment.index, 0, 999, "x") is None
+    assert project.add_author_change(chapter.index, segment.index, 0, 3, "Teh") is None
+    assert project.add_author_change(99, 1, 0, 3, "x") is None
+
+    # undo removes the correction again (the last one first), the empty pseudo-result disappears
+    entry = project.decision_log[-1]
+    assert entry["created"] is True and entry["change_id"] == "author-2"
+    assert project.undo() == [entry]
+    assert segment.find_change("author-2") is None
+    project.undo()
+    assert segment.author_result() is None and render_segment(segment, ALL).startswith("The dog")
+
+    # re-evaluating a segment keeps the author's corrections
+    change = project.add_author_change(chapter.index, segment.index, 0, 3, "Their")
+    removed = project.invalidate(chapter.index, segment.index)
+    assert CHECK_AUTHOR not in {check for _, _, check in removed} and segment.author_result() is not None
+    assert project.invalidate(chapter.index, segment.index, [CHECK_AUTHOR]) == [(chapter.index, segment.index, CHECK_AUTHOR)]
+
+
+def test_edited_and_author_changes_round_trip_and_old_files_default(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    change = next(c for c in segment.changes(ALL) if c.original_text == "Teh")
+    project.edit_change(chapter.index, segment.index, change, "That")
+    author = project.add_author_change(chapter.index, segment.index, 4, 7, "cat")
+    project.save()
+
+    reloaded = Project.load(project.root)
+    _, reloaded_segment = reloaded.find(chapter.index, segment.index)
+    restored = reloaded_segment.find_change(change.change_id)
+    assert (restored.proposed_text, restored.model_proposed_text, restored.edited) == ("That", "The", True)
+    restored_author = reloaded_segment.find_change(author.change_id)
+    assert restored_author.check == CHECK_AUTHOR and restored_author.decision == ACCEPTED
+    assert render_segment(reloaded_segment, ALL) == render_segment(segment, ALL)
+    # undo still works on the reloaded project, text included
+    reloaded.undo()
+    reloaded.undo()
+    assert restored.proposed_text == "The" and reloaded_segment.author_result() is None
+
+    # a project file written before these fields existed
+    data = change.to_dict()
+    legacy = {key: value for key, value in data.items() if key not in ("model_proposed", "edited")}
+    legacy["proposed"] = "The"
+    old = Change.from_dict(legacy)
+    assert old.model_proposed_text == "The" and old.edited is False
+    deletion = Change.from_dict({"id": "spelling-9", "check": CHECK_SPELLING, "start": 0, "end": 3,
+                                 "original": "Teh", "proposed": ""})
+    assert deletion.model_proposed_text == ""  # a deletion is not mistaken for an edit
+
+
+# ------------------------------------------------------------ chapter view
+def _check_spans(text, segment, spans):
+    """Every span must cover exactly the text it stands for.
+
+    A non-applied change that overlaps an applied replacement collapses onto
+    that replacement, so it may cover the replacement's text instead.
+    """
+    applied = [(span["start"], span["end"]) for span in spans if span["state"] == STATE_APPLIED]
+    for span in spans:
+        change = segment.find_change(span["change_id"])
+        covered = text[span["start"]:span["end"]]
+        if span["state"] == STATE_APPLIED:
+            assert covered == change.proposed_text, (span, covered)
+        elif covered != change.original_text:
+            assert any(start <= span["start"] and span["end"] <= end for start, end in applied), (span, covered)
+
+
+def test_annotated_segment_text_equals_render_segment_and_spans_line_up():
+    segment = make_segment()
+    changes = segment.changes(ALL)
+    text, spans = render_segment_annotated(segment, ALL)
+    assert text == render_segment(segment, ALL) == segment.text  # nothing accepted yet
+    assert [span["change_id"] for span in spans] == [change.change_id for change in changes]
+    assert all(span["state"] == STATE_PENDING and span["segment"] == 1 for span in spans)
+    _check_spans(text, segment, spans)
+
+    # accept a replacement (Teh->The), a deletion-like rewrite (very very big -> enormous)
+    # and the overlapping grammar fix that it supersedes, reject the rest
+    for change in changes:
+        change.decision = ACCEPTED if change.check != CHECK_GRAMMAR else REJECTED
+    grammar_was = next(c for c in changes if c.original_text == "were")
+    grammar_was.decision = ACCEPTED  # overlaps nothing, gets applied
+    text, spans = render_segment_annotated(segment, ALL, offset=10)
+    assert text == render_segment(segment, ALL) == "The dog was enormous and it ran fast."
+    shifted = [dict(span, start=span["start"] - 10, end=span["end"] - 10) for span in spans]
+    _check_spans(text, segment, shifted)
+    by_id = {span["change_id"]: span for span in shifted}
+    states = change_states(segment, ALL)
+    assert {span["state"] for span in shifted} == {STATE_APPLIED, STATE_REJECTED, STATE_SUPERSEDED}
+    assert all(by_id[cid]["state"] == state for cid, state in states.items())
+    applied = [span for span in shifted if span["state"] == STATE_APPLIED]
+    assert applied == sorted(applied, key=lambda span: span["start"])
+    assert text[by_id[grammar_was.change_id]["start"]:by_id[grammar_was.change_id]["end"]] == "was"
+
+
+def test_annotated_spans_collapse_inside_replacements_and_handle_insertions_and_deletions():
+    text = "a bb c dd e"
+    segment = Segment(1, text)
+    spelling = extract_changes(text, "a c dd e", CHECK_SPELLING)  # deletion of " bb"
+    grammar = extract_changes(text, "a bb c dd e f", CHECK_GRAMMAR)  # insertion at the end
+    expression = extract_changes(text, "a bb c XX e", CHECK_EXPRESSION)  # replacement of dd
+    segment.results[CHECK_SPELLING] = CheckResult(CHECK_SPELLING, "done", "", spelling)
+    segment.results[CHECK_GRAMMAR] = CheckResult(CHECK_GRAMMAR, "done", "", grammar)
+    segment.results[CHECK_EXPRESSION] = CheckResult(CHECK_EXPRESSION, "done", "", expression)
+    for change in segment.changes(ALL):
+        change.decision = ACCEPTED
+    rendered, spans = render_segment_annotated(segment, ALL)
+    assert rendered == render_segment(segment, ALL)
+    _check_spans(rendered, segment, spans)
+    by_id = {span["change_id"]: span for span in spans}
+    deletion = next(c for c in spelling if c.proposed_text == "")
+    insertion = next(c for c in grammar if c.original_text == "")
+    assert by_id[deletion.change_id]["start"] == by_id[deletion.change_id]["end"]  # zero width in the output
+    assert rendered[by_id[insertion.change_id]["start"]:by_id[insertion.change_id]["end"]] == insertion.proposed_text
+    # a pending change inside an applied replacement collapses onto the replacement
+    segment.results[CHECK_GRAMMAR].changes.append(Change("grammar-9", CHECK_GRAMMAR, 7, 8, "d", "p"))
+    rendered, spans = render_segment_annotated(segment, ALL)
+    inner = next(span for span in spans if span["change_id"] == "grammar-9")
+    outer = next(span for span in spans if span["check"] == CHECK_EXPRESSION)
+    assert inner["state"] == STATE_PENDING
+    assert (inner["start"], inner["end"]) == (outer["start"], outer["end"])
+
+
+def test_render_chapter_annotated_matches_render_chapter_across_segments(tmp_path):
+    project = evaluated_project(tmp_path)
+    for chapter in project.chapters:
+        text, spans = render_chapter_annotated(project, chapter)
+        assert text == project.render_chapter(chapter)
+        for span in spans:
+            _, segment = project.find(chapter.index, span["segment"])
+            _check_spans(text, segment, [span])
+    # accept everything in one chapter and check again, offsets must follow the shifted text
+    chapter = project.chapters[0]
+    listed = [(c.index, s.index, ch.change_id) for c, s, ch in pending_changes(project) if c is chapter]
+    assert listed
+    for _, segment in project.all_segments():
+        for change in segment.changes(ALL):
+            change.decision = ACCEPTED
+    text, spans = render_chapter_annotated(project, chapter)
+    assert text == project.render_chapter(chapter) != chapter.heading + chapter.body + chapter.trailing
+    assert len(spans) == len(listed) and all(span["state"] == STATE_APPLIED for span in spans)
+    for span in spans:
+        _, segment = project.find(chapter.index, span["segment"])
+        assert text[span["start"]:span["end"]] == segment.find_change(span["change_id"]).proposed_text
+    assert list(pending_changes(project)) == []
+
+
+# ------------------------------------------------------------------ re-sync
+def _source(project):
+    return Path(project.source_path)
+
+
+def test_unchanged_source_is_detected_cheaply_and_resync_is_a_noop(tmp_path):
+    project = evaluated_project(tmp_path)
+    assert project.source_sha256 == text_fingerprint(MANUSCRIPT) and project.source_mtime > 0
+    assert project.source_changed() is False and project.source_check_reason == "unchanged"
+    # touched but identical content: the hash decides, and the new mtime is remembered
+    os.utime(str(_source(project)), (time.time() + 5, time.time() + 5))
+    assert project.source_changed() is False and project.source_check_reason == "unchanged"
+    assert abs(project.source_mtime - _source(project).stat().st_mtime) < 1e-6
+
+    segment = next(s for _, s in project.all_segments() if s.changes(ALL))
+    change = segment.changes(ALL)[0]
+    project.decide(1, segment.index, change, ACCEPTED)
+    before = {(c.index, s.index): [ch.to_dict() for ch in s.changes(ALL)] for c, s in project.all_segments()}
+    summary = resync_project(project, MANUSCRIPT)
+    assert summary["new"] == 0 and summary["removed"] == 0 and summary["report"] is None
+    assert summary["kept"] == sum(len(c.segments) for c in project.chapters) and summary["chapters"] == 2
+    after = {(c.index, s.index): [ch.to_dict() for ch in s.changes(ALL)] for c, s in project.all_segments()}
+    assert after == before
+    assert project.pending_tasks() == []
+    marker = project.decision_log[-1]
+    assert marker["resync"] == {"kept": summary["kept"], "new": 0, "removed": 0} and marker["stale"] is True
+    assert project.undo()[0]["change_id"] == change.change_id  # the marker is skipped, the decision reverts
+
+
+def test_edited_paragraph_becomes_a_new_segment_while_others_keep_their_decisions(tmp_path):
+    project = evaluated_project(tmp_path)
+    first = project.chapters[0].segments[0]
+    change = next(c for c in first.changes(ALL) if c.original_text == "Teh")
+    entry = project.decide(1, 1, change, ACCEPTED)
+    edited = MANUSCRIPT.replace("settled quietly over the small town", "settled QUIETLY over the small town", 1)
+    assert edited != MANUSCRIPT
+    _source(project).write_text(edited, encoding="utf-8")
+    os.utime(str(_source(project)), (time.time() + 5, time.time() + 5))
+    assert project.source_changed() is True and project.source_check_reason == "changed"
+
+    summary = resync_project(project, edited)
+    assert (summary["kept"], summary["new"], summary["removed"]) == (2, 1, 1)
+    assert summary["report"] is None  # the dropped filler segment had no changes
+    kept = project.chapters[0].segments[0]
+    assert kept.find_change(change.change_id).decision == ACCEPTED and kept.results
+    fresh = project.chapters[0].segments[1]
+    assert "QUIETLY" in fresh.text and fresh.results == {}
+    assert sorted(project.pending_tasks()) == sorted((1, 2, check) for check in CHECKS)
+    assert project.chapters[1].segments[0].results
+    assert project.source_changed() is False and project.source_sha256 == text_fingerprint(edited)
+    # the decision log still points at the kept segment and undo works
+    assert entry in project.decision_log and entry.get("stale") is None
+    assert project.undo() == [entry] and kept.find_change(change.change_id).decision == PENDING
+
+    project.save()
+    reloaded = Project.load(project.root)
+    assert reloaded.source_sha256 == project.source_sha256 and reloaded.source_mtime == project.source_mtime
+    assert len(reloaded.pending_tasks()) == len(CHECKS)
+
+
+def test_deleted_paragraph_with_pending_changes_is_written_to_a_resync_report(tmp_path):
+    project = evaluated_project(tmp_path)
+    first = project.chapters[0].segments[0]
+    changes = first.changes(ALL)
+    assert changes
+    project.decide(1, 1, changes[0], ACCEPTED)
+    project.decide(1, 1, changes[1], REJECTED)
+    kept_entries = [dict(entry) for entry in project.decision_log]
+    shortened = MANUSCRIPT.replace("Teh dog were very very big. It run fast.\n\n", "")
+    summary = resync_project(project, shortened)
+    assert summary["removed"] == 1 and summary["new"] == 0
+    report = summary["report"]
+    assert report is not None and report.parent == project.root and report.name.startswith("resync-")
+    text = report.read_text(encoding="utf-8")
+    assert "Kapitel 1 · segment 1" in text and "Teh dog were very very big" in text
+    assert "`Teh` → `The` — applied" in text
+    assert changes[1].original_text in text and "rejected" not in text.split("\n> ")[-1].split("- [")[0]
+    assert all(entry["stale"] is True for entry in project.decision_log[:2])
+    assert [entry["change_id"] for entry in project.decision_log[:2]] == [e["change_id"] for e in kept_entries]
+    assert project.undo() is None  # nothing live is left to undo
+    # a second re-sync with dropped changes gets its own file
+    project.chapters[0].segments[0].results[CHECK_SPELLING] = CheckResult(
+        CHECK_SPELLING, "done", "", [Change("spelling-1", CHECK_SPELLING, 0, 3, "The", "Teh")])
+    other = resync_project(project, "Kapitel 1\n\nSomething else entirely.\n")
+    assert other["report"] is not None and other["report"] != report and other["report"].exists()
+
+
+def test_duplicate_segments_pair_up_in_order(tmp_path):
+    text = "Kapitel 1\n\n" + FILLER + "\n\n" + FILLER + "\n\n" + FILLER + "\n"
+    source = tmp_path / "twins.txt"
+    source.write_text(text, encoding="utf-8")
+    project = create_project(source, text, ProjectOptions(target_chars=200, max_chars=400), model="m", backend="fake")
+    segments = [segment for segment in project.chapters[0].segments if segment.text == FILLER]
+    assert len(segments) == 3
+    for number, segment in enumerate(segments, 1):
+        segment.results[CHECK_SPELLING] = CheckResult(CHECK_SPELLING, "done", "", [
+            Change("spelling-1", CHECK_SPELLING, 0, 3, "The", "Ze{0}".format(number))])
+    # drop the middle twin: the first two new segments take the first two old ones, in order
+    summary = resync_project(project, "Kapitel 1\n\n" + FILLER + "\n\n" + FILLER + "\n")
+    assert (summary["new"], summary["removed"]) == (0, 1)
+    proposed = [s.results[CHECK_SPELLING].changes[0].proposed_text
+                for s in project.chapters[0].segments if s.text == FILLER]
+    assert proposed == ["Ze1", "Ze2"]
+    assert summary["report"] is not None and "Ze3" in summary["report"].read_text(encoding="utf-8")
+
+
+def test_resync_keeps_model_chapter_boundaries_when_their_first_paragraphs_survive(tmp_path):
+    text = "Once upon a time.\n\n" + FILLER + "\n\nThe next morning.\n\n" + FILLER + "\n"
+    source = tmp_path / "model.txt"
+    source.write_text(text, encoding="utf-8")
+    project = create_project(source, text, ProjectOptions(target_chars=200, max_chars=400, chapter_mode="model"),
+                             model="m", backend="fake")
+    apply_model_outline(project, text, [2], ["Dawn", "Morning"])
+    assert [c.title for c in project.chapters] == ["Dawn", "Morning"] and project.method == "model"
+    for _, segment in project.all_segments():
+        segment.results[CHECK_SPELLING] = CheckResult(CHECK_SPELLING, "done", segment.text)
+
+    changed = text.replace("Once upon a time.", "Once upon a time, long ago.")
+    summary = resync_project(project, changed)
+    assert [c.title for c in project.chapters] == ["Dawn", "Morning"]
+    assert project.chapters[1].segments[0].text.startswith("The next morning.")
+    assert summary["removed"] == 1 and summary["new"] == 1
+    assert project.chapters[1].segments[0].results  # the second chapter's segments were kept
+
+    # when a chapter's first paragraph is gone the automatic split is the fallback
+    fallback = changed.replace("The next morning.", "Later.")
+    resync_project(project, fallback)
+    assert project.method != "model" and len(project.chapters) >= 1
+
+
+def test_source_tracking_reports_missing_files_and_old_projects(tmp_path):
+    project = make_project(tmp_path)
+    data = project.to_dict()
+    del data["source_sha256"]
+    del data["source_mtime"]
+    old = Project.from_dict(data, root=project.root)
+    assert old.source_sha256 == "" and old.source_mtime == 0.0
+    assert old.source_changed() is False and old.source_check_reason == "unknown"
+    _source(project).unlink()
+    assert project.source_changed() is False and project.source_check_reason == "missing"
+    project.source_path = ""
+    assert project.source_changed() is False and project.source_check_reason == "missing"
+    assert text_fingerprint("a\r\nb") == text_fingerprint("a\nb")

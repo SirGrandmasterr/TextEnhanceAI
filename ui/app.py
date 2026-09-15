@@ -244,6 +244,11 @@ class EditorApp:
         self.root.bind_all("<Alt-KeyPress-A>", self._accept_shortcut)
         self.root.bind_all("<Alt-KeyPress-r>", self._reject_shortcut)
         self.root.bind_all("<Alt-KeyPress-R>", self._reject_shortcut)
+        self.root.bind_all("<Alt-KeyPress-z>", self._undo_shortcut)
+        self.root.bind_all("<Alt-KeyPress-Z>", self._undo_shortcut)
+        self.root.bind_all("<F2>", self._edit_shortcut)
+        self.root.bind_all("<Control-KeyPress-e>", self._author_fix_shortcut)
+        self.root.bind_all("<Control-KeyPress-E>", self._author_fix_shortcut)
         self.root.bind_all("<Alt-Left>", self._previous_shortcut)
         self.root.bind_all("<Alt-Right>", self._next_shortcut)
         self.root.bind_all("<Alt-Up>", self._up_shortcut)
@@ -277,6 +282,21 @@ class EditorApp:
             return self.workflow_screen.reject_current(event)
         if self._in_review():
             return self.review_panel.reject_current(event)
+        return None
+
+    def _undo_shortcut(self, event=None):
+        if self._in_auto():
+            return self.workflow_screen.undo(event)
+        return None
+
+    def _edit_shortcut(self, event=None):
+        if self._in_auto():
+            return self.workflow_screen.edit_current(event)
+        return None
+
+    def _author_fix_shortcut(self, event=None):
+        if self._in_auto():
+            return self.workflow_screen.add_author_correction(event)
         return None
 
     def _previous_shortcut(self, event=None):

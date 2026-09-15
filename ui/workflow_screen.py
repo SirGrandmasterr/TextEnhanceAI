@@ -7,9 +7,25 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from core.backend import EditCancelled
+from core.change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS
 from core.chunking import read_text_file, split_document, word_count
+from core.consistency import (
+    FINDING_LABELS,
+    MODEL_TRIAGED,
+    STATUS_DISMISSED,
+    STATUS_ISSUE,
+    STATUS_LABELS as FINDING_STATUS_LABELS,
+    STATUS_OK,
+    STATUS_UNVERIFIED,
+    ConsistencyRunner,
+    apply_preferred,
+    apply_verdicts,
+    collect_candidates,
+)
 from core.models import ACCEPTED, PENDING, REJECTED
+from core.statistics import project_statistics, statistics_markdown
 from core.workflow import (
+    CHECK_AUTHOR,
     CHECK_DESCRIPTIONS,
     CHECK_LABELS,
     CHECKS,
@@ -37,10 +53,14 @@ from core.workflow import (
     build_outline_messages,
     change_states,
     create_project,
+    new_decision_group,
     normalise_style_guide,
     parse_glossary,
     parse_outline,
+    pending_changes,
+    render_chapter_annotated,
     render_segment,
+    resync_project,
 )
 from .theme import CHECK_COLORS, PALETTE, STATUS_COLORS, ScrollableFrame, Tooltip, font, style_text
 
@@ -185,6 +205,214 @@ class StyleGuideDialog(tk.Toplevel):
         self.on_save(text, glossary)
 
 
+class DecisionLogDialog(tk.Toplevel):
+    """Read-only list of every accept/reject the author made; double-click jumps to the change."""
+
+    COLUMNS = (
+        ("time", "Time", 130),
+        ("chapter", "Chapter", 150),
+        ("segment", "Segment", 70),
+        ("change", "Original → proposed", 320),
+        ("decision", "Before → after", 150),
+    )
+
+    def __init__(self, parent, project, on_jump):
+        super().__init__(parent)
+        self.title("Decisions · {0}".format(project.name))
+        self.transient(parent.winfo_toplevel())
+        self.geometry("880x420")
+        self.project = project
+        self.on_jump = on_jump
+        self.entries = {}
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        ttk.Label(frame, text="Newest decision first. Double-click a row to jump to the change.",
+                  style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        self.tree = ttk.Treeview(frame, columns=[key for key, _, _ in self.COLUMNS], show="headings",
+                                 selectmode="browse")
+        for key, heading, width in self.COLUMNS:
+            self.tree.heading(key, text=heading, anchor="w")
+            self.tree.column(key, width=width, stretch=(key == "change"), anchor="w")
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.tree.tag_configure("stale", foreground=PALETTE["faint"])
+        self.tree.bind("<Double-1>", self._jump)
+        self.tree.bind("<Return>", self._jump)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="Go to change", command=self._jump).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Close", style="Ghost.TButton", command=self.destroy).pack(side=tk.LEFT, padx=(6, 0))
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.refresh()
+
+    def refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        self.entries = {}
+        log = self.project.decision_log
+        if not log:
+            self.tree.insert("", tk.END, values=("", "", "", "No decisions yet.", ""))
+            return
+        for position, entry in enumerate(reversed(log)):
+            if entry.get("resync"):
+                summary = entry["resync"]
+                self.tree.insert("", tk.END, iid="d{0}".format(position), tags=("stale",), values=(
+                    str(entry.get("ts", "")).replace("T", " "), "—", "",
+                    "Re-synced with the manuscript: {0} segment(s) kept, {1} new, {2} removed".format(
+                        summary.get("kept", 0), summary.get("new", 0), summary.get("removed", 0)), ""))
+                continue
+            chapter, segment = self.project.find(entry["chapter"], entry["segment"])
+            change = segment.find_change(entry["change_id"]) if segment is not None else None
+            if change is not None:
+                text = "{0} → {1}".format(_one_line(change.original_text) or "∅",
+                                              _one_line(change.proposed_text) or "∅")
+            else:
+                text = "(change no longer exists)"
+            stale = bool(entry.get("stale"))
+            if stale:
+                text += "  (re-evaluated)"
+            iid = "d{0}".format(position)
+            self.tree.insert("", tk.END, iid=iid, tags=("stale",) if stale else (), values=(
+                str(entry.get("ts", "")).replace("T", " "),
+                chapter.title if chapter is not None else str(entry["chapter"]),
+                entry["segment"],
+                text,
+                "{0} → {1}".format(entry["before"] or "new", entry["after"]),
+            ))
+            self.entries[iid] = entry
+
+    def _jump(self, event=None):
+        selection = self.tree.selection()
+        entry = self.entries.get(selection[0]) if selection else None
+        if entry is not None and entry.get("chapter") is not None:
+            # A stale entry's change was replaced by a re-evaluation: only the segment is left to show.
+            self.on_jump(entry["chapter"], entry["segment"], None if entry.get("stale") else entry["change_id"])
+        return "break"
+
+
+class StatisticsDialog(tk.Toplevel):
+    """Chapters, checks and frequent corrections as tables, with Markdown export."""
+
+    def __init__(self, parent, project, on_jump):
+        super().__init__(parent)
+        self.title("Statistics · {0}".format(project.name))
+        self.transient(parent.winfo_toplevel())
+        self.geometry("900x460")
+        self.project = project
+        self.on_jump = on_jump
+        self.stats = None
+        self.frequent_rows = {}
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        self.summary_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.summary_var, style="Muted.TLabel", wraplength=860,
+                  justify=tk.LEFT).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.notebook = ttk.Notebook(frame)
+        self.notebook.grid(row=1, column=0, sticky="nsew")
+        self.chapters_tree = self._table(
+            "Chapters", (("index", "#", 40), ("title", "Chapter", 220), ("words", "Words", 80),
+                         ("changes", "Changes", 80), ("per_1000", "per 1,000", 80), ("accepted", "Accepted", 80),
+                         ("rejected", "Rejected", 80), ("pending", "Pending", 80), ("rate", "Acceptance", 90)))
+        self.checks_tree = self._table(
+            "Checks", (("check", "Check", 160), ("changes", "Changes", 90), ("per_1000", "per 1,000", 90),
+                       ("accepted", "Accepted", 90), ("rejected", "Rejected", 90), ("pending", "Pending", 90),
+                       ("rate", "Acceptance", 100)))
+        self.kinds_tree = self._table(
+            "Kinds", (("kind", "Kind", 160), ("changes", "Changes", 90), ("accepted", "Accepted", 90),
+                      ("rejected", "Rejected", 90), ("pending", "Pending", 90), ("rate", "Acceptance", 100)))
+        self.frequent_tree = self._table(
+            "Frequent corrections", (("original", "Original", 220), ("proposed", "Proposed", 220),
+                                     ("count", "Count", 70), ("check", "Check", 100), ("accepted", "Accepted", 80),
+                                     ("rejected", "Rejected", 80)))
+        self.frequent_tree.bind("<Double-1>", self._jump)
+        self.frequent_tree.bind("<Return>", self._jump)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(buttons, text="Double-click a frequent correction to open its first occurrence.",
+                  style="Muted.TLabel", font=font(9)).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Close", style="Ghost.TButton", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Refresh", command=self.refresh).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(buttons, text="Copy as Markdown", command=self.copy_markdown).pack(side=tk.RIGHT, padx=(0, 6))
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.refresh()
+
+    def _table(self, title, columns):
+        tab = ttk.Frame(self.notebook)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        self.notebook.add(tab, text=title)
+        tree = ttk.Treeview(tab, columns=[key for key, _, _ in columns], show="headings", selectmode="browse")
+        for position, (key, heading, width) in enumerate(columns):
+            numeric = key not in ("title", "chapter", "check", "kind", "original", "proposed")
+            tree.heading(key, text=heading, anchor="e" if numeric else "w")
+            tree.column(key, width=width, anchor="e" if numeric else "w",
+                        stretch=(key in ("title", "original", "proposed") or position == 0 and key in ("check", "kind")))
+        scroll = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        return tree
+
+    @staticmethod
+    def _percent(rate):
+        return "{0:.0f}%".format(rate * 100)
+
+    def refresh(self):
+        stats = self.stats = project_statistics(self.project)
+        totals = stats["totals"]
+        self.summary_var.set(
+            "{0:,} words · {1} changes ({2} per 1,000 words) · {3} accepted, {4} rejected, {5} pending "
+            "· acceptance rate {6} (accepted share of the decided changes)".format(
+                totals["words"], totals["changes"], totals["per_1000"], totals["accepted"], totals["rejected"],
+                totals["pending"], self._percent(totals["acceptance_rate"])))
+        for tree in (self.chapters_tree, self.checks_tree, self.kinds_tree, self.frequent_tree):
+            tree.delete(*tree.get_children())
+        for row in stats["chapters"]:
+            self.chapters_tree.insert("", tk.END, values=(
+                row["index"], row["title"], "{0:,}".format(row["words"]), row["changes"], row["per_1000"],
+                row["accepted"], row["rejected"], row["pending"], self._percent(row["acceptance_rate"])))
+        for check, counter in stats["checks"].items():
+            if not counter["changes"] and check not in self.project.options.enabled_checks():
+                continue
+            self.checks_tree.insert("", tk.END, values=(
+                CHECK_LABELS[check], counter["changes"], counter["per_1000"], counter["accepted"],
+                counter["rejected"], counter["pending"], self._percent(counter["acceptance_rate"])))
+        for kind, counter in stats["kinds"].items():
+            self.kinds_tree.insert("", tk.END, values=(
+                CHANGE_KIND_LABELS[kind], counter["changes"], counter["accepted"], counter["rejected"],
+                counter["pending"], self._percent(counter["acceptance_rate"])))
+        self.frequent_rows = {}
+        for position, item in enumerate(stats["frequent"]):
+            iid = "f{0}".format(position)
+            self.frequent_tree.insert("", tk.END, iid=iid, values=(
+                item["original"] or "∅", item["proposed"] or "∅", item["count"],
+                CHECK_LABELS.get(item["check"], item["check"]), item["accepted"], item["rejected"]))
+            self.frequent_rows[iid] = item["first"]
+
+    def copy_markdown(self):
+        markdown = statistics_markdown(self.stats or project_statistics(self.project))
+        self.clipboard_clear()
+        self.clipboard_append(markdown)
+        self.summary_var.set("Copied the statistics as Markdown to the clipboard.")
+
+    def _jump(self, event=None):
+        selection = self.frequent_tree.selection()
+        target = self.frequent_rows.get(selection[0]) if selection else None
+        if target is not None:
+            self.on_jump(*target)
+        return "break"
+
+
+def _one_line(text, limit=60):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 class WorkflowScreen(ttk.Frame):
     """Container that switches between the start view and the project view."""
 
@@ -199,7 +427,10 @@ class WorkflowScreen(ttk.Frame):
         self.project_view = ProjectView(self, on_close=self.close_project, on_pause=self.toggle_pause,
                                         on_export=self.export_project, on_retry=self.resume_runner,
                                         on_checks_changed=self.checks_changed, on_options=self.edit_options,
-                                        on_add_to_glossary=self.add_to_glossary)
+                                        on_add_to_glossary=self.add_to_glossary, on_reevaluate=self.reevaluate)
+        self.decision_dialog = None
+        self.statistics_dialog = None
+        self.consistency_runner = None
         self.start_view.pack(fill=tk.BOTH, expand=True)
 
     # ----------------------------------------------------------- lifecycle
@@ -282,6 +513,8 @@ class WorkflowScreen(ttk.Frame):
         self.project = project
         self.project_view.load_project(project)
         self.show_project()
+        if project.source_changed() and self._offer_resync():
+            return
         pending = project.pending_tasks()
         if pending:
             if messagebox.askyesno(
@@ -292,6 +525,81 @@ class WorkflowScreen(ttk.Frame):
                 self.resume_runner()
                 return
         self.host.set_status("Project opened. {0}".format(self.project_view.summary_text()))
+
+    # -------------------------------------------------------------- source
+    def check_source(self):
+        """The "Check source" button: compare the manuscript file with the project and offer a re-sync."""
+        if self.project is None:
+            return
+        project = self.project
+        if project.source_changed():
+            self._offer_resync()
+            return
+        reason = project.source_check_reason
+        if reason == "missing":
+            messagebox.showwarning("Manuscript not found",
+                                   "The manuscript file was not found:\n{0}".format(project.source_path))
+        elif reason == "unknown":
+            if messagebox.askyesno(
+                "Re-sync?",
+                "This project was created before source tracking existed, so changes to the manuscript cannot be "
+                "detected automatically.\n\nRe-sync with the current file now? Segments with identical text keep "
+                "their results and decisions; new or edited segments are evaluated again.",
+            ):
+                self.resync()
+        else:
+            self.host.set_status("The manuscript has not changed since the project was created.")
+
+    def _offer_resync(self):
+        """Ask whether to re-sync a changed manuscript; returns whether a re-sync was done."""
+        if not messagebox.askyesno(
+            "Manuscript changed",
+            "The manuscript changed since the project was created. Re-sync?\n\nSegments with identical text keep "
+            "their results and decisions; new or edited segments are evaluated again. Pending changes of "
+            "segments that no longer exist are written to a resync-*.md file in the project folder.",
+        ):
+            self.host.set_status("The manuscript file changed; use “Check source” to re-sync later.")
+            return False
+        return self.resync()
+
+    def resync(self):
+        """Re-split the current manuscript file and carry decisions over; returns whether it happened."""
+        if self.project is None:
+            return False
+        if self.evaluating:
+            messagebox.showinfo("Evaluation running", "Pause the evaluation before re-syncing the manuscript.")
+            return False
+        try:
+            text = read_text_file(self.project.source_path)
+        except OSError as exc:
+            messagebox.showerror("Cannot read manuscript", str(exc))
+            return False
+        if not text.strip():
+            messagebox.showinfo("Empty file", "The manuscript file contains no text; nothing was changed.")
+            return False
+        summary = resync_project(self.project, text)
+        self.running_tasks = set()
+        if self.project.consistency:
+            self.project.consistency = collect_candidates(self.project, previous=self.project.consistency)
+        try:
+            self.project.write_chapter_files()
+        except OSError:
+            pass
+        self._save_now()
+        self.project_view.load_project(self.project)
+        self._refresh_decision_dialog()
+        message = "Re-synced: {0} segment(s) kept, {1} new, {2} removed, {3} chapter(s).".format(
+            summary["kept"], summary["new"], summary["removed"], summary["chapters"])
+        if summary["report"]:
+            message += " Dropped changes were written to {0}.".format(summary["report"].name)
+        self.host.set_status(message)
+        pending = self.project.pending_tasks()
+        if pending and messagebox.askyesno(
+                "Evaluate now?", "{0}\n\n{1} check(s) are missing for the new or edited segments. Evaluate them now?"
+                .format(message, len(pending))):
+            self.host.lock_controls(True)
+            self.resume_runner()
+        return True
 
     def resume_runner(self):
         if self.project is None or self.evaluating:
@@ -312,6 +620,38 @@ class WorkflowScreen(ttk.Frame):
                 )
             )
             self.project_view.update_progress(0, queued, 0, None)
+
+    def reevaluate(self, chapter_index, segment_index=None, checks=None):
+        """Drop results of a segment (or chapter) and evaluate them again right away."""
+        if self.project is None:
+            return 0
+        checks = list(checks) if checks else self.project.options.enabled_checks()
+        removed = self.project.invalidate(chapter_index, segment_index, checks)
+        self.project_view.refresh_all()
+        self.schedule_save()
+        self._refresh_decision_dialog()
+        if not removed:
+            self.host.set_status("Nothing to evaluate again there.")
+            return 0
+        busy = {(chapter, segment) for chapter, segment, _ in self.running_tasks}  # in-flight ones return anyway
+        if self.project.options.combined:
+            # one request answers every missing check of a segment
+            tasks = [(chapter, segment, None) for chapter, segment in
+                     sorted({(chapter, segment) for chapter, segment, _ in removed}) if (chapter, segment) not in busy]
+        else:
+            tasks = [task for task in removed if task[:2] not in busy]
+        if self.evaluating:
+            queued = self.runner.enqueue(tasks)
+            self.project_view.set_running(True)
+            self.host.lock_controls(True)
+            self.project_view.update_progress(self.runner.done, self.runner.total, self.runner.running,
+                                              self.runner.eta_seconds())
+        else:
+            self.host.lock_controls(True)
+            self.resume_runner()
+            queued = len(tasks)
+        self.host.set_status("Evaluating {0} check(s) again...".format(queued))
+        return queued
 
     def toggle_pause(self):
         if self.evaluating:
@@ -423,9 +763,17 @@ class WorkflowScreen(ttk.Frame):
             if not messagebox.askyesno("Stop evaluation?", "The evaluation is still running. Stop it and close the project?"):
                 return
             self.runner.cancel()
+        if self.checking_consistency:
+            self.consistency_runner.cancel()
+        self.consistency_runner = None
         self._save_now()
         self.project = None
         self.runner = None
+        for dialog in (self.decision_dialog, self.statistics_dialog):
+            if dialog is not None and dialog.winfo_exists():
+                dialog.destroy()
+        self.decision_dialog = None
+        self.statistics_dialog = None
         self.host.lock_controls(False)
         self.show_start()
         self.host.set_status("Project closed. Progress was saved; open it again any time.")
@@ -434,7 +782,49 @@ class WorkflowScreen(ttk.Frame):
         """Called when the application closes."""
         if self.runner is not None:
             self.runner.cancel()
+        if self.consistency_runner is not None:
+            self.consistency_runner.cancel()
         self._save_now()
+
+    # --------------------------------------------------------- consistency
+    @property
+    def checking_consistency(self):
+        return self.consistency_runner is not None and self.consistency_runner.active
+
+    def run_consistency(self):
+        """Collect the deterministic candidates at once and ask the model about the doubtful ones."""
+        if self.project is None:
+            return
+        if self.checking_consistency:
+            self.host.set_status("The consistency check is already running.")
+            return
+        if self.evaluating or self.project.pending_tasks():
+            messagebox.showinfo("Evaluation first",
+                                "Run the consistency check once every segment has been evaluated; it reads the "
+                                "manuscript with the accepted corrections applied.")
+            return
+        self.project.consistency = collect_candidates(self.project, previous=self.project.consistency)
+        self.project_view.refresh_consistency()
+        self.project_view.notebook.select(self.project_view.consistency_tab)
+        self.schedule_save()
+        service = self.host.get_service()
+        model = self.host.get_model() or self.project.model
+        self.consistency_runner = ConsistencyRunner(self.project, self.project.consistency, service, model,
+                                                    self.host.events)
+        requests = self.consistency_runner.start()
+        undecided = sum(1 for f in self.project.consistency if f.kind in MODEL_TRIAGED and f.status == STATUS_UNVERIFIED)
+        if requests:
+            self.host.set_status("Found {0} candidate group(s); asking {1} about {2} of them in {3} request(s)...".format(
+                len(self.project.consistency), model, undecided, requests))
+            self.project_view.set_consistency_progress(0, requests)
+        else:
+            self.host.set_status("Consistency check: {0} finding(s), nothing left to ask the model.".format(
+                len(self.project.consistency)))
+
+    def cancel_consistency(self):
+        if self.checking_consistency:
+            self.consistency_runner.cancel()
+            self.host.set_status("Stopping the consistency check after the running request...")
 
     # -------------------------------------------------------------- saving
     def schedule_save(self):
@@ -486,6 +876,28 @@ class WorkflowScreen(ttk.Frame):
                 self.project_view.segment_updated(chapter_index, segment_index)
             self.schedule_save()
             return True
+        if kind == "consistency_verdicts":
+            updated = apply_verdicts(self.project.consistency, event[1])
+            if updated:
+                self.project_view.refresh_consistency()
+                self.schedule_save()
+            return True
+        if kind == "consistency_progress":
+            self.project_view.set_consistency_progress(event[1], event[2])
+            return True
+        if kind == "consistency_finished":
+            _, verdicts, error = event
+            self.consistency_runner = None
+            self.project_view.set_consistency_progress(None, None)
+            self.project_view.refresh_consistency()
+            self._save_now()
+            issues = sum(1 for finding in self.project.consistency if finding.status == STATUS_ISSUE)
+            if error:
+                self.host.set_status("Consistency check stopped: {0}. Unverified candidates stay listed.".format(error))
+            else:
+                self.host.set_status("Consistency check finished: {0} issue(s) among {1} finding(s).".format(
+                    issues, len(self.project.consistency)))
+            return True
         if kind == "workflow_progress":
             _, done, total, running = event
             eta = self.runner.eta_seconds() if self.runner else None
@@ -493,6 +905,8 @@ class WorkflowScreen(ttk.Frame):
             return True
         if kind == "workflow_finished":
             cancelled = event[1]
+            if self.runner is not None and self.runner.has_work():
+                return True  # stale: tasks were enqueued after this batch of workers retired
             self.project_view.set_running(False)
             self.host.lock_controls(False)
             self._save_now()
@@ -520,6 +934,55 @@ class WorkflowScreen(ttk.Frame):
         if self.active:
             self.project_view.decide_selected(REJECTED)
         return "break" if event else None
+
+    def undo(self, event=None):
+        """Revert the last decision (Alt+Z) and show the change it belonged to."""
+        if self.active:
+            undone = self.project_view.undo()
+            if undone is None:
+                self.host.set_status("Nothing to undo.")
+            else:
+                self.host.set_status("Undid {0} decision(s).".format(len(undone)))
+                self._refresh_decision_dialog()
+        return "break" if event else None
+
+    def edit_current(self, event=None):
+        """F2: reword the selected suggestion."""
+        if self.active:
+            self.project_view.edit_selected()
+        return "break" if event else None
+
+    def add_author_correction(self, event=None):
+        """Ctrl+E: turn the selected text of the segment into an author's correction."""
+        if self.active:
+            self.project_view.add_author_correction()
+        return "break" if event else None
+
+    def show_decisions(self):
+        """Open (or raise) the decision log window."""
+        if not self.active:
+            return
+        if self.decision_dialog is not None and self.decision_dialog.winfo_exists():
+            self.decision_dialog.project = self.project
+            self.decision_dialog.refresh()
+            self.decision_dialog.lift()
+            return
+        self.decision_dialog = DecisionLogDialog(self, self.project, on_jump=self.project_view.show_change)
+
+    def _refresh_decision_dialog(self):
+        if self.decision_dialog is not None and self.decision_dialog.winfo_exists():
+            self.decision_dialog.refresh()
+
+    def show_statistics(self):
+        """Open (or raise and refresh) the statistics window."""
+        if not self.active:
+            return
+        if self.statistics_dialog is not None and self.statistics_dialog.winfo_exists():
+            self.statistics_dialog.project = self.project
+            self.statistics_dialog.refresh()
+            self.statistics_dialog.lift()
+            return
+        self.statistics_dialog = StatisticsDialog(self, self.project, on_jump=self.project_view.show_change)
 
     def previous(self, event=None):
         if self.active:
@@ -802,15 +1265,56 @@ class StartView(ttk.Frame):
 
 
 # ========================================================== project view
+class AuthorFixDialog(tk.Toplevel):
+    """Ask for the author's replacement of a selected span of the segment text."""
+
+    def __init__(self, parent, original, on_save):
+        super().__init__(parent)
+        self.title("Add my correction")
+        self.transient(parent.winfo_toplevel())
+        self.resizable(True, False)
+        self.on_save = on_save
+        frame = ttk.Frame(self, padding=14)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(frame, text="Selected text:", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, text=original.replace("\n", "↵") or "∅", wraplength=520, justify=tk.LEFT,
+                  font=font(10, "bold")).grid(row=1, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(frame, text="Replace it with:", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
+        self.var = tk.StringVar(value=original)
+        self.entry = ttk.Entry(frame, textvariable=self.var, width=70)
+        self.entry.grid(row=3, column=0, sticky="ew", pady=(2, 10))
+        ttk.Label(frame, text="Leave it empty to delete the selected text. The correction is applied with top "
+                             "priority and counts as accepted; Alt+Z removes it again.",
+                  style="Muted.TLabel", wraplength=520, justify=tk.LEFT).grid(row=4, column=0, sticky="w")
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", style="Ghost.TButton", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Add correction", style="Accent.TButton", command=self.save).pack(side=tk.RIGHT, padx=(0, 6))
+        self.bind("<Return>", lambda event: self.save())
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.entry.focus_set()
+        self.entry.selection_range(0, tk.END)
+        self.grab_set()
+
+    def save(self):
+        text = self.var.get()
+        self.destroy()
+        self.on_save(text)
+
+
 class ChangeCard(ttk.Frame):
     """One proposed change with explanation and accept/reject buttons."""
 
-    def __init__(self, parent, change, segment_text, state, on_select, on_decide, on_add_to_glossary=None):
+    def __init__(self, parent, change, segment_text, state, on_select, on_decide, on_add_to_glossary=None,
+                 on_edit=None):
         super().__init__(parent, style="Card.TFrame", padding=(10, 8))
         self.change = change
         self.on_select = on_select
         self.on_decide = on_decide
         self.on_add_to_glossary = on_add_to_glossary
+        self.on_edit = on_edit
+        self.editor = None
         self.selected = False
         fg, bg = CHECK_COLORS[change.check]
 
@@ -820,6 +1324,12 @@ class ChangeCard(ttk.Frame):
         self.badge.pack(side=tk.LEFT)
         self.state_label = ttk.Label(top, text=STATE_LABELS[state], style="{0}.State.TLabel".format(state.title()))
         self.state_label.pack(side=tk.LEFT, padx=8)
+        self.kind_tag = ttk.Label(top, text=CHANGE_KIND_LABELS.get(change.kind, change.kind), style="Kind.Badge.TLabel")
+        self.kind_tag.pack(side=tk.LEFT, padx=(0, 8))
+        self.edited_tag = ttk.Label(top, text="✎ edited", style="Kind.Badge.TLabel")
+        if change.edited:
+            self.edited_tag.pack(side=tk.LEFT, padx=(0, 8))
+            Tooltip(self.edited_tag, "The model proposed: {0}".format(change.model_proposed_text or "∅"))
         self.flag_badge = None
         if change.flagged:
             # Hallucination guard: the reason ids explain themselves in the tooltip.
@@ -827,7 +1337,7 @@ class ChangeCard(ttk.Frame):
             self.flag_badge.pack(side=tk.LEFT, padx=(0, 8))
             Tooltip(self.flag_badge, flag_tooltip(change))
         self.glossary_link = None
-        if on_add_to_glossary is not None and change.original_text.strip():
+        if on_add_to_glossary is not None and change.original_text.strip() and not change.is_author:
             # A small link: reject this change and protect the original wording from now on.
             self.glossary_link = tk.Label(top, text="Add to glossary", cursor="hand2", font=font(9),
                                           foreground=PALETTE["accent"], background=PALETTE["surface"])
@@ -839,6 +1349,11 @@ class ChangeCard(ttk.Frame):
         self.accept_button = ttk.Button(top, text="Accept", style="Small.Success.TButton",
                                         command=lambda: self.on_decide(self.change, ACCEPTED))
         self.accept_button.pack(side=tk.RIGHT, padx=(0, 6))
+        self.edit_button = None
+        if on_edit is not None:
+            self.edit_button = ttk.Button(top, text="Edit…", style="Small.TButton", command=self.begin_edit)
+            self.edit_button.pack(side=tk.RIGHT, padx=(0, 6))
+            Tooltip(self.edit_button, "Reword this suggestion before accepting it (F2 on the selected card).")
 
         self.diff = tk.Text(self, height=2, cursor="arrow")
         style_text(self.diff, size=10)
@@ -886,6 +1401,39 @@ class ChangeCard(ttk.Frame):
         self.on_select(self.change)
         return "break"
 
+    # ---- inline editing of the proposed text
+    def begin_edit(self):
+        """Show an entry with the proposed text; Enter saves through on_edit, Escape cancels."""
+        if self.on_edit is None:
+            return
+        self.on_select(self.change)
+        if self.editor is not None and self.editor.winfo_exists():
+            self.edit_entry.focus_set()
+            return
+        self.editor = ttk.Frame(self, style="Selected.TFrame" if self.selected else "Surface.TFrame")
+        self.editor.pack(fill=tk.X, pady=(2, 4), after=self.diff)
+        self.edit_var = tk.StringVar(value=self.change.proposed_text)
+        self.edit_entry = ttk.Entry(self.editor, textvariable=self.edit_var)
+        self.edit_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(self.editor, text="Save", style="Small.Success.TButton", command=self._save_edit).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(self.editor, text="Cancel", style="Small.TButton", command=self.cancel_edit).pack(side=tk.LEFT, padx=(4, 0))
+        self.edit_entry.bind("<Return>", lambda event: self._save_edit())
+        self.edit_entry.bind("<Escape>", lambda event: self.cancel_edit())
+        self.edit_entry.focus_set()
+        self.edit_entry.selection_range(0, tk.END)
+
+    def _save_edit(self):
+        if self.editor is None:
+            return
+        text = self.edit_var.get()
+        self.cancel_edit()
+        self.on_edit(self.change, text)
+
+    def cancel_edit(self):
+        if self.editor is not None and self.editor.winfo_exists():
+            self.editor.destroy()
+        self.editor = None
+
     def _add_to_glossary(self, event=None):
         if self.on_add_to_glossary is not None:
             self.on_add_to_glossary(self.change)
@@ -912,9 +1460,10 @@ class ProjectView(ttk.Frame):
     """Chapter/segment navigation, highlighted text and change cards."""
 
     def __init__(self, parent, on_close, on_pause, on_export, on_retry, on_checks_changed, on_options=None,
-                 on_add_to_glossary=None):
+                 on_add_to_glossary=None, on_reevaluate=None):
         super().__init__(parent, padding=(12, 8))
         self.on_close = on_close
+        self.on_reevaluate = on_reevaluate or (lambda *args, **kwargs: 0)
         self.on_pause = on_pause
         self.on_export = on_export
         self.on_retry = on_retry
@@ -927,7 +1476,13 @@ class ProjectView(ttk.Frame):
         self.cards = {}
         self.selected_change_id = None
         self.filter_vars = {check: tk.BooleanVar(value=True) for check in CHECKS}
+        self.kind_vars = {kind: tk.BooleanVar(value=True) for kind in CHANGE_KINDS}  # True = shown
         self.preview_var = tk.BooleanVar(value=False)
+        self.chapter_spans = []  # spans of the chapter tab, see render_chapter_annotated
+        self.chapter_shown = None  # chapter index rendered in the chapter tab
+        self._chapter_after = None
+        self._list_after = None
+        self.listed = {}  # all-changes tab: row iid -> (chapter_index, segment_index, change_id)
         self._build()
 
     # ---------------------------------------------------------------- build
@@ -947,6 +1502,17 @@ class ProjectView(ttk.Frame):
         self.pause_button = ttk.Button(buttons, text="Pause", command=self.on_pause)
         self.pause_button.pack(side=tk.LEFT)
         ttk.Button(buttons, text="Options...", command=self.on_options).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(buttons, text="Decisions...", command=lambda: self.master.show_decisions()).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(buttons, text="Statistics...", command=lambda: self.master.show_statistics()).pack(side=tk.LEFT, padx=(6, 0))
+        self.consistency_button = ttk.Button(buttons, text="Consistency...", command=lambda: self.master.run_consistency())
+        self.consistency_button.pack(side=tk.LEFT, padx=(6, 0))
+        Tooltip(self.consistency_button, "Look for names spelled two ways, hyphenation and number-style variants, "
+                                         "mixed quotation marks and POV/tense drift across chapters. Available once "
+                                         "every segment has been evaluated.")
+        check_source = ttk.Button(buttons, text="Check source", command=lambda: self.master.check_source())
+        check_source.pack(side=tk.LEFT, padx=(6, 0))
+        Tooltip(check_source, "Compare the manuscript file with this project and re-sync when it changed: "
+                              "unchanged segments keep their results and decisions.")
         ttk.Button(buttons, text="Export...", style="Accent.TButton", command=self.on_export).pack(side=tk.LEFT, padx=6)
         ttk.Button(buttons, text="Close project", style="Ghost.TButton", command=self.on_close).pack(side=tk.LEFT)
 
@@ -973,7 +1539,14 @@ class ProjectView(ttk.Frame):
         for check in CHECKS:
             ttk.Checkbutton(checks_row, text=CHECK_LABELS[check], variable=self.filter_vars[check],
                             command=self.render_segment).pack(side=tk.LEFT, padx=(8, 0))
-        self.hint_var = tk.StringVar(value="Alt+A accept · Alt+R reject · Alt+↑/↓ change · Alt+←/→ segment")
+        self.kinds_button = ttk.Menubutton(checks_row, text="Kinds ▾", style="Small.TButton")
+        self.kinds_menu = tk.Menu(self.kinds_button, tearoff=False, postcommand=self._fill_kinds_menu)
+        self.kinds_button.configure(menu=self.kinds_menu)
+        self.kinds_button.pack(side=tk.LEFT, padx=(12, 0))
+        Tooltip(self.kinds_button, "Hide kinds of edits from the review, or accept/reject every pending "
+                                   "change of one kind across the project (Alt+Z reverts).")
+        self.hint_var = tk.StringVar(value="Alt+A accept · Alt+R reject · Alt+Z undo · F2 edit · Ctrl+E my correction · "
+                                           "Alt+↑/↓ change · Alt+←/→ segment")
         ttk.Label(checks_row, textvariable=self.hint_var, style="Muted.TLabel", font=font(9)).pack(side=tk.RIGHT)
 
         paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
@@ -994,9 +1567,25 @@ class ProjectView(ttk.Frame):
             self.tree.tag_configure(status, foreground=color)
         self.tree.tag_configure("chapter", font=font(10, "bold"))
         self.tree.bind("<<TreeviewSelect>>", self._tree_selected)
+        self.tree_menu = tk.Menu(self.tree, tearoff=False)
+        self.tree.bind("<Button-3>", self._tree_context)
+        self.tree.bind("<Button-2>", self._tree_context)  # macOS secondary click
+        self.tree.bind("<App>", self._tree_context_key)
+        self.tree.bind("<Menu>", self._tree_context_key)
+        self.tree.bind("<Shift-F10>", self._tree_context_key)
 
-        right = ttk.Frame(paned)
-        paned.add(right, weight=3)
+        self.notebook = ttk.Notebook(paned)
+        paned.add(self.notebook, weight=3)
+        right = ttk.Frame(self.notebook)
+        self.segment_tab = right
+        self.notebook.add(right, text="Segment")
+        self.chapter_tab = self._build_chapter_tab()
+        self.notebook.add(self.chapter_tab, text="Chapter")
+        self.list_tab = self._build_list_tab()
+        self.notebook.add(self.list_tab, text="All changes")
+        self.consistency_tab = self._build_consistency_tab()
+        self.notebook.add(self.consistency_tab, text="Consistency")
+        self.notebook.bind("<<NotebookTabChanged>>", self._tab_changed)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=2)
         right.rowconfigure(3, weight=3)
@@ -1008,6 +1597,11 @@ class ProjectView(ttk.Frame):
         self.segment_status = ttk.Label(seg_header, text="", style="Status.TLabel")
         self.segment_status.pack(side=tk.LEFT, padx=10)
         ttk.Checkbutton(seg_header, text="Preview result", variable=self.preview_var, command=self.render_segment).pack(side=tk.RIGHT)
+        self.reevaluate_button = ttk.Button(seg_header, text="Re-evaluate", style="Small.TButton",
+                                            command=self.reevaluate_current)
+        self.reevaluate_button.pack(side=tk.RIGHT, padx=(0, 10))
+        Tooltip(self.reevaluate_button, "Discard this segment's results and decisions and run the enabled checks "
+                                        "on it again. Right-click a row in the tree for one check or a whole chapter.")
 
         self.text = tk.Text(right, height=9)
         style_text(self.text, size=11, readonly=True)
@@ -1018,6 +1612,10 @@ class ProjectView(ttk.Frame):
         self.text.tag_configure("rejected", background=PALETTE["surface"], underline=False, overstrike=False,
                                 foreground=PALETTE["muted"])
         self.text.tag_raise("selected")
+        self.text.tag_raise("sel")
+        self.text_menu = tk.Menu(self.text, tearoff=False, postcommand=self._fill_text_menu)
+        self.text.bind("<Button-3>", self._text_context)
+        self.text.bind("<Button-2>", self._text_context)
 
         actions = ttk.Frame(right)
         actions.grid(row=2, column=0, sticky="ew", padx=(10, 0), pady=(0, 4))
@@ -1026,6 +1624,9 @@ class ProjectView(ttk.Frame):
         ttk.Button(actions, text="Next to review", style="Small.TButton", command=self.jump_to_next_pending).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Reject all shown", style="Small.Danger.TButton", command=lambda: self.decide_all(REJECTED)).pack(side=tk.RIGHT)
         ttk.Button(actions, text="Accept all shown", style="Small.Success.TButton", command=lambda: self.decide_all(ACCEPTED)).pack(side=tk.RIGHT, padx=(0, 6))
+        self.undo_button = ttk.Button(actions, text="Undo", style="Small.TButton", command=lambda: self.master.undo())
+        self.undo_button.pack(side=tk.RIGHT, padx=(0, 6))
+        Tooltip(self.undo_button, "Revert the last accept/reject (a bulk action is reverted as a whole). Alt+Z")
         self.reject_flagged_button = ttk.Button(actions, text="Reject flagged \u26a0", style="Small.TButton",
                                                 command=self.reject_flagged)
         self.reject_flagged_button.pack(side=tk.RIGHT, padx=(0, 6))
@@ -1034,12 +1635,426 @@ class ProjectView(ttk.Frame):
         self.cards_frame = ScrollableFrame(right)
         self.cards_frame.grid(row=3, column=0, sticky="nsew", padx=(10, 0))
 
+    def _build_chapter_tab(self):
+        """Read-only rendering of the whole chapter with one tag per change state."""
+        tab = ttk.Frame(self.notebook)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        header = ttk.Frame(tab)
+        header.grid(row=0, column=0, sticky="ew", padx=(10, 0), pady=(4, 4))
+        self.chapter_title_var = tk.StringVar(value="")
+        ttk.Label(header, textvariable=self.chapter_title_var, font=font(11, "bold")).pack(side=tk.LEFT)
+        legend = ttk.Frame(header)
+        legend.pack(side=tk.RIGHT)
+        for label, style in (("applied", "Applied.State.TLabel"), ("pending", "Pending.State.TLabel"),
+                             ("rejected", "Rejected.State.TLabel"), ("superseded", "Superseded.State.TLabel"),
+                             ("⚠ flagged", "Flag.Badge.TLabel")):
+            ttk.Label(legend, text=label, style=style).pack(side=tk.LEFT, padx=(4, 0))
+        Tooltip(legend, "Click a highlighted passage to open its change in the Segment tab; "
+                        "Alt+A / Alt+R then decide on it.")
+        self.chapter_text = tk.Text(tab, height=20)
+        style_text(self.chapter_text, size=11, readonly=True)
+        self.chapter_text.grid(row=1, column=0, sticky="nsew", padx=(10, 0))
+        scroll = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=self.chapter_text.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.chapter_text.configure(yscrollcommand=scroll.set)
+        self.chapter_text.tag_configure(STATE_APPLIED, foreground=PALETTE["success"], underline=True)
+        self.chapter_text.tag_configure(STATE_PENDING, background=PALETTE["warning_soft"])
+        self.chapter_text.tag_configure(STATE_REJECTED, foreground=PALETTE["muted"], overstrike=True)
+        self.chapter_text.tag_configure(STATE_SUPERSEDED, foreground=PALETTE["muted"], underline=True)
+        self.chapter_text.tag_configure("flagged", foreground=PALETTE["warning"], underline=True)
+        self.chapter_text.tag_configure("current", background=PALETTE["accent_soft"])
+        self.chapter_text.tag_raise("current")
+        self.chapter_text.tag_raise("flagged")
+        self.chapter_text.bind("<Button-1>", self._chapter_clicked)
+        self.chapter_text.configure(cursor="hand2")
+        return tab
+
+    def _build_list_tab(self):
+        """Every pending change of the project in one table with filters and bulk buttons."""
+        tab = ttk.Frame(self.notebook)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        filters = ttk.Frame(tab)
+        filters.grid(row=0, column=0, columnspan=2, sticky="ew", padx=(10, 0), pady=(4, 4))
+        ttk.Label(filters, text="Check:", style="Muted.TLabel").pack(side=tk.LEFT)
+        self.list_check_var = tk.StringVar(value="All")
+        ttk.Combobox(filters, textvariable=self.list_check_var, state="readonly", width=12,
+                     values=["All"] + [CHECK_LABELS[check] for check in CHECKS] + [CHECK_LABELS[CHECK_AUTHOR]]
+                     ).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(filters, text="Kind:", style="Muted.TLabel").pack(side=tk.LEFT)
+        self.list_kind_var = tk.StringVar(value="All")
+        ttk.Combobox(filters, textvariable=self.list_kind_var, state="readonly", width=14,
+                     values=["All"] + [CHANGE_KIND_LABELS[kind] for kind in CHANGE_KINDS]).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(filters, text="Text:", style="Muted.TLabel").pack(side=tk.LEFT)
+        self.list_text_var = tk.StringVar(value="")
+        ttk.Entry(filters, textvariable=self.list_text_var, width=18).pack(side=tk.LEFT, padx=(4, 10))
+        for var in (self.list_check_var, self.list_kind_var, self.list_text_var):
+            var.trace_add("write", lambda *args: self.schedule_list_refresh())
+        self.list_count_var = tk.StringVar(value="")
+        ttk.Label(filters, textvariable=self.list_count_var, style="Muted.TLabel").pack(side=tk.RIGHT)
+
+        columns = ("chapter", "segment", "check", "kind", "change")
+        self.list_tree = ttk.Treeview(tab, columns=columns, show="headings", selectmode="extended")
+        for key, heading, width, stretch in (("chapter", "Chapter", 140, False), ("segment", "Seg.", 50, False),
+                                             ("check", "Check", 90, False), ("kind", "Kind", 100, False),
+                                             ("change", "Original → proposed", 360, True)):
+            self.list_tree.heading(key, text=heading, anchor="w")
+            self.list_tree.column(key, width=width, stretch=stretch, anchor="w")
+        self.list_tree.grid(row=1, column=0, sticky="nsew", padx=(10, 0))
+        scroll = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=self.list_tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.list_tree.configure(yscrollcommand=scroll.set)
+        self.list_tree.tag_configure("flagged", foreground=PALETTE["warning"])
+        self.list_tree.bind("<Double-1>", self._list_jump)
+        self.list_tree.bind("<Return>", self._list_jump)
+        actions = ttk.Frame(tab)
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=(10, 0), pady=(4, 0))
+        ttk.Label(actions, text="Alt+A / Alt+R decide on the selected rows; double-click opens the segment.",
+                  style="Muted.TLabel", font=font(9)).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Reject selected", style="Small.Danger.TButton",
+                   command=lambda: self.decide_listed(REJECTED)).pack(side=tk.RIGHT)
+        ttk.Button(actions, text="Accept selected", style="Small.Success.TButton",
+                   command=lambda: self.decide_listed(ACCEPTED)).pack(side=tk.RIGHT, padx=(0, 6))
+        return tab
+
+    def _build_consistency_tab(self):
+        """Findings of the chapter-spanning consistency check with their occurrences."""
+        tab = ttk.Frame(self.notebook)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        header = ttk.Frame(tab)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=(10, 0), pady=(4, 4))
+        self.consistency_summary_var = tk.StringVar(value="No consistency check has run yet.")
+        ttk.Label(header, textvariable=self.consistency_summary_var, style="Muted.TLabel").pack(side=tk.LEFT)
+        self.show_dismissed_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(header, text="Show dismissed", variable=self.show_dismissed_var,
+                        command=self.refresh_consistency).pack(side=tk.RIGHT)
+        self.consistency_tree = ttk.Treeview(tab, columns=("kind", "preferred", "status", "reason"),
+                                             show="tree headings", selectmode="browse")
+        self.consistency_tree.heading("#0", text="Variants (count) / occurrences", anchor="w")
+        self.consistency_tree.column("#0", width=300, stretch=True)
+        for key, heading, width in (("kind", "Type", 110), ("preferred", "Preferred", 110),
+                                    ("status", "Status", 90), ("reason", "Reason", 260)):
+            self.consistency_tree.heading(key, text=heading, anchor="w")
+            self.consistency_tree.column(key, width=width, stretch=(key == "reason"), anchor="w")
+        self.consistency_tree.grid(row=1, column=0, sticky="nsew", padx=(10, 0))
+        scroll = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=self.consistency_tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.consistency_tree.configure(yscrollcommand=scroll.set)
+        self.consistency_tree.tag_configure(STATUS_ISSUE, foreground=PALETTE["danger"])
+        self.consistency_tree.tag_configure(STATUS_OK, foreground=PALETTE["success"])
+        self.consistency_tree.tag_configure(STATUS_UNVERIFIED, foreground=PALETTE["warning"])
+        self.consistency_tree.tag_configure(STATUS_DISMISSED, foreground=PALETTE["faint"])
+        self.consistency_tree.tag_configure("occurrence", foreground=PALETTE["muted"])
+        self.consistency_tree.bind("<Double-1>", self._consistency_jump)
+        self.consistency_tree.bind("<Return>", self._consistency_jump)
+        self.consistency_tree.bind("<<TreeviewSelect>>", lambda event: self._update_consistency_buttons())
+        self.consistency_rows = {}  # iid -> ("finding", finding) or ("occurrence", finding, occurrence)
+        actions = ttk.Frame(tab)
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=(10, 0), pady=(4, 0))
+        ttk.Button(actions, text="Run check", style="Small.TButton",
+                   command=lambda: self.master.run_consistency()).pack(side=tk.LEFT)
+        self.consistency_stop = ttk.Button(actions, text="Stop", style="Small.TButton",
+                                           command=lambda: self.master.cancel_consistency())
+        self.consistency_progress_var = tk.StringVar(value="")
+        ttk.Label(actions, textvariable=self.consistency_progress_var, style="Muted.TLabel",
+                  font=font(9)).pack(side=tk.LEFT, padx=(10, 0))
+        self.dismiss_button = ttk.Button(actions, text="Dismiss", style="Small.TButton", command=self.dismiss_finding)
+        self.dismiss_button.pack(side=tk.RIGHT)
+        self.apply_button = ttk.Button(actions, text="Apply preferred everywhere", style="Small.Success.TButton",
+                                       command=self.apply_finding)
+        self.apply_button.pack(side=tk.RIGHT, padx=(0, 6))
+        Tooltip(self.apply_button, "Replace every other variant by the preferred form as author corrections "
+                                   "(one undo step). Double-click an occurrence to look at it first.")
+        self._update_consistency_buttons()
+        return tab
+
+    # ------------------------------------------------------- consistency
+    def set_consistency_progress(self, done, total):
+        if done is None:
+            self.consistency_progress_var.set("")
+            self.consistency_stop.pack_forget()
+        else:
+            self.consistency_progress_var.set("Asking the model... {0}/{1} request(s)".format(done, total))
+            self.consistency_stop.pack(side=tk.LEFT, padx=(6, 0))
+
+    def refresh_consistency(self):
+        tree = self.consistency_tree
+        tree.delete(*tree.get_children())
+        self.consistency_rows = {}
+        if self.project is None:
+            return
+        findings = self.project.consistency
+        show_dismissed = self.show_dismissed_var.get()
+        counts = {}
+        for finding in findings:
+            counts[finding.status] = counts.get(finding.status, 0) + 1
+        if not findings:
+            self.consistency_summary_var.set("No consistency check has run yet." if not self.project.pending_tasks()
+                                             else "Available once every segment has been evaluated.")
+        else:
+            self.consistency_summary_var.set(
+                "{0} finding(s): {1} issue(s), {2} intentional, {3} unverified, {4} dismissed".format(
+                    len(findings), counts.get(STATUS_ISSUE, 0), counts.get(STATUS_OK, 0),
+                    counts.get(STATUS_UNVERIFIED, 0), counts.get(STATUS_DISMISSED, 0)))
+        order = {STATUS_ISSUE: 0, STATUS_UNVERIFIED: 1, STATUS_OK: 2, STATUS_DISMISSED: 3}
+        for number, finding in enumerate(sorted(findings, key=lambda f: (order.get(f.status, 9), -f.total))):
+            if finding.status == STATUS_DISMISSED and not show_dismissed:
+                continue
+            iid = "f{0}".format(number)
+            label = ", ".join("{0} ({1})".format(variant, finding.counts.get(variant, 0)) for variant in finding.variants)
+            tree.insert("", tk.END, iid=iid, text=label, open=False, tags=(finding.status,), values=(
+                FINDING_LABELS.get(finding.kind, finding.kind), finding.preferred,
+                FINDING_STATUS_LABELS.get(finding.status, finding.status),
+                finding.reason or finding.detail))
+            self.consistency_rows[iid] = ("finding", finding)
+            for variant in finding.variants:
+                for position, occurrence in enumerate(finding.occurrences.get(variant, [])):
+                    chapter, _ = self.project.find(occurrence["chapter"], occurrence["segment"])
+                    child = "{0}-{1}-{2}".format(iid, variant, position)
+                    tree.insert(iid, tk.END, iid=child, tags=("occurrence",),
+                                text="{0} · {1} · segment {2}".format(
+                                    variant, chapter.title if chapter else occurrence["chapter"], occurrence["segment"]),
+                                values=("", "", "", _one_line(occurrence.get("text", ""), 80)))
+                    self.consistency_rows[child] = ("occurrence", finding, occurrence)
+        self._update_consistency_buttons()
+
+    def _selected_finding(self):
+        selection = self.consistency_tree.selection()
+        row = self.consistency_rows.get(selection[0]) if selection else None
+        return row[1] if row else None
+
+    def _update_consistency_buttons(self):
+        finding = self._selected_finding()
+        self.apply_button.configure(state=tk.NORMAL if finding is not None and finding.applicable
+                                    and finding.status != STATUS_DISMISSED else tk.DISABLED)
+        if finding is None:
+            self.dismiss_button.configure(text="Dismiss", state=tk.DISABLED)
+        else:
+            self.dismiss_button.configure(text="Restore" if finding.status == STATUS_DISMISSED else "Dismiss",
+                                          state=tk.NORMAL)
+
+    def _consistency_jump(self, event=None):
+        selection = self.consistency_tree.selection()
+        row = self.consistency_rows.get(selection[0]) if selection else None
+        if row is None:
+            return "break"
+        if row[0] == "occurrence":
+            occurrence = row[2]
+        else:
+            finding = row[1]
+            occurrence = next((items[0] for variant in finding.variants
+                               for items in [finding.occurrences.get(variant, [])] if items), None)
+        if occurrence is not None:
+            self.show_span(occurrence["chapter"], occurrence["segment"], occurrence["start"], occurrence["end"])
+        return "break"
+
+    def show_span(self, chapter_index, segment_index, start, end):
+        """Open a segment in the Segment tab and select ``[start, end)`` of its text."""
+        if self.project is None or self.project.find(chapter_index, segment_index)[1] is None:
+            return
+        self.preview_var.set(False)
+        self.select_segment(chapter_index, segment_index)
+        self.notebook.select(self.segment_tab)
+        self.text.tag_remove("sel", "1.0", tk.END)
+        self.text.tag_add("sel", "1.0+{0}c".format(start), "1.0+{0}c".format(max(end, start + 1)))
+        self.text.see("1.0+{0}c".format(start))
+
+    def dismiss_finding(self):
+        finding = self._selected_finding()
+        if finding is None:
+            return
+        finding.status = STATUS_UNVERIFIED if finding.status == STATUS_DISMISSED else STATUS_DISMISSED
+        self.refresh_consistency()
+        self.master.schedule_save()
+
+    def apply_finding(self):
+        finding = self._selected_finding()
+        if finding is None or not finding.applicable:
+            return
+        others = [variant for variant in finding.variants if variant != finding.preferred]
+        total = sum(finding.counts.get(variant, 0) for variant in others)
+        if not messagebox.askyesno(
+                "Apply preferred spelling?",
+                "Replace {0} occurrence(s) of {1} by “{2}” as your own corrections?\n\nAlt+Z reverts them all."
+                .format(total, " / ".join("“{0}”".format(v) for v in others), finding.preferred)):
+            return
+        count, _ = apply_preferred(self.project, finding)
+        self.project.consistency = collect_candidates(self.project, previous=self.project.consistency)
+        self.refresh_all()
+        self.refresh_consistency()
+        self._after_decision()
+        self.master.host.set_status("Wrote {0} author correction(s) for “{1}”. Alt+Z reverts them.".format(
+            count, finding.preferred))
+
+    # -------------------------------------------------------- chapter tab
+    def _tab_changed(self, event=None):
+        if self.project is None:
+            return
+        tab = self.notebook.select()
+        if tab == str(self.chapter_tab):
+            self.render_chapter_view()
+        elif tab == str(self.list_tab):
+            self.refresh_list()
+        elif tab == str(self.consistency_tab):
+            self.refresh_consistency()
+
+    def _tab_visible(self, tab):
+        try:
+            return self.notebook.select() == str(tab)
+        except tk.TclError:
+            return False
+
+    def schedule_chapter_render(self):
+        """Re-render the chapter tab shortly (coalesces bursts of decisions and results)."""
+        if self._chapter_after is not None:
+            try:
+                self.after_cancel(self._chapter_after)
+            except tk.TclError:
+                pass
+        self._chapter_after = self.after(150, self.render_chapter_view)
+
+    def render_chapter_view(self):
+        self._chapter_after = None
+        if self.project is None or not self._tab_visible(self.chapter_tab):
+            return
+        chapter, segment = self._current_segment()
+        if chapter is None:
+            chapter = self.project.chapters[0] if self.project.chapters else None
+        if chapter is None:
+            return
+        text, spans = render_chapter_annotated(self.project, chapter)
+        self.chapter_spans = spans
+        self.chapter_shown = chapter.index
+        counts = {}
+        for span in spans:
+            counts[span["state"]] = counts.get(span["state"], 0) + 1
+        self.chapter_title_var.set("{0}. {1} · {2} words · {3}".format(
+            chapter.index, chapter.title, word_count(text),
+            ", ".join("{0} {1}".format(counts[state], STATE_LABELS[state].lower())
+                      for state in (STATE_PENDING, STATE_APPLIED, STATE_REJECTED, STATE_SUPERSEDED) if counts.get(state))
+            or "no changes"))
+        widget = self.chapter_text
+        top = widget.yview()[0]
+        widget.configure(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", text)
+        for span in spans:
+            start = "1.0+{0}c".format(span["start"])
+            end = "1.0+{0}c".format(span["end"] if span["end"] > span["start"] else span["start"] + 1)
+            widget.tag_add(span["state"], start, end)
+            if span["flags"]:
+                widget.tag_add("flagged", start, end)
+            if segment is not None and span["segment"] == segment.index and span["change_id"] == self.selected_change_id:
+                widget.tag_add("current", start, end)
+        widget.configure(state=tk.DISABLED)
+        widget.yview_moveto(top)
+
+    def _chapter_clicked(self, event):
+        if self.project is None or not self.chapter_spans:
+            return "break"
+        index = self.chapter_text.index("@{0},{1}".format(event.x, event.y))
+        counted = self.chapter_text.count("1.0", index, "chars")
+        offset = counted[0] if counted else 0
+        hit = None
+        for span in self.chapter_spans:
+            end = span["end"] if span["end"] > span["start"] else span["start"] + 1
+            if span["start"] <= offset < end:
+                hit = span
+                if span["state"] == STATE_PENDING:
+                    break  # prefer the change that still needs a decision
+        if hit is None:
+            return "break"
+        self.show_change(self.chapter_shown, hit["segment"], hit["change_id"])
+        self.notebook.select(self.segment_tab)
+        return "break"
+
+    # --------------------------------------------------- all-changes tab
+    def schedule_list_refresh(self):
+        if self._list_after is not None:
+            try:
+                self.after_cancel(self._list_after)
+            except tk.TclError:
+                pass
+        self._list_after = self.after(150, self.refresh_list)
+
+    def _list_filters(self):
+        check = self.list_check_var.get()
+        kind = self.list_kind_var.get()
+        labels_to_check = {label: key for key, label in CHECK_LABELS.items()}
+        labels_to_kind = {label: key for key, label in CHANGE_KIND_LABELS.items()}
+        return labels_to_check.get(check), labels_to_kind.get(kind), self.list_text_var.get().strip().casefold()
+
+    def refresh_list(self):
+        self._list_after = None
+        if self.project is None or not self._tab_visible(self.list_tab):
+            return
+        check, kind, needle = self._list_filters()
+        keep = {iid for iid in self.list_tree.selection()}
+        self.list_tree.delete(*self.list_tree.get_children())
+        self.listed = {}
+        total = 0
+        for chapter, segment, change in pending_changes(self.project):
+            total += 1
+            if check and change.check != check:
+                continue
+            if kind and change.kind != kind:
+                continue
+            if needle and needle not in (change.original_text + " " + change.proposed_text).casefold():
+                continue
+            iid = "l{0}-{1}-{2}".format(chapter.index, segment.index, change.change_id)
+            self.list_tree.insert("", tk.END, iid=iid, tags=("flagged",) if change.flagged else (), values=(
+                chapter.title, segment.index, CHECK_LABELS[change.check], CHANGE_KIND_LABELS[change.kind],
+                "{0} → {1}{2}".format(_one_line(change.original_text) or "∅",
+                                          _one_line(change.proposed_text) or "∅",
+                                          "  ⚠" if change.flagged else ""),
+            ))
+            self.listed[iid] = (chapter.index, segment.index, change.change_id)
+        shown = len(self.listed)
+        self.list_count_var.set("{0} of {1} pending change(s)".format(shown, total) if shown != total
+                                else "{0} pending change(s)".format(total))
+        still = [iid for iid in keep if iid in self.listed]
+        if still:
+            self.list_tree.selection_set(still)
+
+    def _list_jump(self, event=None):
+        selection = self.list_tree.selection()
+        if selection and selection[0] in self.listed:
+            chapter_index, segment_index, change_id = self.listed[selection[0]]
+            self.show_change(chapter_index, segment_index, change_id)
+            self.notebook.select(self.segment_tab)
+        return "break"
+
+    def decide_listed(self, decision):
+        """Accept or reject the rows selected in the all-changes tab as one undo group."""
+        if self.project is None:
+            return 0
+        targets = [self.listed[iid] for iid in self.list_tree.selection() if iid in self.listed]
+        if not targets:
+            self.master.host.set_status("Select one or more rows in the list first.")
+            return 0
+        group = new_decision_group() if len(targets) > 1 else None
+        count = 0
+        for chapter_index, segment_index, change_id in targets:
+            _, segment = self.project.find(chapter_index, segment_index)
+            change = segment.find_change(change_id) if segment is not None else None
+            if change is not None and self.project.decide(chapter_index, segment_index, change, decision, group=group):
+                count += 1
+        self.refresh_all()
+        self._after_decision()
+        self.master.host.set_status("{0} change(s) {1}. Alt+Z reverts them.".format(
+            count, "accepted" if decision == ACCEPTED else "rejected"))
+        return count
+
     # ------------------------------------------------------------- loading
     def load_project(self, project):
         self.project = project
         self.title_var.set(project.name)
         for check in CHECKS:
             self.check_vars[check].set(bool(project.options.checks.get(check)))
+        for kind in CHANGE_KINDS:
+            self.kind_vars[kind].set(kind not in project.options.hidden_kinds)
         self.tree.delete(*self.tree.get_children())
         for chapter in project.chapters:
             chapter_id = "c{0}".format(chapter.index)
@@ -1050,6 +2065,11 @@ class ProjectView(ttk.Frame):
                                  text="Segment {0} · {1} words".format(segment.index, word_count(segment.text)),
                                  values=("",))
         self.current = None
+        self.chapter_shown = None
+        self.chapter_spans = []
+        self.notebook.select(self.segment_tab)
+        self.set_consistency_progress(None, None)
+        self.refresh_consistency()
         self.refresh_all()
         first = self._first_segment_with(lambda status: status == STATUS_READY) or self._first_segment_with(lambda status: True)
         if first:
@@ -1128,8 +2148,12 @@ class ProjectView(ttk.Frame):
             self.retry_button.pack(side=tk.LEFT, padx=(8, 0))
         else:
             self.retry_button.pack_forget()
+        self.consistency_button.configure(
+            state=tk.NORMAL if not self.running and not self.project.pending_tasks() else tk.DISABLED)
         if self.current:
             self.render_segment()
+        self.schedule_chapter_render()
+        self.schedule_list_refresh()
 
     def _segment_status(self, chapter, segment):
         status = segment.status(self.project.enabled)
@@ -1163,12 +2187,129 @@ class ProjectView(ttk.Frame):
             self.check_buttons[check].configure(text="{0} ({1})".format(CHECK_LABELS[check], per["changes"]))
         if self.current == (chapter_index, segment_index):
             self.render_segment()
+        if self.current and self.current[0] == chapter_index:
+            self.schedule_chapter_render()
+        self.schedule_list_refresh()
 
     def _toggle_check(self, check):
         if self.project is None:
             return
         self.project.options.checks[check] = bool(self.check_vars[check].get())
         self.on_checks_changed()
+
+    # -------------------------------------------------------- re-evaluate
+    def _tree_context(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return "break"
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self._post_tree_menu(iid, event.x_root, event.y_root)
+        return "break"
+
+    def _tree_context_key(self, event=None):
+        iid = self.tree.focus() or (self.tree.selection() or [None])[0]
+        if not iid:
+            return "break"
+        x, y, width, height = self.tree.bbox(iid) or (0, 0, 0, 0)
+        self._post_tree_menu(iid, self.tree.winfo_rootx() + x + width // 3, self.tree.winfo_rooty() + y + height)
+        return "break"
+
+    def _post_tree_menu(self, iid, x, y):
+        if self.project is None:
+            return
+        menu = self.tree_menu
+        menu.delete(0, tk.END)
+        if iid.startswith("s"):
+            chapter_index, segment_index = (int(part) for part in iid[1:].split("-"))
+            _, segment = self.project.find(chapter_index, segment_index)
+            if segment is None or segment.is_blank:
+                return
+            submenu = tk.Menu(menu, tearoff=False)
+            submenu.add_command(label="All checks", command=lambda: self.on_reevaluate(chapter_index, segment_index))
+            submenu.add_separator()
+            for check in self.project.options.enabled_checks():
+                submenu.add_command(label=CHECK_LABELS[check],
+                                    command=lambda c=check: self.on_reevaluate(chapter_index, segment_index, [c]))
+            submenu.add_separator()
+            submenu.add_command(label="Whole chapter", command=lambda: self.on_reevaluate(chapter_index))
+            menu.add_cascade(label="Evaluate again", menu=submenu)
+        else:
+            chapter_index = int(iid[1:])
+            menu.add_command(label="Evaluate chapter again", command=lambda: self.on_reevaluate(chapter_index))
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def reevaluate_current(self):
+        chapter, segment = self._current_segment()
+        if segment is None or segment.is_blank:
+            return
+        if self.project.decision_log and any(
+                change.decision != PENDING for change in segment.changes(self.project.enabled)):
+            if not messagebox.askyesno("Evaluate again?",
+                                       "Discard the results and decisions of this segment and run the checks again?"):
+                return
+        self.on_reevaluate(chapter.index, segment.index)
+
+    # -------------------------------------------------------------- kinds
+    def _fill_kinds_menu(self):
+        """Rebuild the Kinds menu with current counts every time it opens."""
+        menu = self.kinds_menu
+        menu.delete(0, tk.END)
+        if self.project is None:
+            return
+        stats = self.project.progress()
+        menu.add_command(label="Show kinds", state=tk.DISABLED)
+        for kind in CHANGE_KINDS:
+            menu.add_checkbutton(
+                label="{0} ({1})".format(CHANGE_KIND_LABELS[kind], stats["per_kind"][kind]["changes"]),
+                variable=self.kind_vars[kind], onvalue=True, offvalue=False,
+                command=lambda k=kind: self._toggle_kind(k),
+            )
+        menu.add_separator()
+        for decision, label in ((ACCEPTED, "Accept all…"), (REJECTED, "Reject all…")):
+            submenu = tk.Menu(menu, tearoff=False)
+            for kind in CHANGE_KINDS:
+                pending = len(self.project.changes_by_kind(kind, decision=PENDING))
+                submenu.add_command(
+                    label="{0} ({1} pending)".format(CHANGE_KIND_LABELS[kind], pending),
+                    state=tk.NORMAL if pending else tk.DISABLED,
+                    command=lambda k=kind, d=decision: self.decide_kind_everywhere(k, d),
+                )
+            menu.add_cascade(label=label, menu=submenu)
+
+    def _toggle_kind(self, kind):
+        if self.project is None:
+            return
+        hidden = [k for k in CHANGE_KINDS if not self.kind_vars[k].get()]
+        self.project.options.hidden_kinds = hidden
+        self.kinds_button.configure(text="Kinds ▾" if not hidden else "Kinds ({0} hidden) ▾".format(len(hidden)))
+        self.master.schedule_save()
+        self.render_segment()
+
+    def decide_kind_everywhere(self, kind, decision):
+        """Accept or reject every pending change of ``kind`` in the project (one undo group)."""
+        if self.project is None:
+            return
+        pending = self.project.changes_by_kind(kind, decision=PENDING)
+        label = CHANGE_KIND_LABELS[kind].lower()
+        verb = "Accept" if decision == ACCEPTED else "Reject"
+        if not pending:
+            self.master.host.set_status("No pending {0} changes.".format(label))
+            return
+        if not messagebox.askyesno(
+            "{0} all {1} changes?".format(verb, label),
+            "{0} {1} pending {2} change(s) across the whole project?\n\nAlt+Z (Undo) reverts them all at once."
+            .format(verb, len(pending), label),
+        ):
+            return
+        entries = self.project.decide_kind(kind, decision)
+        self.refresh_all()
+        self._after_decision()
+        self.master.host.set_status("{0}ed {1} {2} change(s). Alt+Z reverts them.".format(
+            verb, len(entries), label))
 
     # ------------------------------------------------------------ segment
     def _tree_selected(self, event=None):
@@ -1177,12 +2318,18 @@ class ProjectView(ttk.Frame):
             return
         iid = selection[0]
         if iid.startswith("s"):
-            chapter_index, segment_index = iid[1:].split("-")
-            self.select_segment(int(chapter_index), int(segment_index), from_tree=True)
+            chapter_index, segment_index = (int(part) for part in iid[1:].split("-"))
+            if (chapter_index, segment_index) == self.current:
+                # Either a click on the row already shown or the echo of our own
+                # selection_set(): re-rendering would drop the selected change.
+                return
+            self.select_segment(chapter_index, segment_index, from_tree=True)
 
-    def select_segment(self, chapter_index, segment_index, from_tree=False):
+    def select_segment(self, chapter_index, segment_index, from_tree=False, change_id=None):
         self.current = (chapter_index, segment_index)
-        self.selected_change_id = None
+        self.selected_change_id = change_id
+        if self.chapter_shown != chapter_index:
+            self.schedule_chapter_render()
         if not from_tree:
             iid = self._segment_iid(chapter_index, segment_index)
             try:
@@ -1202,7 +2349,7 @@ class ProjectView(ttk.Frame):
         for check in CHECKS:
             if not self.filter_vars[check].get():
                 enabled[check] = False
-        return segment.changes(enabled)
+        return segment.changes(enabled, hidden_kinds=self.project.options.hidden_kinds)
 
     def render_segment(self):
         chapter, segment = self._current_segment()
@@ -1269,10 +2416,19 @@ class ProjectView(ttk.Frame):
             ttk.Label(self.cards_frame.inner, text=message, style="Muted.TLabel", wraplength=560,
                       justify=tk.LEFT, padding=(12, 16)).pack(anchor="w")
             return
-        for change in changes:
+        author_changes = [change for change in changes if change.is_author]
+        model_changes = [change for change in changes if not change.is_author]
+        if author_changes:
+            ttk.Label(self.cards_frame.inner, text="Author's corrections", style="Muted.TLabel",
+                      font=font(9, "bold")).pack(anchor="w", pady=(2, 4))
+        for change in author_changes + model_changes:
+            if model_changes and author_changes and change is model_changes[0]:
+                ttk.Label(self.cards_frame.inner, text="Suggested by the checks", style="Muted.TLabel",
+                          font=font(9, "bold")).pack(anchor="w", pady=(6, 4))
             card = ChangeCard(self.cards_frame.inner, change, segment.text, states[change.change_id],
                               on_select=self._card_selected, on_decide=self.decide,
-                              on_add_to_glossary=self.add_to_glossary if self.on_add_to_glossary else None)
+                              on_add_to_glossary=self.add_to_glossary if self.on_add_to_glossary else None,
+                              on_edit=None if change.is_author else self.edit_change)
             card.pack(fill=tk.X, padx=(0, 4), pady=(0, 6))
             card.refresh(states[change.change_id], selected=change.change_id == self.selected_change_id)
             self.cards[change.change_id] = card
@@ -1316,13 +2472,92 @@ class ProjectView(ttk.Frame):
         )
 
     # ---------------------------------------------------------- decisions
-    def decide(self, change, decision):
-        change.decision = decision
+    def decide(self, change, decision, group=None):
+        chapter, segment = self._current_segment()
+        if segment is None:
+            return
+        self.project.decide(chapter.index, segment.index, change, decision, group=group)
         self.selected_change_id = change.change_id
         self._refresh_cards_only()
         self._after_decision()
         # move on to the next pending change for a fast keyboard flow
         self.step_change(1, pending_only=True)
+
+    def edit_change(self, change, new_text):
+        """Store the author's wording for ``change`` and accept it (from the card's Edit box)."""
+        chapter, segment = self._current_segment()
+        if segment is None:
+            return
+        entry = self.project.edit_change(chapter.index, segment.index, change, new_text)
+        self.selected_change_id = change.change_id
+        self.render_segment()
+        if entry is not None:
+            self._after_decision()
+            self.master.host.set_status("Suggestion reworded and accepted. Alt+Z restores the model's wording.")
+
+    def edit_selected(self):
+        """F2: open the inline editor of the selected card."""
+        card = self.cards.get(self.selected_change_id)
+        if card is not None and not card.change.is_author:
+            card.begin_edit()
+
+    # ---- the author's own corrections
+    def _fill_text_menu(self):
+        menu = self.text_menu
+        menu.delete(0, tk.END)
+        has_selection = bool(self.text.tag_ranges("sel"))
+        menu.add_command(label="Add my correction…   Ctrl+E", command=self.add_author_correction,
+                         state=tk.NORMAL if has_selection and not self.preview_var.get() else tk.DISABLED)
+        menu.add_command(label="Copy", command=self._copy_selection, state=tk.NORMAL if has_selection else tk.DISABLED)
+
+    def _text_context(self, event):
+        try:
+            self.text_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.text_menu.grab_release()
+        return "break"
+
+    def _copy_selection(self):
+        if self.text.tag_ranges("sel"):
+            self.clipboard_clear()
+            self.clipboard_append(self.text.get("sel.first", "sel.last"))
+
+    def selected_span(self):
+        """Return (start, end) offsets of the selection in the segment text, or None."""
+        if not self.text.tag_ranges("sel"):
+            return None
+        counted = self.text.count("1.0", "sel.first", "chars")
+        start = counted[0] if counted else 0
+        counted = self.text.count("sel.first", "sel.last", "chars")
+        end = start + (counted[0] if counted else 0)
+        return start, end
+
+    def add_author_correction(self):
+        """Ctrl+E: replace the selected span of the ORIGINAL segment text with the author's wording."""
+        chapter, segment = self._current_segment()
+        if segment is None:
+            return
+        if self.preview_var.get():
+            self.master.host.set_status("Switch off “Preview result” to add a correction to the original text.")
+            return
+        span = self.selected_span()
+        if span is None or span[0] == span[1]:
+            self.master.host.set_status("Select the text to correct first, then press Ctrl+E.")
+            return
+        start, end = span
+        original = segment.text[start:end]
+
+        def save(new_text, chapter_index=chapter.index, segment_index=segment.index):
+            change = self.project.add_author_change(chapter_index, segment_index, start, end, new_text)
+            if change is None:
+                self.master.host.set_status("The correction equals the original text; nothing added.")
+                return
+            self.selected_change_id = change.change_id
+            self.render_segment()
+            self._after_decision()
+            self.master.host.set_status("Your correction was added and applied. Alt+Z removes it.")
+
+        AuthorFixDialog(self, original, on_save=save)
 
     def add_to_glossary(self, change):
         """Reject ``change`` and protect its original wording (the "Add to glossary" link)."""
@@ -1330,6 +2565,9 @@ class ProjectView(ttk.Frame):
         self.decide(change, REJECTED)
 
     def decide_selected(self, decision):
+        if self._tab_visible(self.list_tab):
+            self.decide_listed(decision)
+            return
         card = self.cards.get(self.selected_change_id)
         if card is not None:
             self.decide(card.change, decision)
@@ -1338,8 +2576,9 @@ class ProjectView(ttk.Frame):
         chapter, segment = self._current_segment()
         if segment is None:
             return
+        group = new_decision_group()
         for change in self._visible_changes(segment):
-            change.decision = decision
+            self.project.decide(chapter.index, segment.index, change, decision, group=group)
         self.render_segment()
         self._after_decision()
 
@@ -1349,11 +2588,36 @@ class ProjectView(ttk.Frame):
         if segment is None:
             return
         flagged = [c for c in self._visible_changes(segment) if c.flagged and c.decision == PENDING]
+        group = new_decision_group()
         for change in flagged:
-            change.decision = REJECTED
+            self.project.decide(chapter.index, segment.index, change, REJECTED, group=group)
         if flagged:
             self.render_segment()
             self._after_decision()
+
+    def undo(self):
+        """Revert the last decision (group) and show the first change it touched.
+
+        Returns the reverted log entries, or None when the log was empty.
+        """
+        if self.project is None:
+            return None
+        undone = self.project.undo()
+        if not undone:
+            return None
+        first = undone[0]
+        self.show_change(first["chapter"], first["segment"], first["change_id"])
+        self._after_decision()
+        return undone
+
+    def show_change(self, chapter_index, segment_index, change_id):
+        """Select ``change_id`` in its segment and scroll it into view."""
+        if self.project is None or self.project.find(chapter_index, segment_index)[1] is None:
+            return
+        self.select_segment(chapter_index, segment_index, change_id=change_id)
+        card = self.cards.get(change_id) if change_id else None
+        if card is not None:
+            self.cards_frame.scroll_to_widget(card)
 
     def _after_decision(self):
         self.summary_var.set(self._summary_line(self.project.progress()))
@@ -1361,6 +2625,8 @@ class ProjectView(ttk.Frame):
         if segment is not None:
             self._refresh_tree_row(chapter, segment)
         self.master.schedule_save()
+        self.schedule_chapter_render()
+        self.schedule_list_refresh()
 
     def step_change(self, delta, pending_only=False):
         ids = list(self.cards.keys())
