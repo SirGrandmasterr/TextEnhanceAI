@@ -33,6 +33,7 @@ from core.workflow import (
     build_outline_messages,
     change_states,
     create_project,
+    normalise_style_guide,
     parse_outline,
     render_segment,
 )
@@ -61,6 +62,9 @@ STATE_LABELS = {
     STATE_PENDING: "Pending",
 }
 LANGUAGES = [SAME_LANGUAGE, "English", "German", "French", "Spanish", "Italian", "Dutch"]
+STYLE_GUIDE_PLACEHOLDER = "British spelling · keep dialect inside dialogue · never touch quotations"
+STYLE_GUIDE_HINT = ("Standing rules every check must respect, one per line. They are sent with every request "
+                    "and take precedence over the built-in rules where they conflict.")
 
 
 def _format_eta(seconds):
@@ -72,6 +76,85 @@ def _format_eta(seconds):
     if minutes < 60:
         return "~{0} min left".format(minutes)
     return "~{0} h {1:02d} min left".format(minutes // 60, minutes % 60)
+
+
+class StyleGuideBox(tk.Text):
+    """Multi-line entry for the author's instructions with a grey placeholder."""
+
+    def __init__(self, parent, height=4, placeholder=STYLE_GUIDE_PLACEHOLDER, **kwargs):
+        super().__init__(parent, height=height, **kwargs)
+        style_text(self, size=10)
+        self.placeholder = placeholder
+        self._showing_placeholder = False
+        self.bind("<FocusIn>", self._focus_in)
+        self.bind("<FocusOut>", self._focus_out)
+        self.set("")
+
+    def get_text(self):
+        """Return the author's text ("" while the placeholder is shown)."""
+        if self._showing_placeholder:
+            return ""
+        return self.get("1.0", tk.END).rstrip()
+
+    def set(self, text):
+        self.delete("1.0", tk.END)
+        if text:
+            self._showing_placeholder = False
+            self.configure(foreground=PALETTE["text"])
+            self.insert("1.0", text)
+        else:
+            self._showing_placeholder = True
+            self.configure(foreground=PALETTE["muted"])
+            self.insert("1.0", self.placeholder)
+
+    def _focus_in(self, event=None):
+        if self._showing_placeholder:
+            self._showing_placeholder = False
+            self.delete("1.0", tk.END)
+            self.configure(foreground=PALETTE["text"])
+
+    def _focus_out(self, event=None):
+        if not self.get("1.0", tk.END).strip():
+            self.set("")
+
+
+class StyleGuideDialog(tk.Toplevel):
+    """Edit the author's instructions of an open project."""
+
+    def __init__(self, parent, style_guide, on_save):
+        super().__init__(parent)
+        self.on_save = on_save
+        self.title("Review options")
+        self.transient(parent.winfo_toplevel())
+        self.resizable(True, False)
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="Author's instructions", font=font(11, "bold")).pack(anchor="w")
+        ttk.Label(body, text=STYLE_GUIDE_HINT, style="Muted.TLabel", wraplength=460).pack(anchor="w", pady=(2, 8))
+        self.box = StyleGuideBox(body, height=6, width=60)
+        self.box.pack(fill=tk.BOTH, expand=True)
+        self.box.set(style_guide)
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Save", style="Primary.TButton", command=self.save).pack(side=tk.RIGHT, padx=(0, 6))
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.grab_set()
+        self.box.focus_set()
+        self.update_idletasks()
+        try:
+            top = parent.winfo_toplevel()
+            x = top.winfo_rootx() + (top.winfo_width() - self.winfo_width()) // 2
+            y = top.winfo_rooty() + (top.winfo_height() - self.winfo_height()) // 2
+            self.geometry("+{0}+{1}".format(max(x, 0), max(y, 0)))
+        except tk.TclError:
+            pass
+
+    def save(self):
+        text = self.box.get_text()
+        self.destroy()
+        self.on_save(text)
 
 
 class WorkflowScreen(ttk.Frame):
@@ -87,7 +170,7 @@ class WorkflowScreen(ttk.Frame):
         self.start_view = StartView(self, on_start=self.start_project, on_open=self.open_project)
         self.project_view = ProjectView(self, on_close=self.close_project, on_pause=self.toggle_pause,
                                         on_export=self.export_project, on_retry=self.resume_runner,
-                                        on_checks_changed=self.checks_changed)
+                                        on_checks_changed=self.checks_changed, on_options=self.edit_options)
         self.start_view.pack(fill=tk.BOTH, expand=True)
 
     # ----------------------------------------------------------- lifecycle
@@ -122,6 +205,7 @@ class WorkflowScreen(ttk.Frame):
             messagebox.showerror("No model", "Select a model in the toolbar before starting a review.")
             return
         project = create_project(path, text, options, model=model, backend=self.host.backend_id())
+        self.host.remember_style_guide(options.style_guide)
         if project.root.exists() and (project.root / PROJECT_FILE).exists():
             if not messagebox.askyesno(
                 "Replace previous review?",
@@ -219,6 +303,43 @@ class WorkflowScreen(ttk.Frame):
             ):
                 self.host.lock_controls(True)
                 self.resume_runner()
+
+    def edit_options(self):
+        """Open the review options (author's instructions) of the current project."""
+        if self.project is None:
+            return
+        if self.evaluating:
+            messagebox.showinfo("Evaluation running", "Pause the evaluation before changing the instructions.")
+            return
+        StyleGuideDialog(self, self.project.options.style_guide, on_save=self._apply_style_guide)
+
+    def _apply_style_guide(self, style_guide):
+        if self.project is None:
+            return
+        if normalise_style_guide(style_guide) == normalise_style_guide(self.project.options.style_guide):
+            self.project.options.style_guide = style_guide
+            self.project.save()
+            return
+        self.project.options.style_guide = style_guide
+        self.project.save()
+        self.host.remember_style_guide(style_guide)
+        has_results = any(segment.results for _, segment in self.project.all_segments())
+        if has_results and messagebox.askyesno(
+            "Re-evaluate?",
+            "Re-evaluate all segments with the new instructions? "
+            "(existing decisions on unchanged text are lost)",
+        ):
+            for _, segment in self.project.all_segments():
+                segment.results.clear()
+            self.running_tasks = set()
+            self.project.save()
+            self.project_view.refresh_all()
+            self.project_view.render_segment()
+            self.host.lock_controls(True)
+            self.resume_runner()
+            return
+        self.project_view.refresh_all()
+        self.host.set_status("Instructions saved; they apply to segments evaluated from now on.")
 
     def export_project(self):
         if self.project is None:
@@ -487,9 +608,15 @@ class StartView(ttk.Frame):
         self.language_var = tk.StringVar(value=SAME_LANGUAGE)
         ttk.Combobox(expl_row, textvariable=self.language_var, values=LANGUAGES, width=14).pack(side=tk.LEFT)
 
+        # --- author's instructions
+        guide = self._card(body, "4. Author's instructions", STYLE_GUIDE_HINT)
+        guide.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        self.style_guide_box = StyleGuideBox(guide, height=4)
+        self.style_guide_box.pack(fill=tk.X)
+
         # --- actions
         actions = ttk.Frame(body)
-        actions.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        actions.grid(row=4, column=0, sticky="ew", pady=(4, 0))
         self.start_button = ttk.Button(actions, text="Start automatic review", style="Accent.TButton",
                                        command=self.start, state=tk.DISABLED)
         self.start_button.pack(side=tk.LEFT)
@@ -498,9 +625,14 @@ class StartView(ttk.Frame):
         ttk.Label(actions, textvariable=self.estimate_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=12)
 
     def refresh_defaults(self, host):
-        """Suggest a parallelism that suits the selected backend."""
+        """Suggest a parallelism that suits the backend and pre-fill the author's instructions."""
         try:
             self.parallel_var.set("1" if host.backend_id() == "ollama" else "2")
+        except Exception:
+            pass
+        try:
+            if not self.style_guide_box.get_text():
+                self.style_guide_box.set(host.default_style_guide())
         except Exception:
             pass
 
@@ -544,6 +676,7 @@ class StartView(ttk.Frame):
             explain=bool(self.explain_var.get()),
             language=self.language_var.get().strip() or SAME_LANGUAGE,
             parallelism=parallel,
+            style_guide=self.style_guide_box.get_text(),
         )
 
     def _update_preview(self):
@@ -681,13 +814,14 @@ class ChangeCard(ttk.Frame):
 class ProjectView(ttk.Frame):
     """Chapter/segment navigation, highlighted text and change cards."""
 
-    def __init__(self, parent, on_close, on_pause, on_export, on_retry, on_checks_changed):
+    def __init__(self, parent, on_close, on_pause, on_export, on_retry, on_checks_changed, on_options=None):
         super().__init__(parent, padding=(12, 8))
         self.on_close = on_close
         self.on_pause = on_pause
         self.on_export = on_export
         self.on_retry = on_retry
         self.on_checks_changed = on_checks_changed
+        self.on_options = on_options or (lambda: None)
         self.project = None
         self.current = None  # (chapter_index, segment_index)
         self.running = set()  # (chapter_index, segment_index) currently being evaluated
@@ -713,6 +847,7 @@ class ProjectView(ttk.Frame):
         buttons.grid(row=0, column=2, rowspan=2, sticky="e")
         self.pause_button = ttk.Button(buttons, text="Pause", command=self.on_pause)
         self.pause_button.pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Options...", command=self.on_options).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(buttons, text="Export...", style="Accent.TButton", command=self.on_export).pack(side=tk.LEFT, padx=6)
         ttk.Button(buttons, text="Close project", style="Ghost.TButton", command=self.on_close).pack(side=tk.LEFT)
 

@@ -87,6 +87,13 @@ EXPLANATION_SYSTEM_PROMPT = (
 )
 SAME_LANGUAGE = "same as text"
 
+# Standing instructions from the author, appended to every check's instruction
+# and to the explanation prompt (see ``format_style_guide``).
+STYLE_GUIDE_MAX_CHARS = 1500
+STYLE_GUIDE_HEADER = (
+    "Author's instructions (they take precedence over the rules above where they conflict):"
+)
+
 STATUS_QUEUED = "queued"
 STATUS_ERROR = "error"
 STATUS_CLEAN = "clean"
@@ -295,6 +302,7 @@ class ProjectOptions:
     explain: bool = True
     language: str = SAME_LANGUAGE
     parallelism: int = 2
+    style_guide: str = ""  # author's standing instructions, see build_check_instruction
 
     def enabled_checks(self):
         return [check for check in CHECKS if self.checks.get(check)]
@@ -310,6 +318,7 @@ class ProjectOptions:
             "explain": self.explain,
             "language": self.language,
             "parallelism": self.parallelism,
+            "style_guide": self.style_guide,
         }
 
     @classmethod
@@ -319,6 +328,8 @@ class ProjectOptions:
             if key in ("checks", "auto_accept"):
                 merged = getattr(options, key)
                 merged.update({k: bool(v) for k, v in (value or {}).items() if k in CHECKS})
+            elif key == "style_guide":
+                options.style_guide = str(value or "")
             elif hasattr(options, key):
                 setattr(options, key, value)
         return options
@@ -688,6 +699,40 @@ def parse_outline(text):
     return starts, titles
 
 
+# ----------------------------------------------------------- style guide
+def normalise_style_guide(style_guide):
+    """Return the author's rules one per line, trimmed to ``STYLE_GUIDE_MAX_CHARS``.
+
+    Authors type rules separated by line breaks or by " · " bullets (as in the
+    placeholder); both become one rule per line. Blank lines are dropped.
+    """
+    rules = []
+    for line in (style_guide or "").replace("\u00b7", "\n").splitlines():
+        rule = " ".join(line.split())
+        if rule:
+            rules.append(rule)
+    return "\n".join(rules)[:STYLE_GUIDE_MAX_CHARS].rstrip()
+
+
+def format_style_guide(style_guide):
+    """Return the block appended to a prompt for a non-empty style guide, else ""."""
+    rules = normalise_style_guide(style_guide)
+    if not rules:
+        return ""
+    return "\n\n" + STYLE_GUIDE_HEADER + "\n" + rules
+
+
+def build_check_instruction(check, options=None, style_guide=None):
+    """Return the instruction sent for ``check``, with the author's rules appended.
+
+    ``style_guide`` (a string) wins over ``options.style_guide``; both may be
+    omitted, in which case the plain ``CHECK_INSTRUCTIONS`` entry is returned.
+    """
+    if style_guide is None:
+        style_guide = getattr(options, "style_guide", "") if options is not None else ""
+    return CHECK_INSTRUCTIONS[check] + format_style_guide(style_guide)
+
+
 # ---------------------------------------------------------- explanations
 def _context(text, start, end, radius=40):
     before = text[max(0, start - radius):start].replace("\n", " ")
@@ -695,8 +740,12 @@ def _context(text, start, end, radius=40):
     return before, after
 
 
-def build_explanation_messages(segment_text, changes, check, language=SAME_LANGUAGE):
-    """Build the prompt asking for one short explanation per change."""
+def build_explanation_messages(segment_text, changes, check, language=SAME_LANGUAGE, style_guide=""):
+    """Build the prompt asking for one short explanation per change.
+
+    The author's rules are appended after the check description so the
+    explanations do not argue against them.
+    """
     lines = []
     for number, change in enumerate(changes, 1):
         before, after = _context(segment_text, change.start, change.end)
@@ -718,10 +767,10 @@ def build_explanation_messages(segment_text, changes, check, language=SAME_LANGU
                 "numbered change, write one short explanation (at most 15 words, {1}) of "
                 "why the new version is better. Return a JSON object mapping the change "
                 "number to its explanation, e.g. {{\"1\": \"...\", \"2\": \"...\"}}.\n\n"
-                "Check: {2}\n\nText:\n{3}\n\nChanges:\n{4}"
+                "Check: {2}{3}\n\nText:\n{4}\n\nChanges:\n{5}"
             ).format(
                 CHECK_LABELS[check].lower(), language_clause, CHECK_DESCRIPTIONS[check],
-                segment_text, "\n".join(lines),
+                format_style_guide(style_guide), segment_text, "\n".join(lines),
             ),
         },
     ]
@@ -789,19 +838,23 @@ def sanity_check_proposal(original, proposed):
         )
 
 
-def run_check(service, model, text, check, cancel_event, explain=True, language=SAME_LANGUAGE, retries=1):
+def run_check(service, model, text, check, cancel_event, explain=True, language=SAME_LANGUAGE, retries=1,
+              style_guide=""):
     """Evaluate one check on one segment; returns a CheckResult (never raises except on cancel).
 
     Edits are requested with ``text_first=True``: the segment comes before the
     check's instruction, so the three checks of one segment share a prompt
-    prefix that the GPU server can serve from its prefix cache.
+    prefix that the GPU server can serve from its prefix cache. ``style_guide``
+    holds the author's standing instructions; they are appended to the check's
+    instruction and to the explanation prompt.
     """
     started = time.time()
     attempt = 0
+    instruction = build_check_instruction(check, style_guide=style_guide)
     while True:
         try:
             proposed = strip_fences(
-                service.stream_edit(model, CHECK_INSTRUCTIONS[check], text, cancel_event, text_first=True)
+                service.stream_edit(model, instruction, text, cancel_event, text_first=True)
             ).strip("\n")
             sanity_check_proposal(text, proposed)
             break
@@ -820,7 +873,8 @@ def run_check(service, model, text, check, cancel_event, explain=True, language=
     if changes and explain:
         try:
             answer = service.generate(
-                model, build_explanation_messages(text, changes, check, language), cancel_event, max_tokens=2048
+                model, build_explanation_messages(text, changes, check, language, style_guide), cancel_event,
+                max_tokens=2048,
             )
             explanations = parse_explanations(answer)
             explained = bool(explanations)
@@ -911,7 +965,7 @@ class ProjectRunner:
                 try:
                     result = run_check(
                         self.service, self.model, segment.text, check, self.cancel_event,
-                        explain=options.explain, language=options.language,
+                        explain=options.explain, language=options.language, style_guide=options.style_guide,
                     )
                 except EditCancelled:
                     with self._lock:

@@ -336,6 +336,17 @@ class EditorApp:
     def backend_id(self):
         return self.settings.backend
 
+    def default_style_guide(self):
+        """Author's instructions that pre-fill a new review project."""
+        return self.settings.default_style_guide
+
+    def remember_style_guide(self, style_guide):
+        """Keep the last used author's instructions as the default for the next project."""
+        style_guide = style_guide or ""
+        if style_guide != self.settings.default_style_guide:
+            self.settings.default_style_guide = style_guide
+            self._save_settings()
+
     def lock_controls(self, locked):
         """Freeze backend/model selection while a project evaluation runs."""
         self._controls_locked = bool(locked)
