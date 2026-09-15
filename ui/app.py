@@ -347,6 +347,17 @@ class EditorApp:
             self.settings.default_style_guide = style_guide
             self._save_settings()
 
+    def default_glossary(self):
+        """Protected terms that pre-fill a new review project."""
+        return list(self.settings.default_glossary)
+
+    def remember_glossary(self, glossary):
+        """Keep the last used protected terms as the default for the next project."""
+        glossary = list(glossary or [])
+        if glossary != list(self.settings.default_glossary):
+            self.settings.default_glossary = glossary
+            self._save_settings()
+
     def lock_controls(self, locked):
         """Freeze backend/model selection while a project evaluation runs."""
         self._controls_locked = bool(locked)

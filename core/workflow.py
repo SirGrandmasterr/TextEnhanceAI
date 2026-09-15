@@ -94,6 +94,14 @@ STYLE_GUIDE_HEADER = (
     "Author's instructions (they take precedence over the rules above where they conflict):"
 )
 
+# Protected terms (names, invented words, technical terms). They are listed in
+# the prompt up to these caps; beyond them only the post-filter protects them.
+GLOSSARY_MAX_TERMS = 200
+GLOSSARY_MAX_CHARS = 2000
+GLOSSARY_HEADER = "Protected terms — never change their spelling, capitalization or form: "
+GLOSSARY_CONTEXT = 20  # characters around an insertion point checked against the glossary
+GLOSSARY_EXPLANATION = "Suppressed: touches a protected term."
+
 STATUS_QUEUED = "queued"
 STATUS_ERROR = "error"
 STATUS_CLEAN = "clean"
@@ -171,6 +179,7 @@ class CheckResult:
     model: str = ""
     duration: float = 0.0
     explained: bool = False
+    suppressed: List[Change] = field(default_factory=list)  # dropped by the glossary post-filter
 
     def to_dict(self):
         return {
@@ -182,6 +191,7 @@ class CheckResult:
             "model": self.model,
             "duration": round(self.duration, 2),
             "explained": self.explained,
+            "suppressed": [change.to_dict() for change in self.suppressed],
         }
 
     @classmethod
@@ -191,6 +201,7 @@ class CheckResult:
             [Change.from_dict(item) for item in data.get("changes", [])],
             data.get("error", ""), data.get("model", ""), float(data.get("duration", 0.0)),
             bool(data.get("explained", False)),
+            [Change.from_dict(item) for item in data.get("suppressed", []) or []],
         )
 
 
@@ -303,6 +314,7 @@ class ProjectOptions:
     language: str = SAME_LANGUAGE
     parallelism: int = 2
     style_guide: str = ""  # author's standing instructions, see build_check_instruction
+    glossary: List[str] = field(default_factory=list)  # protected terms, see glossary_matcher
 
     def enabled_checks(self):
         return [check for check in CHECKS if self.checks.get(check)]
@@ -319,6 +331,7 @@ class ProjectOptions:
             "language": self.language,
             "parallelism": self.parallelism,
             "style_guide": self.style_guide,
+            "glossary": list(self.glossary),
         }
 
     @classmethod
@@ -330,6 +343,8 @@ class ProjectOptions:
                 merged.update({k: bool(v) for k, v in (value or {}).items() if k in CHECKS})
             elif key == "style_guide":
                 options.style_guide = str(value or "")
+            elif key == "glossary":
+                options.glossary = parse_glossary(value)
             elif hasattr(options, key):
                 setattr(options, key, value)
         return options
@@ -387,9 +402,12 @@ class Project:
         stats = {
             "segments": 0, "queued": 0, "error": 0, "clean": 0, "ready": 0, "reviewed": 0,
             "tasks_total": 0, "tasks_done": 0, "changes": 0, "accepted": 0, "rejected": 0, "pending": 0,
-            "words": 0,
+            "suppressed": 0, "words": 0,
             "per_check": {
-                check: {"changes": 0, "accepted": 0, "rejected": 0, "by_kind": {kind: 0 for kind in CHANGE_KINDS}}
+                check: {
+                    "changes": 0, "accepted": 0, "rejected": 0, "suppressed": 0,
+                    "by_kind": {kind: 0 for kind in CHANGE_KINDS},
+                }
                 for check in CHECKS
             },
             "per_kind": {kind: {"changes": 0, "accepted": 0, "rejected": 0} for kind in CHANGE_KINDS},
@@ -406,6 +424,11 @@ class Project:
                 1 for check in checks
                 if check in segment.results and segment.results[check].status == "done"
             )
+            for check in checks:
+                result = segment.results.get(check)
+                if result is not None and result.status == "done" and result.suppressed:
+                    stats["suppressed"] += len(result.suppressed)
+                    stats["per_check"][check]["suppressed"] += len(result.suppressed)
             for change in segment.changes(enabled):
                 per_check = stats["per_check"][change.check]
                 per_kind = stats["per_kind"][change.kind]
@@ -533,6 +556,8 @@ class Project:
                     "{0} {1}".format(CHANGE_KIND_LABELS[kind].lower(), per["by_kind"][kind])
                     for kind in CHANGE_KINDS if per["by_kind"][kind]
                 ))
+            if per["suppressed"]:
+                lines.append("    - Glossary suppressed {0} proposed change(s)".format(per["suppressed"]))
         lines.append("")
         for chapter in self.chapters:
             lines.append("## {0}. {1}\n".format(chapter.index, chapter.title))
@@ -722,15 +747,110 @@ def format_style_guide(style_guide):
     return "\n\n" + STYLE_GUIDE_HEADER + "\n" + rules
 
 
-def build_check_instruction(check, options=None, style_guide=None):
-    """Return the instruction sent for ``check``, with the author's rules appended.
+# -------------------------------------------------------------- glossary
+def parse_glossary(text):
+    """Return the protected terms from a text box (one per line) or a stored list.
 
-    ``style_guide`` (a string) wins over ``options.style_guide``; both may be
-    omitted, in which case the plain ``CHECK_INSTRUCTIONS`` entry is returned.
+    Terms are trimmed, empty lines and duplicates dropped (first occurrence
+    wins, order kept). A term may end in ``*`` to protect every word that
+    starts with it (``hyper*`` covers ``hyperdrive``).
+    """
+    if text is None:
+        return []
+    if isinstance(text, str):
+        items = text.replace("\u00b7", "\n").splitlines()
+    else:
+        items = list(text)
+    terms = []
+    seen = set()
+    for item in items:
+        term = " ".join(str(item).split())
+        if not term or term == "*" or term in seen:
+            continue
+        seen.add(term)
+        terms.append(term)
+    return terms
+
+
+def glossary_pattern(terms):
+    """Return the compiled regex matching any protected term, or ``None`` when there is none."""
+    parts = []
+    for term in parse_glossary(terms):
+        if term.endswith("*"):
+            stem = term[:-1]
+            parts.append("(?<!\\w)" + re.escape(stem))
+        else:
+            parts.append("(?<!\\w)" + re.escape(term) + "(?!\\w)")
+    if not parts:
+        return None
+    # Longest first so "Meret Aubinger" wins over "Meret"; lookarounds instead of
+    # \b so terms may start or end with punctuation. Case-sensitive on purpose:
+    # a protected name keeps its capitalization.
+    parts.sort(key=len, reverse=True)
+    return re.compile("|".join(parts), re.UNICODE)
+
+
+def glossary_matcher(terms):
+    """Return ``callable(text) -> bool`` telling whether ``text`` contains a protected term."""
+    pattern = glossary_pattern(terms)
+    if pattern is None:
+        return lambda text: False
+    return lambda text: bool(text) and pattern.search(text) is not None
+
+
+def glossary_prompt_terms(terms):
+    """Return the terms listed in the prompt: at most ``GLOSSARY_MAX_TERMS`` / ``GLOSSARY_MAX_CHARS``."""
+    listed = []
+    length = 0
+    for term in parse_glossary(terms)[:GLOSSARY_MAX_TERMS]:
+        length += len(term) + (2 if listed else 0)
+        if length > GLOSSARY_MAX_CHARS:
+            break
+        listed.append(term)
+    return listed
+
+
+def format_glossary(terms):
+    """Return the prompt block naming the protected terms, or "" when there are none."""
+    listed = glossary_prompt_terms(terms)
+    if not listed:
+        return ""
+    return "\n\n" + GLOSSARY_HEADER + ", ".join(listed)
+
+
+def suppress_glossary_changes(text, changes, matcher):
+    """Split ``changes`` into (kept, suppressed) using the glossary ``matcher``.
+
+    A change is suppressed when its original text contains a protected term
+    or, for insertions, when the ``GLOSSARY_CONTEXT`` characters on either
+    side of the insertion point do.
+    """
+    kept, suppressed = [], []
+    for change in changes:
+        if change.original_text.strip():
+            hit = matcher(change.original_text)
+        else:
+            window = text[max(0, change.start - GLOSSARY_CONTEXT):change.end + GLOSSARY_CONTEXT]
+            hit = matcher(window)
+        if hit:
+            change.explanation = GLOSSARY_EXPLANATION
+            suppressed.append(change)
+        else:
+            kept.append(change)
+    return kept, suppressed
+
+
+def build_check_instruction(check, options=None, style_guide=None, glossary=None):
+    """Return the instruction sent for ``check`` with the author's rules and protected terms appended.
+
+    ``style_guide`` / ``glossary`` win over the values in ``options``; all may
+    be omitted, in which case the plain ``CHECK_INSTRUCTIONS`` entry is returned.
     """
     if style_guide is None:
         style_guide = getattr(options, "style_guide", "") if options is not None else ""
-    return CHECK_INSTRUCTIONS[check] + format_style_guide(style_guide)
+    if glossary is None:
+        glossary = getattr(options, "glossary", None) if options is not None else None
+    return CHECK_INSTRUCTIONS[check] + format_style_guide(style_guide) + format_glossary(glossary or [])
 
 
 # ---------------------------------------------------------- explanations
@@ -839,18 +959,20 @@ def sanity_check_proposal(original, proposed):
 
 
 def run_check(service, model, text, check, cancel_event, explain=True, language=SAME_LANGUAGE, retries=1,
-              style_guide=""):
+              style_guide="", glossary=None):
     """Evaluate one check on one segment; returns a CheckResult (never raises except on cancel).
 
     Edits are requested with ``text_first=True``: the segment comes before the
     check's instruction, so the three checks of one segment share a prompt
     prefix that the GPU server can serve from its prefix cache. ``style_guide``
     holds the author's standing instructions; they are appended to the check's
-    instruction and to the explanation prompt.
+    instruction and to the explanation prompt. ``glossary`` lists protected
+    terms: they are named in the prompt and any change touching one is moved
+    to ``CheckResult.suppressed`` instead of being proposed.
     """
     started = time.time()
     attempt = 0
-    instruction = build_check_instruction(check, style_guide=style_guide)
+    instruction = build_check_instruction(check, style_guide=style_guide, glossary=glossary)
     while True:
         try:
             proposed = strip_fences(
@@ -867,7 +989,7 @@ def run_check(service, model, text, check, cancel_event, explain=True, language=
             if cancel_event.wait(1.5):
                 raise EditCancelled("Editing was cancelled.")
 
-    changes = extract_changes(text, proposed, check)
+    changes, suppressed = suppress_glossary_changes(text, extract_changes(text, proposed, check), glossary_matcher(glossary))
     explained = False
     explanations = {}
     if changes and explain:
@@ -884,7 +1006,10 @@ def run_check(service, model, text, check, cancel_event, explain=True, language=
             explanations = {}
     for number, change in enumerate(changes, 1):
         change.explanation = explanations.get(number) or FALLBACK_EXPLANATIONS[check]
-    return CheckResult(check, "done", proposed, changes, model=model, duration=time.time() - started, explained=explained)
+    return CheckResult(
+        check, "done", proposed, changes, model=model, duration=time.time() - started, explained=explained,
+        suppressed=suppressed,
+    )
 
 
 class ProjectRunner:
@@ -966,6 +1091,7 @@ class ProjectRunner:
                     result = run_check(
                         self.service, self.model, segment.text, check, self.cancel_event,
                         explain=options.explain, language=options.language, style_guide=options.style_guide,
+                        glossary=options.glossary,
                     )
                 except EditCancelled:
                     with self._lock:

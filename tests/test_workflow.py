@@ -17,6 +17,10 @@ from core.workflow import (
     CHECK_INSTRUCTIONS,
     CHECK_SPELLING,
     CHECKS,
+    GLOSSARY_EXPLANATION,
+    GLOSSARY_HEADER,
+    GLOSSARY_MAX_CHARS,
+    GLOSSARY_MAX_TERMS,
     STYLE_GUIDE_HEADER,
     STYLE_GUIDE_MAX_CHARS,
     STATE_APPLIED,
@@ -42,14 +46,19 @@ from core.workflow import (
     classify_change,
     create_project,
     extract_changes,
+    format_glossary,
     format_style_guide,
+    glossary_matcher,
+    glossary_prompt_terms,
     normalise_style_guide,
     parse_explanations,
+    parse_glossary,
     parse_outline,
     render_segment,
     run_check,
     sanity_check_proposal,
     strip_fences,
+    suppress_glossary_changes,
 )
 
 ALL = {check: True for check in CHECKS}
@@ -404,6 +413,133 @@ def test_runner_passes_the_project_style_guide_to_every_check(tmp_path):
 
     assert service.instructions and all(GUIDE_BLOCK in instruction for instruction in service.instructions)
     assert service.prompts and all(GUIDE_BLOCK in prompt for prompt in service.prompts)
+
+
+# -------------------------------------------------------------- glossary
+def test_parse_glossary_trims_dedupes_and_accepts_lists():
+    assert parse_glossary("Thalbrück\n\n  Meret   Aubinger \nThalbrück\n*\nhyper*") == [
+        "Thalbrück", "Meret Aubinger", "hyper*"
+    ]
+    assert parse_glossary("a · b") == ["a", "b"]
+    assert parse_glossary(["x", " y ", "", "x"]) == ["x", "y"]
+    assert parse_glossary(None) == [] and parse_glossary("") == []
+
+
+def test_glossary_matcher_semantics():
+    hit = glossary_matcher(["Thalbrück", "Meret Aubinger", "hyper*", "C++", "Straße"])
+    # exact terms need word boundaries on both sides
+    assert hit("nach Thalbrück fahren") and hit("Thalbrück,") and hit("(Thalbrück)")
+    assert not hit("Thalbrücker") and not hit("Neuthalbrück")
+    # case matters: a protected name keeps its capitalization
+    assert not hit("thalbrück") and not hit("THALBRÜCK")
+    # umlauts and ß are word characters, not boundaries
+    assert hit("die Straße") and not hit("Straßenbahn") and not hit("Strasse")
+    # multi-word terms match as a phrase only
+    assert hit("Meret Aubinger kam") and not hit("Meret kam") and not hit("Aubinger")
+    # wildcard: word-boundary at the start, any suffix
+    assert hit("hyperdrive") and hit("hyper") and hit("hyper-drive")
+    assert not hit("superhyper") and not hit("ahyperb")
+    # punctuation inside terms is escaped
+    assert hit("C++ code") and not hit("C code") and not hit("xC++")
+    assert not hit("") and not glossary_matcher([])("Thalbrück") and not glossary_matcher(["*"])("anything")
+
+
+def test_post_filter_drops_changes_touching_protected_terms():
+    text = "Teh Kestenholz dog were very very big."
+    changes = extract_changes(text, "The Kestenholz dog was extremely big.", CHECK_GRAMMAR)
+    kept, suppressed = suppress_glossary_changes(text, changes, glossary_matcher(["Teh", "very*"]))
+    assert [c.original_text for c in kept] == ["were"]
+    assert [c.original_text for c in suppressed] == ["Teh", "very very"]
+    assert all(c.explanation == GLOSSARY_EXPLANATION for c in suppressed)
+
+    # an insertion is dropped only when a protected term sits within 20 characters
+    near = "I saw Kestenholz there"
+    inserted = extract_changes(near, "I saw a Kestenholz there", CHECK_GRAMMAR)
+    assert inserted[0].original_text == ""
+    assert suppress_glossary_changes(near, inserted, glossary_matcher(["Kestenholz"])) == ([], inserted)
+    far = "I saw dog. " + "x" * 30 + " Kestenholz"
+    inserted = extract_changes(far, far.replace("saw dog", "saw a dog"), CHECK_GRAMMAR)
+    assert suppress_glossary_changes(far, inserted, glossary_matcher(["Kestenholz"])) == (inserted, [])
+    # no glossary: nothing is touched
+    assert suppress_glossary_changes(text, changes, glossary_matcher([])) == (changes, [])
+
+
+def test_run_check_suppresses_and_keeps_the_dropped_changes():
+    service = FakeService()
+    result = run_check(service, "m", "Teh dog were big.", CHECK_SPELLING, threading.Event(), glossary=["Teh"])
+
+    assert result.status == "done"
+    assert result.changes == []
+    assert [c.original_text for c in result.suppressed] == ["Teh"]
+    assert service.prompts == []  # nothing left to explain
+    assert GLOSSARY_HEADER + "Teh" in service.instructions[0]
+
+    result = run_check(FakeService(), "m", "Teh dog were big.", CHECK_SPELLING, threading.Event(), glossary=["Kestenholz"])
+    assert [c.original_text for c in result.changes] == ["Teh"] and result.suppressed == []
+
+
+def test_suppressed_changes_round_trip_and_are_counted(tmp_path):
+    result = run_check(FakeService(), "m", "Teh dog.", CHECK_SPELLING, threading.Event(), glossary=["Teh"])
+    data = result.to_dict()
+    assert data["suppressed"][0]["original"] == "Teh"
+    restored = CheckResult.from_dict(data)
+    assert [c.to_dict() for c in restored.suppressed] == data["suppressed"]
+    legacy = {key: value for key, value in data.items() if key != "suppressed"}
+    assert CheckResult.from_dict(legacy).suppressed == []
+
+    project = make_project(tmp_path, glossary=["Teh", "very*"])
+    events = queue.Queue()
+    ProjectRunner(project, FakeService(), "m", events, parallelism=2).start()
+    for event in drain(events):
+        if event[0] == "workflow_result":
+            apply_result(project, *event[1:])
+    stats = project.progress()
+    assert stats["suppressed"] >= 2  # "Teh" (spelling) and "very very" (expression)
+    assert stats["per_check"][CHECK_SPELLING]["suppressed"] == 1
+    assert stats["per_check"][CHECK_EXPRESSION]["suppressed"] == 1
+    assert stats["per_check"][CHECK_GRAMMAR]["suppressed"] == 0
+    assert stats["suppressed"] == sum(per["suppressed"] for per in stats["per_check"].values())
+    assert not any("Teh" in c.original_text for _, s in project.all_segments() for c in s.changes(ALL))
+    report = project.build_report()
+    assert "  - Spelling: 0 proposed, 0 accepted, 0 rejected\n    - Glossary suppressed 1 proposed change(s)" in report
+    assert "  - Grammar:" in report and report.count("Glossary suppressed") == 2
+
+    project.save()
+    reloaded = Project.load(project.root)
+    assert reloaded.options.glossary == ["Teh", "very*"]
+    assert reloaded.progress()["suppressed"] == stats["suppressed"]
+
+
+def test_glossary_option_round_trips_and_defaults_to_empty():
+    options = ProjectOptions(glossary=["Thalbrück", "hyper*"])
+    assert options.to_dict()["glossary"] == ["Thalbrück", "hyper*"]
+    assert ProjectOptions.from_dict(options.to_dict()).glossary == ["Thalbrück", "hyper*"]
+    legacy = {key: value for key, value in options.to_dict().items() if key != "glossary"}
+    assert ProjectOptions.from_dict(legacy).glossary == []
+    assert ProjectOptions.from_dict(dict(legacy, glossary=None)).glossary == []
+    assert ProjectOptions.from_dict(dict(legacy, glossary="a\nb")).glossary == ["a", "b"]  # tolerant of text
+
+
+def test_prompt_lists_protected_terms_up_to_the_caps():
+    instruction = build_check_instruction(CHECK_SPELLING, glossary=["Thalbrück", "hyper*"], style_guide="British spelling")
+    assert instruction.endswith(GLOSSARY_HEADER + "Thalbrück, hyper*")
+    assert instruction.index(STYLE_GUIDE_HEADER) < instruction.index(GLOSSARY_HEADER)
+    assert build_check_instruction(CHECK_SPELLING, glossary=[]) == CHECK_INSTRUCTIONS[CHECK_SPELLING]
+    assert format_glossary(None) == ""
+
+    many = ["term{0}".format(n) for n in range(GLOSSARY_MAX_TERMS + 50)]
+    listed = glossary_prompt_terms(many)
+    assert listed == many[:GLOSSARY_MAX_TERMS]
+    assert "term{0}".format(GLOSSARY_MAX_TERMS) not in format_glossary(many)
+
+    long_terms = ["{0}{1}".format("x" * 150, n) for n in range(30)]
+    block = format_glossary(long_terms)
+    assert len(block) - len("\n\n" + GLOSSARY_HEADER) <= GLOSSARY_MAX_CHARS
+    assert long_terms[0] in block and long_terms[-1] not in block
+
+    # beyond the caps the post-filter still protects the term
+    hit = glossary_matcher(many + ["Kestenholz"])
+    assert hit("Kestenholz") and "Kestenholz" not in format_glossary(many + ["Kestenholz"])
 
 
 def test_run_check_produces_changes_with_explanations_and_strips_fences():
