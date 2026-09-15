@@ -182,6 +182,16 @@ def test_stream_edit_assembles_content_and_sends_editor_options(relay):
     assert "Instruction:\nFix grammar.\n\nText:\nOriginal." == body["messages"][1]["content"]
 
 
+def test_stream_edit_text_first_orders_the_prompt_for_prefix_caching(relay):
+    service = RemoteService(relay.url, "secret")
+
+    service.stream_edit("qwen-27b", "Fix grammar.", "Original.", threading.Event(), text_first=True)
+
+    body = relay.requests[-1][3]
+    assert body["messages"][1]["content"] == "Text:\nOriginal.\n\nInstruction:\nFix grammar."
+    assert body["messages"][0]["content"].endswith("The instruction follows the text.")
+
+
 def test_rejected_api_key_has_actionable_error(relay):
     service = RemoteService(relay.url, "wrong")
 

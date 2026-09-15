@@ -790,13 +790,18 @@ def sanity_check_proposal(original, proposed):
 
 
 def run_check(service, model, text, check, cancel_event, explain=True, language=SAME_LANGUAGE, retries=1):
-    """Evaluate one check on one segment; returns a CheckResult (never raises except on cancel)."""
+    """Evaluate one check on one segment; returns a CheckResult (never raises except on cancel).
+
+    Edits are requested with ``text_first=True``: the segment comes before the
+    check's instruction, so the three checks of one segment share a prompt
+    prefix that the GPU server can serve from its prefix cache.
+    """
     started = time.time()
     attempt = 0
     while True:
         try:
             proposed = strip_fences(
-                service.stream_edit(model, CHECK_INSTRUCTIONS[check], text, cancel_event)
+                service.stream_edit(model, CHECK_INSTRUCTIONS[check], text, cancel_event, text_first=True)
             ).strip("\n")
             sanity_check_proposal(text, proposed)
             break
@@ -860,6 +865,16 @@ class ProjectRunner:
         return any(thread.is_alive() for thread in self._threads)
 
     def start(self):
+        """Queue every pending task and start the workers; returns the task count.
+
+        The queue keeps ``pending_tasks()`` order, (chapter, segment, check):
+        all checks of one segment are dispatched consecutively, and because
+        ``run_check`` puts the segment text before the instruction, the GPU
+        server sees the same prompt prefix back to back and can reuse it from
+        its prefix cache (vLLM ``--enable-prefix-caching``) instead of
+        re-encoding the segment for every check. Keep the order when changing
+        the scheduling.
+        """
         pending = self.project.pending_tasks()
         self.total = len(pending)
         self.started_at = time.time()

@@ -10,7 +10,8 @@ A *cassette* is one JSON file per sample text and model in
 ``key`` is the SHA-256 of the canonical JSON of ``[model, messages,
 max_tokens]`` exactly as ``run_check`` hands them to the backend (``max_tokens``
 is ``None`` for edits, ``2048`` for explanations). Because ``stream_edit``
-builds its messages with ``core.backend.build_messages``, the key matches what
+builds its messages with ``core.backend.build_messages`` (honouring
+``text_first``, which the review checks use), the key matches what
 ``RemoteService`` and ``OllamaService`` send, so any prompt change makes the
 lookup miss and the failure says "re-record" instead of silently passing.
 
@@ -76,13 +77,24 @@ def _user_content(messages):
     return ""
 
 
+def split_edit_request(user_content):
+    """Return ``(instruction, text)`` from an edit request in either order, or ``None``."""
+    if user_content.startswith("Instruction:\n"):
+        instruction, _, text = user_content[len("Instruction:\n"):].partition("\n\nText:\n")
+        return instruction, text
+    if user_content.startswith("Text:\n"):
+        text, _, instruction = user_content[len("Text:\n"):].rpartition("\n\nInstruction:\n")
+        return instruction, text
+    return None
+
+
 def check_name(messages):
     """Best-effort name of the check behind a request (for error messages and summaries)."""
     user = _user_content(messages)
-    if user.startswith("Instruction:\n"):
-        instruction = user[len("Instruction:\n"):].split("\n\nText:\n", 1)[0]
+    edit = split_edit_request(user)
+    if edit is not None:
         for check, text in CHECK_INSTRUCTIONS.items():
-            if text == instruction:
+            if text == edit[0]:
                 return check
         return "edit"
     match = _EXPLANATION_HEAD.match(user)
@@ -183,9 +195,9 @@ class RecordedService:
             on_progress(len(response))
         return response
 
-    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None):
+    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None, text_first=False):
         result = self.generate(
-            model, build_messages(instruction, text), cancel_event, on_progress=on_progress
+            model, build_messages(instruction, text, text_first), cancel_event, on_progress=on_progress
         )
         if not result.strip():
             raise BackendUnavailable("The recorded model returned an empty response.")
@@ -244,10 +256,10 @@ class RecordingService:
             self.entries[key] = dict(self._entry(model, messages, max_tokens, key), response=response)
         return response
 
-    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None):
+    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None, text_first=False):
         # Mirror the real backends: build the messages here so the pair is captured.
         result = self.generate(
-            model, build_messages(instruction, text), cancel_event, on_progress=on_progress
+            model, build_messages(instruction, text, text_first), cancel_event, on_progress=on_progress
         )
         if not result.strip():
             raise BackendUnavailable("{0} returned an empty response.".format(self.display_name))

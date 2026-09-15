@@ -45,6 +45,17 @@ def test_stream_edit_combines_chunks_and_uses_deterministic_options():
     assert client.chat_arguments["options"]["temperature"] == 0.1
 
 
+def test_stream_edit_text_first_puts_the_text_before_the_instruction():
+    client = FakeClient(chunks=["Edited."])
+    service = OllamaService(client)
+
+    service.stream_edit("local-model", "Fix grammar.", "Original text.", threading.Event(), text_first=True)
+
+    system, user = client.chat_arguments["messages"]
+    assert user["content"] == "Text:\nOriginal text.\n\nInstruction:\nFix grammar."
+    assert system["content"].endswith(" The instruction follows the text.")
+
+
 def test_cancelled_before_request_does_not_call_client():
     client = FakeClient(chunks=["Unused"])
     service = OllamaService(client)

@@ -38,6 +38,7 @@ services:
       --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}
       --tensor-parallel-size ${VLLM_TENSOR_PARALLEL_SIZE:-1}
       --max-num-seqs ${VLLM_MAX_NUM_SEQS:-16}
+      --enable-prefix-caching
       ${VLLM_EXTRA_ARGS:-}
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]

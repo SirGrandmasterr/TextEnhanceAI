@@ -37,8 +37,14 @@ from recorded_service import (
     model_slug,
     request_key,
     sample_names,
+    split_edit_request,
     write_cassette,
 )
+
+# run_check asks for edits with the segment before the instruction so the
+# checks of one segment share a prompt prefix; keys for review edits must be
+# computed the same way.
+REVIEW_TEXT_FIRST = True
 
 # What each sample plants: the typo the spelling check must catch and the
 # proper noun no check may touch. Keep in sync with tests/recorded/samples.
@@ -170,8 +176,9 @@ class ScriptedBackend:
             self.fail_first -= 1
             raise BackendUnavailable("transient")
         user = messages[1]["content"]
-        if user.startswith("Instruction:\n"):
-            instruction, text = user[len("Instruction:\n"):].split("\n\nText:\n", 1)
+        edit = split_edit_request(user)
+        if edit is not None:
+            instruction, text = edit
             if instruction.startswith("Correct spelling"):
                 return text.replace("teh", "the")
             if instruction.startswith("Fix grammar"):
@@ -180,8 +187,8 @@ class ScriptedBackend:
         count = user.count("→")
         return json.dumps({str(n): "Because {0}".format(n) for n in range(1, count + 1)})
 
-    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None):
-        return self.generate(model, build_messages(instruction, text), cancel_event)
+    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None, text_first=False):
+        return self.generate(model, build_messages(instruction, text, text_first), cancel_event)
 
 
 TEXT = "teh dog were very very big and it run fast, said Ravenscourt."
@@ -209,6 +216,12 @@ def test_record_then_replay_reproduces_the_pipeline_outcome(tmp_path):
     )
     for entry in data["requests"]:
         assert entry["key"] == request_key(entry["model"], entry["messages"], entry["max_tokens"])
+    edits = {entry["check"]: entry for entry in data["requests"] if entry["check"] in CHECKS}
+    for check in CHECKS:
+        expected = build_messages(CHECK_INSTRUCTIONS[check], TEXT, text_first=REVIEW_TEXT_FIRST)
+        assert edits[check]["messages"] == expected
+        assert edits[check]["messages"][1]["content"].startswith("Text:\n" + TEXT)
+        assert edits[check]["key"] == request_key("scripted-1b", expected)
 
     service = RecordedService(path)
     assert service.list_models() == ["scripted-1b"]
@@ -261,7 +274,9 @@ def test_recording_keeps_the_error_until_the_request_succeeds(tmp_path):
     recorder = RecordingService(backend)
     result = run_check(recorder, "scripted-1b", TEXT, CHECK_SPELLING, threading.Event(), explain=False)
     assert result.status == "done"
-    key = request_key("scripted-1b", build_messages(CHECK_INSTRUCTIONS[CHECK_SPELLING], TEXT))
+    key = request_key(
+        "scripted-1b", build_messages(CHECK_INSTRUCTIONS[CHECK_SPELLING], TEXT, text_first=REVIEW_TEXT_FIRST)
+    )
     assert "response" in recorder.entries[key] and "error" not in recorder.entries[key]
 
     always_failing = RecordingService(ScriptedBackend(fail_first=10))
@@ -272,7 +287,10 @@ def test_recording_keeps_the_error_until_the_request_succeeds(tmp_path):
 
     replay = RecordedService({"model": "scripted-1b", "requests": [entry]})
     with pytest.raises(BackendUnavailable):
-        replay.stream_edit("scripted-1b", entry["messages"][1]["content"].split("\n")[1], TEXT, threading.Event())
+        replay.stream_edit(
+            "scripted-1b", CHECK_INSTRUCTIONS[CHECK_SPELLING], TEXT, threading.Event(),
+            text_first=REVIEW_TEXT_FIRST,
+        )
 
 
 def test_keys_ignore_nothing_that_the_backends_send():
@@ -281,6 +299,8 @@ def test_keys_ignore_nothing_that_the_backends_send():
     assert request_key("m", messages) != request_key("m", messages, max_tokens=2048)
     assert request_key("m", messages) != request_key("n", messages)
     assert request_key("m", build_messages("Do it", "Text ")) != request_key("m", messages)
+    # The two message orders are different requests (and different cassette entries).
+    assert request_key("m", build_messages("Do it", "Text", text_first=True)) != request_key("m", messages)
 
 
 def test_helpers_name_checks_and_slug_models():
@@ -288,6 +308,9 @@ def test_helpers_name_checks_and_slug_models():
     assert model_slug("llama3.1:8b") == "llama3.1-8b"
     assert model_slug("") == "model"
     assert check_name(build_messages(CHECK_INSTRUCTIONS[CHECK_GRAMMAR], "t")) == CHECK_GRAMMAR
+    assert check_name(build_messages(CHECK_INSTRUCTIONS[CHECK_GRAMMAR], "t", text_first=True)) == CHECK_GRAMMAR
+    assert check_name(build_messages("Anything else", "t", text_first=True)) == "edit"
+    assert split_edit_request("Text:\nA\n\nInstruction:\nB\n\nInstruction:\nC") == ("C", "A\n\nInstruction:\nB")
     changes = extract_changes("teh", "the", CHECK_SPELLING)
     assert check_name(build_explanation_messages("teh", changes, CHECK_SPELLING)) == "spelling-explanation"
     assert check_name([{"role": "user", "content": "hello"}]) == "unknown"
