@@ -43,6 +43,21 @@ def test_environment_seeds_missing_values(tmp_path):
     assert settings.preferred_model(BACKEND_OLLAMA) == DEFAULT_OLLAMA_MODEL
 
 
+def test_default_style_guide_is_persisted(tmp_path):
+    path = tmp_path / "settings.json"
+    settings = AppSettings.load(path, environ={})
+    assert settings.default_style_guide == ""
+
+    settings.default_style_guide = "British spelling\nnever touch quotations"
+    assert settings.save() is None
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["default_style_guide"] == "British spelling\nnever touch quotations"
+    assert AppSettings.load(path, environ={}).default_style_guide == "British spelling\nnever touch quotations"
+
+    path.write_text(json.dumps({"default_style_guide": None}), encoding="utf-8")
+    assert AppSettings.load(path, environ={}).default_style_guide == ""
+
+
 def test_saved_file_wins_over_environment_and_round_trips(tmp_path):
     path = tmp_path / "settings.json"
     settings = AppSettings.load(path, environ={})

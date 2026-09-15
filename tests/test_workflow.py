@@ -14,8 +14,11 @@ from core.workflow import (
     CHANGE_KINDS as WORKFLOW_CHANGE_KINDS,
     CHECK_EXPRESSION,
     CHECK_GRAMMAR,
+    CHECK_INSTRUCTIONS,
     CHECK_SPELLING,
     CHECKS,
+    STYLE_GUIDE_HEADER,
+    STYLE_GUIDE_MAX_CHARS,
     STATE_APPLIED,
     STATE_PENDING,
     STATE_REJECTED,
@@ -33,11 +36,14 @@ from core.workflow import (
     Segment,
     apply_result,
     applied_changes,
+    build_check_instruction,
     build_explanation_messages,
     change_states,
     classify_change,
     create_project,
     extract_changes,
+    format_style_guide,
+    normalise_style_guide,
     parse_explanations,
     parse_outline,
     render_segment,
@@ -277,6 +283,8 @@ class FakeService:
 
     def __init__(self, fail_first=0, truncate=False, delay=0.0):
         self.calls = []
+        self.instructions = []  # full instruction of every edit request
+        self.prompts = []  # full user message of every explanation request
         self.fail_first = fail_first
         self.truncate = truncate
         self.delay = delay
@@ -285,6 +293,7 @@ class FakeService:
     def stream_edit(self, model, instruction, text, cancel_event, on_progress=None, text_first=False):
         with self.lock:
             self.calls.append(("edit", instruction[:20], text, text_first))
+            self.instructions.append(instruction)
             if self.fail_first > 0:
                 self.fail_first -= 1
                 raise BackendUnavailable("transient")
@@ -302,8 +311,99 @@ class FakeService:
     def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None):
         with self.lock:
             self.calls.append(("explain", messages[1]["content"][:20], None))
+            self.prompts.append(messages[1]["content"])
         count = messages[1]["content"].count("→")
         return json.dumps({str(n): "Reason {0}".format(n) for n in range(1, count + 1)})
+
+
+# ----------------------------------------------------------- style guide
+GUIDE = "British spelling\nkeep dialect inside dialogue\nnever touch quotations"
+GUIDE_BLOCK = "\n\n" + STYLE_GUIDE_HEADER + "\n" + GUIDE
+
+
+def test_check_instruction_without_style_guide_is_the_plain_instruction():
+    for check in CHECKS:
+        assert build_check_instruction(check) == CHECK_INSTRUCTIONS[check]
+        assert build_check_instruction(check, ProjectOptions()) == CHECK_INSTRUCTIONS[check]
+        assert build_check_instruction(check, style_guide="  \n\t ") == CHECK_INSTRUCTIONS[check]
+    assert format_style_guide("") == "" and format_style_guide(None) == ""
+
+
+def test_check_instruction_appends_the_authors_rules_one_per_line():
+    options = ProjectOptions(style_guide=GUIDE)
+    instruction = build_check_instruction(CHECK_GRAMMAR, options)
+    assert instruction == CHECK_INSTRUCTIONS[CHECK_GRAMMAR] + GUIDE_BLOCK
+    assert instruction.startswith(CHECK_INSTRUCTIONS[CHECK_GRAMMAR])
+    # an explicit string wins over the options
+    assert build_check_instruction(CHECK_GRAMMAR, options, style_guide="x") == CHECK_INSTRUCTIONS[CHECK_GRAMMAR] + (
+        "\n\n" + STYLE_GUIDE_HEADER + "\nx"
+    )
+
+
+def test_style_guide_is_normalised_to_one_rule_per_line():
+    typed = "  British spelling · keep   dialect inside dialogue  \n\n\r\n never touch quotations \n"
+    assert normalise_style_guide(typed) == GUIDE
+    assert format_style_guide(typed) == GUIDE_BLOCK
+
+
+def test_style_guide_is_trimmed_to_the_limit():
+    long_rules = "\n".join("rule number {0} is rather long".format(n) for n in range(200))
+    assert len(long_rules) > STYLE_GUIDE_MAX_CHARS
+    trimmed = normalise_style_guide(long_rules)
+    assert len(trimmed) <= STYLE_GUIDE_MAX_CHARS == 1500
+    assert long_rules.startswith(trimmed)
+    assert build_check_instruction(CHECK_SPELLING, style_guide=long_rules).endswith(trimmed)
+
+
+def test_explanation_prompt_carries_the_authors_rules():
+    text = "Teh colour."
+    changes = extract_changes(text, "The colour.", CHECK_SPELLING)
+    content = build_explanation_messages(text, changes, CHECK_SPELLING, style_guide=GUIDE)[1]["content"]
+    assert GUIDE_BLOCK in content
+    assert content.index(STYLE_GUIDE_HEADER) < content.index("Text:\nTeh colour.")
+    plain = build_explanation_messages(text, changes, CHECK_SPELLING)[1]["content"]
+    assert STYLE_GUIDE_HEADER not in plain
+
+
+def test_style_guide_round_trips_through_project_options_and_project(tmp_path):
+    options = ProjectOptions(style_guide=GUIDE)
+    assert options.to_dict()["style_guide"] == GUIDE
+    assert ProjectOptions.from_dict(options.to_dict()).style_guide == GUIDE
+
+    legacy = {key: value for key, value in options.to_dict().items() if key != "style_guide"}
+    assert ProjectOptions.from_dict(legacy).style_guide == ""
+    assert ProjectOptions.from_dict(dict(legacy, style_guide=None)).style_guide == ""
+
+    source = tmp_path / "novel.txt"
+    source.write_text("Some text.", encoding="utf-8")
+    project = create_project(source, "Some text.", options, model="m", backend="fake")
+    data = project.to_dict()
+    assert data["options"]["style_guide"] == GUIDE
+    assert Project.from_dict(data).options.style_guide == GUIDE
+    del data["options"]["style_guide"]
+    assert Project.from_dict(data).options.style_guide == ""
+
+
+def test_run_check_sends_the_authors_rules_with_edit_and_explanation():
+    service = FakeService()
+    result = run_check(service, "m", "Teh dog.", CHECK_SPELLING, threading.Event(), style_guide=GUIDE)
+
+    assert result.status == "done" and len(result.changes) == 1
+    assert service.instructions == [CHECK_INSTRUCTIONS[CHECK_SPELLING] + GUIDE_BLOCK]
+    assert GUIDE_BLOCK in service.prompts[0]
+    # keyword stays optional: positional callers are unaffected
+    assert run_check(FakeService(), "m", "Teh dog.", CHECK_SPELLING, threading.Event(), True, "German", 1).status == "done"
+
+
+def test_runner_passes_the_project_style_guide_to_every_check(tmp_path):
+    project = make_project(tmp_path, style_guide=GUIDE)
+    events = queue.Queue()
+    service = FakeService()
+    ProjectRunner(project, service, "m", events, parallelism=2).start()
+    drain(events)
+
+    assert service.instructions and all(GUIDE_BLOCK in instruction for instruction in service.instructions)
+    assert service.prompts and all(GUIDE_BLOCK in prompt for prompt in service.prompts)
 
 
 def test_run_check_produces_changes_with_explanations_and_strips_fences():
@@ -312,12 +412,9 @@ def test_run_check_produces_changes_with_explanations_and_strips_fences():
 
     # Review edits put the segment before the instruction (prefix-cache friendly).
     assert service.calls[0] == ("edit", "Improve expression o", "It were very very big.", True)
-
-    # Review edits put the segment before the instruction (prefix-cache friendly).
-    assert service.calls[0] == ("edit", "Improve expression o", "It were very very big.", True)
-
-    # Review edits put the segment before the instruction (prefix-cache friendly).
-    assert service.calls[0] == ("edit", "Improve expression o", "It were very very big.", True)
+    # Without author's instructions the plain check instruction is sent.
+    assert service.instructions == [CHECK_INSTRUCTIONS[CHECK_EXPRESSION]]
+    assert STYLE_GUIDE_HEADER not in service.prompts[0]
 
     assert result.status == "done"
     assert result.proposed_text == "It were extremely big."

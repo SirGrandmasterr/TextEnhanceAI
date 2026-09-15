@@ -53,6 +53,7 @@ class AppSettings:
     remote_max_tokens: int = 4096
     remote_enable_thinking: bool = False
     ui_language: str = UI_LANGUAGE_AUTO
+    default_style_guide: str = ""  # pre-fills "Author's instructions" for new review projects
     path: Path = field(default=None, repr=False, compare=False)
     load_error: str = field(default="", repr=False, compare=False)
 
@@ -64,6 +65,7 @@ class AppSettings:
         "remote_max_tokens",
         "remote_enable_thinking",
         "ui_language",
+        "default_style_guide",
     )
 
     # ------------------------------------------------------------ persistence
@@ -110,6 +112,7 @@ class AppSettings:
         settings.remote_max_tokens = max(256, settings.remote_max_tokens)
         language = str(data.get("ui_language") or environ.get("TEAI_LANG", "") or "").strip().lower()
         settings.ui_language = language if language in UI_LANGUAGES else UI_LANGUAGE_AUTO
+        settings.default_style_guide = str(data.get("default_style_guide") or "")
 
         env_model = environ.get("TEAI_MODEL", "").strip()
         if settings.backend not in settings.models and env_model:
