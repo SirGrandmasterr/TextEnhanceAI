@@ -51,9 +51,20 @@ outbound HTTPS to the relay, and enough disk for the weights (Docker volume
 | `VLLM_TENSOR_PARALLEL_SIZE`     | Number of GPUs to shard across                                |
 | `NVIDIA_VISIBLE_DEVICES`        | Which GPUs the container sees (`all` or `0,1`)               |
 | `VLLM_MAX_NUM_SEQS`             | How many sequences vLLM batches                               |
-| `VLLM_EXTRA_ARGS`               | Any other vLLM flag; default enables `--reasoning-parser qwen3` |
+| `VLLM_EXTRA_ARGS`               | Any other vLLM flag; default enables `--reasoning-parser qwen3` (`--enable-prefix-caching` is always on, see below) |
 | `VLLM_IMAGE_TAG`                | Pin a vLLM version                                            |
 | `HUGGING_FACE_HUB_TOKEN`        | For gated repos                                               |
+
+### Prefix caching
+
+Keep `--enable-prefix-caching` in the vLLM command (`docker-compose.yml` passes
+it explicitly; do not remove it via `VLLM_EXTRA_ARGS`). The automatic review
+sends the three checks of one manuscript segment back to back with the segment
+text *before* the instruction, so every request starts with the same tokens
+and vLLM only has to prefill the segment once per segment instead of once per
+check. Without the flag the requests still work, they just cost the full
+prefill three times. Recent vLLM versions (V1 engine) enable prefix caching by
+default; the explicit flag keeps older images and pinned tags consistent.
 
 Qwen3-family models "think" by default. TextEnhanceAI asks for
 `enable_thinking: false` (fast, deterministic edits) unless you enable thinking

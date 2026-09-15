@@ -79,6 +79,23 @@ Keepalive uses WebSocket ping/pong (`RELAY_WS_HEARTBEAT`, default 20 s). If the
 socket drops, every in-flight request on that agent fails with `502` and the
 agent reconnects with exponential backoff (1 s → 30 s, with jitter).
 
+## Prefix caching
+
+The relay forwards requests verbatim, so whether the GPU can reuse work
+between requests is decided on the client side. TextEnhanceAI's automatic
+review evaluates each segment with several independent checks; it dispatches
+those checks consecutively (queue order is chapter, segment, check) and builds
+their edit requests with the segment text *before* the instruction (system
+prompt "... The instruction follows the text.", user message
+`Text:\n<segment>\n\nInstruction:\n<check instruction>`). Consecutive requests
+therefore share one token prefix — system prompt plus segment — and vLLM
+(`--enable-prefix-caching`, on in the GPU stack) serves it from cache; only
+the short instruction and the answer differ per check. The quick editor keeps
+the traditional instruction-first order, as does any other OpenAI-compatible
+client; nothing in the protocol depends on the ordering. If you change the
+review scheduling, keep the checks of one segment together and keep the
+segment in front, or the cache hit rate drops to zero.
+
 ## Concurrency
 
 Each agent announces `max_concurrency`. The relay picks the ready agent with

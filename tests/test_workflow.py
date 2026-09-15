@@ -282,9 +282,9 @@ class FakeService:
         self.delay = delay
         self.lock = threading.Lock()
 
-    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None):
+    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None, text_first=False):
         with self.lock:
-            self.calls.append(("edit", instruction[:20], text))
+            self.calls.append(("edit", instruction[:20], text, text_first))
             if self.fail_first > 0:
                 self.fail_first -= 1
                 raise BackendUnavailable("transient")
@@ -309,6 +309,15 @@ class FakeService:
 def test_run_check_produces_changes_with_explanations_and_strips_fences():
     service = FakeService()
     result = run_check(service, "m", "It were very very big.", CHECK_EXPRESSION, threading.Event())
+
+    # Review edits put the segment before the instruction (prefix-cache friendly).
+    assert service.calls[0] == ("edit", "Improve expression o", "It were very very big.", True)
+
+    # Review edits put the segment before the instruction (prefix-cache friendly).
+    assert service.calls[0] == ("edit", "Improve expression o", "It were very very big.", True)
+
+    # Review edits put the segment before the instruction (prefix-cache friendly).
+    assert service.calls[0] == ("edit", "Improve expression o", "It were very very big.", True)
 
     assert result.status == "done"
     assert result.proposed_text == "It were extremely big."
@@ -459,6 +468,63 @@ def test_runner_can_be_cancelled_and_resumed(tmp_path):
         if event[0] == "workflow_result":
             apply_result(project, event[1], event[2], event[3], event[4])
     assert project.pending_tasks() == []
+
+
+def test_runner_dispatches_all_checks_of_a_segment_consecutively(tmp_path):
+    project = make_project(tmp_path)
+    pending = project.pending_tasks()
+    assert len(pending) > len(CHECKS)  # several segments
+    # pending_tasks() is (chapter, segment, check) with checks innermost ...
+    for index in range(0, len(pending), len(CHECKS)):
+        group = pending[index:index + len(CHECKS)]
+        assert {(chapter, segment) for chapter, segment, _ in group} == {group[0][:2]}
+        assert [check for _, _, check in group] == list(CHECKS)
+    assert [task[:2] for task in pending] == sorted(task[:2] for task in pending)
+
+    # ... and the runner starts the tasks in exactly that order.
+    events = queue.Queue()
+    runner = ProjectRunner(project, FakeService(), "m", events, parallelism=1)
+    runner.start()
+    started = [event[1:] for event in drain(events) if event[0] == "workflow_started"]
+    assert started == pending
+
+
+def test_runner_dispatches_all_checks_of_a_segment_consecutively(tmp_path):
+    project = make_project(tmp_path)
+    pending = project.pending_tasks()
+    assert len(pending) > len(CHECKS)  # several segments
+    # pending_tasks() is (chapter, segment, check) with checks innermost ...
+    for index in range(0, len(pending), len(CHECKS)):
+        group = pending[index:index + len(CHECKS)]
+        assert {(chapter, segment) for chapter, segment, _ in group} == {group[0][:2]}
+        assert [check for _, _, check in group] == list(CHECKS)
+    assert [task[:2] for task in pending] == sorted(task[:2] for task in pending)
+
+    # ... and the runner starts the tasks in exactly that order.
+    events = queue.Queue()
+    runner = ProjectRunner(project, FakeService(), "m", events, parallelism=1)
+    runner.start()
+    started = [event[1:] for event in drain(events) if event[0] == "workflow_started"]
+    assert started == pending
+
+
+def test_runner_dispatches_all_checks_of_a_segment_consecutively(tmp_path):
+    project = make_project(tmp_path)
+    pending = project.pending_tasks()
+    assert len(pending) > len(CHECKS)  # several segments
+    # pending_tasks() is (chapter, segment, check) with checks innermost ...
+    for index in range(0, len(pending), len(CHECKS)):
+        group = pending[index:index + len(CHECKS)]
+        assert {(chapter, segment) for chapter, segment, _ in group} == {group[0][:2]}
+        assert [check for _, _, check in group] == list(CHECKS)
+    assert [task[:2] for task in pending] == sorted(task[:2] for task in pending)
+
+    # ... and the runner starts the tasks in exactly that order.
+    events = queue.Queue()
+    runner = ProjectRunner(project, FakeService(), "m", events, parallelism=1)
+    runner.start()
+    started = [event[1:] for event in drain(events) if event[0] == "workflow_started"]
+    assert started == pending
 
 
 def test_runner_with_nothing_to_do_finishes_immediately(tmp_path):

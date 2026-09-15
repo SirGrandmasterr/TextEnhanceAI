@@ -137,14 +137,15 @@ class OllamaService:
             raise OutputTruncated(truncated_message(model))
         return strip_thinking("".join(chunks))
 
-    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None):
+    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None, text_first=False):
         """Return an edited document while honoring a cancellation event.
 
         ``on_progress`` (optional) receives the number of characters received
-        so far and is called from the worker thread.
+        so far and is called from the worker thread. ``text_first`` is passed
+        to ``build_messages`` (prefix-cache friendly ordering).
         """
         result = self.generate(
-            model, build_messages(instruction, text), cancel_event, on_progress=on_progress
+            model, build_messages(instruction, text, text_first), cancel_event, on_progress=on_progress
         )
         if not result.strip():
             raise OllamaUnavailable("Ollama returned an empty response.")

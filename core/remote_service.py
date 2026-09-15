@@ -414,10 +414,13 @@ class RemoteService:
             raise OutputTruncated(truncated_message(model))
         return strip_thinking("".join(chunks))
 
-    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None):
-        """Return the edited document, honoring cancellation mid-stream."""
+    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None, text_first=False):
+        """Return the edited document, honoring cancellation mid-stream.
+
+        ``text_first`` is passed to ``build_messages`` (prefix-cache friendly ordering).
+        """
         result = self.generate(
-            model, build_messages(instruction, text), cancel_event, on_progress=on_progress
+            model, build_messages(instruction, text, text_first), cancel_event, on_progress=on_progress
         )
         if not result.strip():
             raise RemoteUnavailable("The remote model returned an empty response.")

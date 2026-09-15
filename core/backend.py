@@ -7,8 +7,11 @@ where the model runs:
 - ``list_models()``: sorted model names, or raise ``BackendUnavailable``.
 - ``connection_summary()``: one-line connection state after ``list_models``.
 - ``no_models_hint()``: what the user should do when no model is listed.
-- ``stream_edit(model, instruction, text, cancel_event, on_progress=None)``:
-  return the edited document or raise ``EditCancelled``/``BackendUnavailable``.
+- ``stream_edit(model, instruction, text, cancel_event, on_progress=None,
+  text_first=False)``: return the edited document or raise
+  ``EditCancelled``/``BackendUnavailable``. ``text_first`` puts the text before
+  the instruction so consecutive requests on the same segment share a prompt
+  prefix (see ``build_messages``).
 """
 
 import re
@@ -34,6 +37,15 @@ SYSTEM_PROMPT = (
     "without commentary, labels, or Markdown fences."
 )
 
+# Appended to the system prompt when the user message starts with the text.
+TEXT_FIRST_NOTE = "The instruction follows the text."
+
+# Appended to the system prompt when the user message starts with the text.
+TEXT_FIRST_NOTE = "The instruction follows the text."
+
+# Appended to the system prompt when the user message starts with the text.
+TEXT_FIRST_NOTE = "The instruction follows the text."
+
 # Deterministic, conservative sampling shared by every backend.
 DEFAULT_MAX_TOKENS = 4096
 TEMPERATURE = 0.1
@@ -43,14 +55,25 @@ _THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 _OPEN_THINK = re.compile(r"^\s*<think>.*", re.DOTALL)
 
 
-def build_messages(instruction, text):
-    """Return the chat messages used for one editing request."""
+def build_messages(instruction, text, text_first=False):
+    """Return the chat messages used for one editing request.
+
+    The default order (instruction, then text) is what the quick editor sends.
+    With ``text_first`` the user message starts with the text and the system
+    prompt says so: the automatic review runs several checks on the same
+    segment back to back, and with the text in front every request shares the
+    same token prefix, which vLLM's prefix cache can reuse instead of
+    re-encoding the segment for each check.
+    """
+    if text_first:
+        system = SYSTEM_PROMPT + " " + TEXT_FIRST_NOTE
+        content = "Text:\n{0}\n\nInstruction:\n{1}".format(text, instruction)
+    else:
+        system = SYSTEM_PROMPT
+        content = "Instruction:\n{0}\n\nText:\n{1}".format(instruction, text)
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": "Instruction:\n{0}\n\nText:\n{1}".format(instruction, text),
-        },
+        {"role": "system", "content": system},
+        {"role": "user", "content": content},
     ]
 
 
