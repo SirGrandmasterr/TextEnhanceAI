@@ -11,6 +11,7 @@ from core.change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS
 from core.chunking import read_text_file, split_document, word_count
 from core.models import ACCEPTED, PENDING, REJECTED
 from core.workflow import (
+    CHECK_AUTHOR,
     CHECK_DESCRIPTIONS,
     CHECK_LABELS,
     CHECKS,
@@ -252,7 +253,7 @@ class DecisionLogDialog(tk.Toplevel):
                 chapter.title if chapter is not None else str(entry["chapter"]),
                 entry["segment"],
                 text,
-                "{0} → {1}".format(entry["before"], entry["after"]),
+                "{0} → {1}".format(entry["before"] or "new", entry["after"]),
             ))
             self.entries[iid] = entry
 
@@ -648,6 +649,18 @@ class WorkflowScreen(ttk.Frame):
                 self._refresh_decision_dialog()
         return "break" if event else None
 
+    def edit_current(self, event=None):
+        """F2: reword the selected suggestion."""
+        if self.active:
+            self.project_view.edit_selected()
+        return "break" if event else None
+
+    def add_author_correction(self, event=None):
+        """Ctrl+E: turn the selected text of the segment into an author's correction."""
+        if self.active:
+            self.project_view.add_author_correction()
+        return "break" if event else None
+
     def show_decisions(self):
         """Open (or raise) the decision log window."""
         if not self.active:
@@ -925,15 +938,56 @@ class StartView(ttk.Frame):
 
 
 # ========================================================== project view
+class AuthorFixDialog(tk.Toplevel):
+    """Ask for the author's replacement of a selected span of the segment text."""
+
+    def __init__(self, parent, original, on_save):
+        super().__init__(parent)
+        self.title("Add my correction")
+        self.transient(parent.winfo_toplevel())
+        self.resizable(True, False)
+        self.on_save = on_save
+        frame = ttk.Frame(self, padding=14)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(frame, text="Selected text:", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, text=original.replace("\n", "↵") or "∅", wraplength=520, justify=tk.LEFT,
+                  font=font(10, "bold")).grid(row=1, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(frame, text="Replace it with:", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
+        self.var = tk.StringVar(value=original)
+        self.entry = ttk.Entry(frame, textvariable=self.var, width=70)
+        self.entry.grid(row=3, column=0, sticky="ew", pady=(2, 10))
+        ttk.Label(frame, text="Leave it empty to delete the selected text. The correction is applied with top "
+                             "priority and counts as accepted; Alt+Z removes it again.",
+                  style="Muted.TLabel", wraplength=520, justify=tk.LEFT).grid(row=4, column=0, sticky="w")
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", style="Ghost.TButton", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Add correction", style="Accent.TButton", command=self.save).pack(side=tk.RIGHT, padx=(0, 6))
+        self.bind("<Return>", lambda event: self.save())
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.entry.focus_set()
+        self.entry.selection_range(0, tk.END)
+        self.grab_set()
+
+    def save(self):
+        text = self.var.get()
+        self.destroy()
+        self.on_save(text)
+
+
 class ChangeCard(ttk.Frame):
     """One proposed change with explanation and accept/reject buttons."""
 
-    def __init__(self, parent, change, segment_text, state, on_select, on_decide, on_add_to_glossary=None):
+    def __init__(self, parent, change, segment_text, state, on_select, on_decide, on_add_to_glossary=None,
+                 on_edit=None):
         super().__init__(parent, style="Card.TFrame", padding=(10, 8))
         self.change = change
         self.on_select = on_select
         self.on_decide = on_decide
         self.on_add_to_glossary = on_add_to_glossary
+        self.on_edit = on_edit
+        self.editor = None
         self.selected = False
         fg, bg = CHECK_COLORS[change.check]
 
@@ -945,6 +999,10 @@ class ChangeCard(ttk.Frame):
         self.state_label.pack(side=tk.LEFT, padx=8)
         self.kind_tag = ttk.Label(top, text=CHANGE_KIND_LABELS.get(change.kind, change.kind), style="Kind.Badge.TLabel")
         self.kind_tag.pack(side=tk.LEFT, padx=(0, 8))
+        self.edited_tag = ttk.Label(top, text="✎ edited", style="Kind.Badge.TLabel")
+        if change.edited:
+            self.edited_tag.pack(side=tk.LEFT, padx=(0, 8))
+            Tooltip(self.edited_tag, "The model proposed: {0}".format(change.model_proposed_text or "∅"))
         self.flag_badge = None
         if change.flagged:
             # Hallucination guard: the reason ids explain themselves in the tooltip.
@@ -952,7 +1010,7 @@ class ChangeCard(ttk.Frame):
             self.flag_badge.pack(side=tk.LEFT, padx=(0, 8))
             Tooltip(self.flag_badge, flag_tooltip(change))
         self.glossary_link = None
-        if on_add_to_glossary is not None and change.original_text.strip():
+        if on_add_to_glossary is not None and change.original_text.strip() and not change.is_author:
             # A small link: reject this change and protect the original wording from now on.
             self.glossary_link = tk.Label(top, text="Add to glossary", cursor="hand2", font=font(9),
                                           foreground=PALETTE["accent"], background=PALETTE["surface"])
@@ -964,6 +1022,11 @@ class ChangeCard(ttk.Frame):
         self.accept_button = ttk.Button(top, text="Accept", style="Small.Success.TButton",
                                         command=lambda: self.on_decide(self.change, ACCEPTED))
         self.accept_button.pack(side=tk.RIGHT, padx=(0, 6))
+        self.edit_button = None
+        if on_edit is not None:
+            self.edit_button = ttk.Button(top, text="Edit…", style="Small.TButton", command=self.begin_edit)
+            self.edit_button.pack(side=tk.RIGHT, padx=(0, 6))
+            Tooltip(self.edit_button, "Reword this suggestion before accepting it (F2 on the selected card).")
 
         self.diff = tk.Text(self, height=2, cursor="arrow")
         style_text(self.diff, size=10)
@@ -1010,6 +1073,39 @@ class ChangeCard(ttk.Frame):
     def _clicked(self, event=None):
         self.on_select(self.change)
         return "break"
+
+    # ---- inline editing of the proposed text
+    def begin_edit(self):
+        """Show an entry with the proposed text; Enter saves through on_edit, Escape cancels."""
+        if self.on_edit is None:
+            return
+        self.on_select(self.change)
+        if self.editor is not None and self.editor.winfo_exists():
+            self.edit_entry.focus_set()
+            return
+        self.editor = ttk.Frame(self, style="Selected.TFrame" if self.selected else "Surface.TFrame")
+        self.editor.pack(fill=tk.X, pady=(2, 4), after=self.diff)
+        self.edit_var = tk.StringVar(value=self.change.proposed_text)
+        self.edit_entry = ttk.Entry(self.editor, textvariable=self.edit_var)
+        self.edit_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(self.editor, text="Save", style="Small.Success.TButton", command=self._save_edit).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(self.editor, text="Cancel", style="Small.TButton", command=self.cancel_edit).pack(side=tk.LEFT, padx=(4, 0))
+        self.edit_entry.bind("<Return>", lambda event: self._save_edit())
+        self.edit_entry.bind("<Escape>", lambda event: self.cancel_edit())
+        self.edit_entry.focus_set()
+        self.edit_entry.selection_range(0, tk.END)
+
+    def _save_edit(self):
+        if self.editor is None:
+            return
+        text = self.edit_var.get()
+        self.cancel_edit()
+        self.on_edit(self.change, text)
+
+    def cancel_edit(self):
+        if self.editor is not None and self.editor.winfo_exists():
+            self.editor.destroy()
+        self.editor = None
 
     def _add_to_glossary(self, event=None):
         if self.on_add_to_glossary is not None:
@@ -1107,7 +1203,8 @@ class ProjectView(ttk.Frame):
         self.kinds_button.pack(side=tk.LEFT, padx=(12, 0))
         Tooltip(self.kinds_button, "Hide kinds of edits from the review, or accept/reject every pending "
                                    "change of one kind across the project (Alt+Z reverts).")
-        self.hint_var = tk.StringVar(value="Alt+A accept · Alt+R reject · Alt+Z undo · Alt+↑/↓ change · Alt+←/→ segment")
+        self.hint_var = tk.StringVar(value="Alt+A accept · Alt+R reject · Alt+Z undo · F2 edit · Ctrl+E my correction · "
+                                           "Alt+↑/↓ change · Alt+←/→ segment")
         ttk.Label(checks_row, textvariable=self.hint_var, style="Muted.TLabel", font=font(9)).pack(side=tk.RIGHT)
 
         paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
@@ -1163,6 +1260,10 @@ class ProjectView(ttk.Frame):
         self.text.tag_configure("rejected", background=PALETTE["surface"], underline=False, overstrike=False,
                                 foreground=PALETTE["muted"])
         self.text.tag_raise("selected")
+        self.text.tag_raise("sel")
+        self.text_menu = tk.Menu(self.text, tearoff=False, postcommand=self._fill_text_menu)
+        self.text.bind("<Button-3>", self._text_context)
+        self.text.bind("<Button-2>", self._text_context)
 
         actions = ttk.Frame(right)
         actions.grid(row=2, column=0, sticky="ew", padx=(10, 0), pady=(0, 4))
@@ -1441,8 +1542,12 @@ class ProjectView(ttk.Frame):
             return
         iid = selection[0]
         if iid.startswith("s"):
-            chapter_index, segment_index = iid[1:].split("-")
-            self.select_segment(int(chapter_index), int(segment_index), from_tree=True)
+            chapter_index, segment_index = (int(part) for part in iid[1:].split("-"))
+            if (chapter_index, segment_index) == self.current:
+                # Either a click on the row already shown or the echo of our own
+                # selection_set(): re-rendering would drop the selected change.
+                return
+            self.select_segment(chapter_index, segment_index, from_tree=True)
 
     def select_segment(self, chapter_index, segment_index, from_tree=False, change_id=None):
         self.current = (chapter_index, segment_index)
@@ -1533,10 +1638,19 @@ class ProjectView(ttk.Frame):
             ttk.Label(self.cards_frame.inner, text=message, style="Muted.TLabel", wraplength=560,
                       justify=tk.LEFT, padding=(12, 16)).pack(anchor="w")
             return
-        for change in changes:
+        author_changes = [change for change in changes if change.is_author]
+        model_changes = [change for change in changes if not change.is_author]
+        if author_changes:
+            ttk.Label(self.cards_frame.inner, text="Author's corrections", style="Muted.TLabel",
+                      font=font(9, "bold")).pack(anchor="w", pady=(2, 4))
+        for change in author_changes + model_changes:
+            if model_changes and author_changes and change is model_changes[0]:
+                ttk.Label(self.cards_frame.inner, text="Suggested by the checks", style="Muted.TLabel",
+                          font=font(9, "bold")).pack(anchor="w", pady=(6, 4))
             card = ChangeCard(self.cards_frame.inner, change, segment.text, states[change.change_id],
                               on_select=self._card_selected, on_decide=self.decide,
-                              on_add_to_glossary=self.add_to_glossary if self.on_add_to_glossary else None)
+                              on_add_to_glossary=self.add_to_glossary if self.on_add_to_glossary else None,
+                              on_edit=None if change.is_author else self.edit_change)
             card.pack(fill=tk.X, padx=(0, 4), pady=(0, 6))
             card.refresh(states[change.change_id], selected=change.change_id == self.selected_change_id)
             self.cards[change.change_id] = card
@@ -1590,6 +1704,82 @@ class ProjectView(ttk.Frame):
         self._after_decision()
         # move on to the next pending change for a fast keyboard flow
         self.step_change(1, pending_only=True)
+
+    def edit_change(self, change, new_text):
+        """Store the author's wording for ``change`` and accept it (from the card's Edit box)."""
+        chapter, segment = self._current_segment()
+        if segment is None:
+            return
+        entry = self.project.edit_change(chapter.index, segment.index, change, new_text)
+        self.selected_change_id = change.change_id
+        self.render_segment()
+        if entry is not None:
+            self._after_decision()
+            self.master.host.set_status("Suggestion reworded and accepted. Alt+Z restores the model's wording.")
+
+    def edit_selected(self):
+        """F2: open the inline editor of the selected card."""
+        card = self.cards.get(self.selected_change_id)
+        if card is not None and not card.change.is_author:
+            card.begin_edit()
+
+    # ---- the author's own corrections
+    def _fill_text_menu(self):
+        menu = self.text_menu
+        menu.delete(0, tk.END)
+        has_selection = bool(self.text.tag_ranges("sel"))
+        menu.add_command(label="Add my correction…   Ctrl+E", command=self.add_author_correction,
+                         state=tk.NORMAL if has_selection and not self.preview_var.get() else tk.DISABLED)
+        menu.add_command(label="Copy", command=self._copy_selection, state=tk.NORMAL if has_selection else tk.DISABLED)
+
+    def _text_context(self, event):
+        try:
+            self.text_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.text_menu.grab_release()
+        return "break"
+
+    def _copy_selection(self):
+        if self.text.tag_ranges("sel"):
+            self.clipboard_clear()
+            self.clipboard_append(self.text.get("sel.first", "sel.last"))
+
+    def selected_span(self):
+        """Return (start, end) offsets of the selection in the segment text, or None."""
+        if not self.text.tag_ranges("sel"):
+            return None
+        counted = self.text.count("1.0", "sel.first", "chars")
+        start = counted[0] if counted else 0
+        counted = self.text.count("sel.first", "sel.last", "chars")
+        end = start + (counted[0] if counted else 0)
+        return start, end
+
+    def add_author_correction(self):
+        """Ctrl+E: replace the selected span of the ORIGINAL segment text with the author's wording."""
+        chapter, segment = self._current_segment()
+        if segment is None:
+            return
+        if self.preview_var.get():
+            self.master.host.set_status("Switch off “Preview result” to add a correction to the original text.")
+            return
+        span = self.selected_span()
+        if span is None or span[0] == span[1]:
+            self.master.host.set_status("Select the text to correct first, then press Ctrl+E.")
+            return
+        start, end = span
+        original = segment.text[start:end]
+
+        def save(new_text, chapter_index=chapter.index, segment_index=segment.index):
+            change = self.project.add_author_change(chapter_index, segment_index, start, end, new_text)
+            if change is None:
+                self.master.host.set_status("The correction equals the original text; nothing added.")
+                return
+            self.selected_change_id = change.change_id
+            self.render_segment()
+            self._after_decision()
+            self.master.host.set_status("Your correction was added and applied. Alt+Z removes it.")
+
+        AuthorFixDialog(self, original, on_save=save)
 
     def add_to_glossary(self, change):
         """Reject ``change`` and protect its original wording (the "Add to glossary" link)."""

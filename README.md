@@ -67,7 +67,7 @@ Switch to **Automatic review** in the header to process a whole text instead of 
 
 When two accepted changes touch the same words, the earlier check wins (spelling > grammar > expression) and the other one is marked *Superseded*; rejecting the winner applies the next one. Model answers that are not a plausible edit of the segment (summaries, refusals, truncated output) are rejected and retried once, and failed segments can be retried later with one click.
 
-Keyboard shortcuts in the review: `Alt+A` / `Alt+R` accept or reject the selected change (and move to the next pending one), `Alt+Z` undoes the last decision, `Alt+↑` / `Alt+↓` select the previous or next change, `Alt+←` / `Alt+→` switch segments.
+Keyboard shortcuts in the review: `Alt+A` / `Alt+R` accept or reject the selected change (and move to the next pending one), `Alt+Z` undoes the last decision, `F2` rewords the selected suggestion, `Ctrl+E` turns the selected text into your own correction, `Alt+↑` / `Alt+↓` select the previous or next change, `Alt+←` / `Alt+→` switch segments.
 
 ## Remote GPU models through your own relay
 

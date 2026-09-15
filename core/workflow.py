@@ -47,17 +47,25 @@ DECISION_LOG_LIMIT = 5000  # oldest decisions are dropped beyond this
 CHECK_SPELLING = "spelling"
 CHECK_GRAMMAR = "grammar"
 CHECK_EXPRESSION = "expression"
-CHECKS = (CHECK_SPELLING, CHECK_GRAMMAR, CHECK_EXPRESSION)  # also the priority order
+CHECKS = (CHECK_SPELLING, CHECK_GRAMMAR, CHECK_EXPRESSION)  # the model checks, also their priority order
+# The author's own corrections live under a pseudo-check that is always enabled,
+# never queued for the model and beats every model check when changes overlap.
+CHECK_AUTHOR = "author"
+ALL_CHECKS = (CHECK_AUTHOR,) + CHECKS  # priority order for merging
 CHECK_LABELS = {
+    CHECK_AUTHOR: "Author",
     CHECK_SPELLING: "Spelling",
     CHECK_GRAMMAR: "Grammar",
     CHECK_EXPRESSION: "Expression",
 }
 CHECK_DESCRIPTIONS = {
+    CHECK_AUTHOR: "Corrections you added yourself while reviewing.",
     CHECK_SPELLING: "Typos, misspellings, capitalization, accents and umlauts.",
     CHECK_GRAMMAR: "Agreement, tense, cases, articles, commas and sentence structure.",
     CHECK_EXPRESSION: "Clearer, more natural wording where a phrase is awkward or vague.",
 }
+AUTHOR_EXPLANATION = "Author's correction"
+EDITED_REPORT_MARK = "✎ edited by the author"
 CHECK_INSTRUCTIONS = {
     CHECK_SPELLING: (
         "Correct spelling mistakes and typos only: misspelled words, wrong or "
@@ -80,6 +88,7 @@ CHECK_INSTRUCTIONS = {
     ),
 }
 FALLBACK_EXPLANATIONS = {
+    CHECK_AUTHOR: AUTHOR_EXPLANATION + ".",
     CHECK_SPELLING: "Spelling correction.",
     CHECK_GRAMMAR: "Grammar or punctuation fix.",
     CHECK_EXPRESSION: "Clearer, more natural expression.",
@@ -171,6 +180,10 @@ class Change:
     ``kind`` (see ``change_kinds.CHANGE_KINDS``) describes what the edit does
     regardless of which check proposed it; it is derived from the two texts
     whenever it is missing or unknown, so older project files need no upgrade.
+
+    ``proposed_text`` is what gets applied; when the author reworded a
+    suggestion (``edited``), ``model_proposed_text`` still holds what the
+    model originally proposed.
     """
 
     change_id: str
@@ -183,11 +196,16 @@ class Change:
     decision: str = PENDING
     kind: str = ""
     flags: List[str] = field(default_factory=list)  # hallucination-guard reason ids, see flag_suspicious
+    model_proposed_text: Optional[str] = None  # None = same as proposed_text (never edited)
+    edited: bool = False
 
     def __post_init__(self):
         if self.kind not in CHANGE_KINDS:
             self.kind = classify_change(self.original_text, self.proposed_text)
         self.flags = [str(flag) for flag in (self.flags or []) if flag]
+        if self.model_proposed_text is None:
+            self.model_proposed_text = self.proposed_text
+        self.edited = bool(self.edited)
 
     @property
     def flagged(self):
@@ -195,7 +213,11 @@ class Change:
 
     @property
     def priority(self):
-        return CHECKS.index(self.check)
+        return ALL_CHECKS.index(self.check)
+
+    @property
+    def is_author(self):
+        return self.check == CHECK_AUTHOR
 
     def to_dict(self):
         return {
@@ -209,6 +231,8 @@ class Change:
             "decision": self.decision,
             "kind": self.kind,
             "flags": list(self.flags),
+            "model_proposed": self.model_proposed_text,
+            "edited": self.edited,
         }
 
     @classmethod
@@ -218,6 +242,7 @@ class Change:
             data.get("original", ""), data.get("proposed", ""),
             data.get("explanation", ""), data.get("decision", PENDING),
             data.get("kind") or "", list(data.get("flags") or []),
+            data.get("model_proposed"), bool(data.get("edited", False)),
         )
 
 
@@ -279,13 +304,21 @@ class Segment:
         progress() and render_segment() always see every change.
         """
         found = []
-        for check in CHECKS:
-            if not enabled.get(check):
+        for check in ALL_CHECKS:
+            if check != CHECK_AUTHOR and not enabled.get(check):
                 continue
             result = self.results.get(check)
             if result and result.status == "done":
                 found.extend(change for change in result.changes if change.kind not in hidden_kinds)
         return sorted(found, key=lambda change: (change.start, change.priority, change.end))
+
+    def author_result(self, create=False):
+        """Return the pseudo-result holding the author's own corrections (created on demand)."""
+        result = self.results.get(CHECK_AUTHOR)
+        if result is None and create:
+            result = CheckResult(CHECK_AUTHOR, "done", explained=True)
+            self.results[CHECK_AUTHOR] = result
+        return result
 
     def find_change(self, change_id):
         for result in self.results.values():
@@ -480,6 +513,8 @@ class Project:
                 for check in list(segment.results):
                     if checks is not None and check not in checks:
                         continue
+                    if checks is None and check == CHECK_AUTHOR:
+                        continue  # the author's corrections are not model results
                     result = segment.results.pop(check)
                     removed.append((chapter.index, segment.index, check))
                     stale_ids = {change.change_id for change in result.changes}
@@ -513,8 +548,9 @@ class Project:
                     "changes": 0, "accepted": 0, "rejected": 0, "suppressed": 0, "flagged": 0,
                     "by_kind": {kind: 0 for kind in CHANGE_KINDS},
                 }
-                for check in CHECKS
+                for check in ALL_CHECKS
             },
+            "edited": 0,
             "per_kind": {kind: {"changes": 0, "accepted": 0, "rejected": 0} for kind in CHANGE_KINDS},
         }
         checks = self.options.enabled_checks()
@@ -541,6 +577,8 @@ class Project:
                 per_check["changes"] += 1
                 per_check["by_kind"][change.kind] += 1
                 per_kind["changes"] += 1
+                if change.edited:
+                    stats["edited"] += 1
                 if change.flagged:
                     stats["flagged"] += 1
                     per_check["flagged"] += 1
@@ -568,20 +606,74 @@ class Project:
         """
         if change.decision == decision:
             return None
+        entry = self._log_entry(chapter_index, segment_index, change, change.decision, decision, group)
+        change.decision = decision
+        self.decision_log.append(entry)
+        self._trim_log()
+        return entry
+
+    def _log_entry(self, chapter_index, segment_index, change, before, after, group, **extra):
         entry = {
             "ts": datetime.now().isoformat(timespec="seconds"),
             "chapter": chapter_index,
             "segment": segment_index,
             "change_id": change.change_id,
-            "before": change.decision,
-            "after": decision,
+            "before": before,
+            "after": after,
             "group": group,
         }
-        change.decision = decision
-        self.decision_log.append(entry)
+        entry.update(extra)
+        return entry
+
+    def _trim_log(self):
         if len(self.decision_log) > DECISION_LOG_LIMIT:
             del self.decision_log[:-DECISION_LOG_LIMIT]
+
+    def edit_change(self, chapter_index, segment_index, change, new_text, group=None):
+        """Replace a suggestion's text with the author's wording and accept it.
+
+        The log entry carries ``before_text``/``after_text`` so undo() restores
+        both the text and the decision. Returns the entry, or None when nothing changed.
+        """
+        new_text = str(new_text)
+        if new_text == change.proposed_text and change.decision == ACCEPTED:
+            return None
+        entry = self._log_entry(chapter_index, segment_index, change, change.decision, ACCEPTED, group,
+                                before_text=change.proposed_text, after_text=new_text)
+        change.proposed_text = new_text
+        change.edited = new_text != change.model_proposed_text
+        change.kind = classify_change(change.original_text, new_text)
+        change.decision = ACCEPTED
+        self.decision_log.append(entry)
+        self._trim_log()
         return entry
+
+    def add_author_change(self, chapter_index, segment_index, start, end, new_text, group=None):
+        """Record the author's own correction of ``segment.text[start:end]`` as an accepted change.
+
+        Returns the new Change, or None when the span is invalid or the text is unchanged.
+        """
+        _, segment = self.find(chapter_index, segment_index)
+        if segment is None:
+            return None
+        start, end = int(start), int(end)
+        if not 0 <= start <= end <= len(segment.text):
+            return None
+        original = segment.text[start:end]
+        new_text = str(new_text)
+        if new_text == original:
+            return None
+        result = segment.author_result(create=True)
+        numbers = [int(c.change_id.rsplit("-", 1)[1]) for c in result.changes if c.change_id.rsplit("-", 1)[1].isdigit()]
+        change = Change(
+            "{0}-{1}".format(CHECK_AUTHOR, max(numbers, default=0) + 1), CHECK_AUTHOR, start, end,
+            original, new_text, AUTHOR_EXPLANATION, ACCEPTED,
+        )
+        result.changes.append(change)
+        result.changes.sort(key=lambda c: (c.start, c.end))
+        self.decision_log.append(self._log_entry(chapter_index, segment_index, change, "", ACCEPTED, group, created=True))
+        self._trim_log()
+        return change
 
     def decide_kind(self, kind, decision, group=None):
         """Apply ``decision`` to every pending change of ``kind`` as one undoable group.
@@ -619,7 +711,18 @@ class Project:
             _, segment = self.find(entry["chapter"], entry["segment"])
             change = segment.find_change(entry["change_id"]) if segment is not None else None
             if change is not None:
-                change.decision = entry["before"]
+                if entry.get("created"):
+                    result = segment.author_result()
+                    if result is not None:
+                        result.changes = [c for c in result.changes if c is not change]
+                        if not result.changes:
+                            del segment.results[CHECK_AUTHOR]
+                else:
+                    if "before_text" in entry:
+                        change.proposed_text = entry["before_text"]
+                        change.edited = change.proposed_text != change.model_proposed_text
+                        change.kind = classify_change(change.original_text, change.proposed_text)
+                    change.decision = entry["before"]
             undone.append(entry)
         undone.reverse()
         return undone
@@ -739,6 +842,10 @@ class Project:
                 lines.append("    - Glossary suppressed {0} proposed change(s)".format(per["suppressed"]))
             if per["flagged"]:
                 lines.append("    - {0}: {1} change(s) flagged".format(FLAG_REPORT_MARK, per["flagged"]))
+        if stats["per_check"][CHECK_AUTHOR]["changes"]:
+            lines.append("  - Author's corrections: {0}".format(stats["per_check"][CHECK_AUTHOR]["changes"]))
+        if stats["edited"]:
+            lines.append("  - Suggestions reworded by the author: {0}".format(stats["edited"]))
         lines.append("")
         for chapter in self.chapters:
             lines.append("## {0}. {1}\n".format(chapter.index, chapter.title))
@@ -758,6 +865,8 @@ class Project:
                     )
                     if change.flagged:
                         line += " — {0} ({1})".format(FLAG_REPORT_MARK, ", ".join(change.flags))
+                    if change.edited:
+                        line += " — {0} (model proposed `{1}`)".format(EDITED_REPORT_MARK, _inline(change.model_proposed_text))
                     lines.append(line)
             lines.append("")
         return "\n".join(lines)

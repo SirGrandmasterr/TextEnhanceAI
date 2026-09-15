@@ -11,7 +11,10 @@ from core.backend import BackendUnavailable, EditCancelled, OutputTruncated
 from core.models import ACCEPTED, PENDING, REJECTED
 from core.change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS, levenshtein
 from core.workflow import (
+    ALL_CHECKS,
+    AUTHOR_EXPLANATION,
     CHANGE_KINDS as WORKFLOW_CHANGE_KINDS,
+    CHECK_AUTHOR,
     CHECK_EXPRESSION,
     CHECK_GRAMMAR,
     CHECK_INSTRUCTIONS,
@@ -1192,3 +1195,109 @@ def test_enqueue_after_the_runner_finished_starts_new_workers(tmp_path):
     collected = drain(events)
     assert [event[1:] for event in collected if event[0] == "workflow_started"] == removed
     assert collected[-1] == ("workflow_finished", False)
+
+
+# ------------------------------------------------- inline edits and author fixes
+def test_edit_change_uses_the_new_text_and_undo_restores_it(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    change = next(c for c in segment.changes(ALL) if c.original_text == "Teh")
+    assert (change.proposed_text, change.model_proposed_text, change.edited) == ("The", "The", False)
+
+    entry = project.edit_change(chapter.index, segment.index, change, "That")
+    assert (entry["before"], entry["after"]) == (PENDING, ACCEPTED)
+    assert (entry["before_text"], entry["after_text"]) == ("The", "That")
+    assert change.proposed_text == "That" and change.model_proposed_text == "The"
+    assert change.edited and change.decision == ACCEPTED
+    assert change.kind == "word_choice"  # recomputed: Teh -> That is no longer a spelling fix
+    assert render_segment(segment, ALL).startswith("That dog")
+    # the same text again is not a change
+    assert project.edit_change(chapter.index, segment.index, change, "That") is None
+
+    assert project.undo() == [entry]
+    assert change.proposed_text == "The" and not change.edited and change.decision == PENDING
+    assert change.kind == "spelling"
+    assert render_segment(segment, ALL).startswith("Teh dog")
+
+    # reverting to the model's own wording clears the edited flag
+    project.edit_change(chapter.index, segment.index, change, "That")
+    project.edit_change(chapter.index, segment.index, change, "The")
+    assert not change.edited and change.decision == ACCEPTED
+    assert project.progress()["edited"] == 0
+
+
+def test_author_change_beats_an_overlapping_spelling_change_and_is_reported(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    spelling = next(c for c in segment.changes(ALL) if c.original_text == "Teh")
+    spelling.decision = ACCEPTED
+    assert render_segment(segment, ALL).startswith("The dog")
+
+    change = project.add_author_change(chapter.index, segment.index, 0, 3, "Their")
+    assert change is not None and change.check == CHECK_AUTHOR and change.is_author
+    assert change.change_id == "author-1" and change.decision == ACCEPTED
+    assert change.explanation == AUTHOR_EXPLANATION and change.priority == 0
+    assert ALL_CHECKS.index(CHECK_AUTHOR) == 0 and CHECK_AUTHOR not in CHECKS
+    assert render_segment(segment, ALL).startswith("Their dog")
+    states = change_states(segment, ALL)
+    assert states[change.change_id] == STATE_APPLIED and states[spelling.change_id] == STATE_SUPERSEDED
+    # author changes are always listed, even with every model check disabled
+    assert segment.changes({check: False for check in CHECKS}) == [change]
+    assert all(check != CHECK_AUTHOR for _, _, check in project.pending_tasks())  # never queued for the model
+
+    second = project.add_author_change(chapter.index, segment.index, 4, 7, "cat")
+    assert second.change_id == "author-2"
+    assert [c.change_id for c in segment.author_result().changes] == ["author-1", "author-2"]
+    stats = project.progress()
+    assert stats["per_check"][CHECK_AUTHOR]["changes"] == 2 and stats["accepted"] >= 2
+    report = project.build_report()
+    assert "- Author's corrections: 2" in report
+    assert "[Author] `Teh` → `Their` — applied — Author's correction" in report
+
+    # invalid or empty corrections are refused
+    assert project.add_author_change(chapter.index, segment.index, 5, 2, "x") is None
+    assert project.add_author_change(chapter.index, segment.index, 0, 999, "x") is None
+    assert project.add_author_change(chapter.index, segment.index, 0, 3, "Teh") is None
+    assert project.add_author_change(99, 1, 0, 3, "x") is None
+
+    # undo removes the correction again (the last one first), the empty pseudo-result disappears
+    entry = project.decision_log[-1]
+    assert entry["created"] is True and entry["change_id"] == "author-2"
+    assert project.undo() == [entry]
+    assert segment.find_change("author-2") is None
+    project.undo()
+    assert segment.author_result() is None and render_segment(segment, ALL).startswith("The dog")
+
+    # re-evaluating a segment keeps the author's corrections
+    change = project.add_author_change(chapter.index, segment.index, 0, 3, "Their")
+    removed = project.invalidate(chapter.index, segment.index)
+    assert CHECK_AUTHOR not in {check for _, _, check in removed} and segment.author_result() is not None
+    assert project.invalidate(chapter.index, segment.index, [CHECK_AUTHOR]) == [(chapter.index, segment.index, CHECK_AUTHOR)]
+
+
+def test_edited_and_author_changes_round_trip_and_old_files_default(tmp_path):
+    project, chapter, segment = make_reviewed_project(tmp_path)
+    change = next(c for c in segment.changes(ALL) if c.original_text == "Teh")
+    project.edit_change(chapter.index, segment.index, change, "That")
+    author = project.add_author_change(chapter.index, segment.index, 4, 7, "cat")
+    project.save()
+
+    reloaded = Project.load(project.root)
+    _, reloaded_segment = reloaded.find(chapter.index, segment.index)
+    restored = reloaded_segment.find_change(change.change_id)
+    assert (restored.proposed_text, restored.model_proposed_text, restored.edited) == ("That", "The", True)
+    restored_author = reloaded_segment.find_change(author.change_id)
+    assert restored_author.check == CHECK_AUTHOR and restored_author.decision == ACCEPTED
+    assert render_segment(reloaded_segment, ALL) == render_segment(segment, ALL)
+    # undo still works on the reloaded project, text included
+    reloaded.undo()
+    reloaded.undo()
+    assert restored.proposed_text == "The" and reloaded_segment.author_result() is None
+
+    # a project file written before these fields existed
+    data = change.to_dict()
+    legacy = {key: value for key, value in data.items() if key not in ("model_proposed", "edited")}
+    legacy["proposed"] = "The"
+    old = Change.from_dict(legacy)
+    assert old.model_proposed_text == "The" and old.edited is False
+    deletion = Change.from_dict({"id": "spelling-9", "check": CHECK_SPELLING, "start": 0, "end": 3,
+                                 "original": "Teh", "proposed": ""})
+    assert deletion.model_proposed_text == ""  # a deletion is not mistaken for an edit

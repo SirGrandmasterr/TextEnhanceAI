@@ -34,6 +34,7 @@ CHECK_COLORS = {
     "spelling": ("#6d28d9", "#ede9fe"),
     "grammar": ("#1d4ed8", "#dbeafe"),
     "expression": ("#0f766e", "#ccfbf1"),
+    "author": ("#9a3412", "#ffedd5"),  # the author's own corrections (core.workflow.CHECK_AUTHOR)
 }
 
 STATUS_COLORS = {
