@@ -54,6 +54,7 @@ class AppSettings:
     remote_enable_thinking: bool = False
     ui_language: str = UI_LANGUAGE_AUTO
     default_style_guide: str = ""  # pre-fills "Author's instructions" for new review projects
+    default_glossary: list = field(default_factory=list)  # pre-fills "Protected terms"
     path: Path = field(default=None, repr=False, compare=False)
     load_error: str = field(default="", repr=False, compare=False)
 
@@ -66,6 +67,7 @@ class AppSettings:
         "remote_enable_thinking",
         "ui_language",
         "default_style_guide",
+        "default_glossary",
     )
 
     # ------------------------------------------------------------ persistence
@@ -113,6 +115,12 @@ class AppSettings:
         language = str(data.get("ui_language") or environ.get("TEAI_LANG", "") or "").strip().lower()
         settings.ui_language = language if language in UI_LANGUAGES else UI_LANGUAGE_AUTO
         settings.default_style_guide = str(data.get("default_style_guide") or "")
+        glossary = data.get("default_glossary")
+        if isinstance(glossary, str):
+            glossary = glossary.splitlines()
+        settings.default_glossary = [
+            " ".join(str(term).split()) for term in (glossary or []) if str(term).strip()
+        ] if isinstance(glossary, list) else []
 
         env_model = environ.get("TEAI_MODEL", "").strip()
         if settings.backend not in settings.models and env_model:

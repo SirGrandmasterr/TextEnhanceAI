@@ -58,6 +58,22 @@ def test_default_style_guide_is_persisted(tmp_path):
     assert AppSettings.load(path, environ={}).default_style_guide == ""
 
 
+def test_default_glossary_is_persisted_as_a_list(tmp_path):
+    path = tmp_path / "settings.json"
+    settings = AppSettings.load(path, environ={})
+    assert settings.default_glossary == []
+
+    settings.default_glossary = ["Thalbrück", "hyper*"]
+    assert settings.save() is None
+    assert json.loads(path.read_text(encoding="utf-8"))["default_glossary"] == ["Thalbrück", "hyper*"]
+    assert AppSettings.load(path, environ={}).default_glossary == ["Thalbrück", "hyper*"]
+
+    path.write_text(json.dumps({"default_glossary": "a\n b \n"}), encoding="utf-8")
+    assert AppSettings.load(path, environ={}).default_glossary == ["a", "b"]
+    path.write_text(json.dumps({"default_glossary": 5}), encoding="utf-8")
+    assert AppSettings.load(path, environ={}).default_glossary == []
+
+
 def test_saved_file_wins_over_environment_and_round_trips(tmp_path):
     path = tmp_path / "settings.json"
     settings = AppSettings.load(path, environ={})
