@@ -9,6 +9,19 @@ from tkinter import filedialog, messagebox, ttk
 from core.backend import EditCancelled
 from core.change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS
 from core.chunking import read_text_file, split_document, word_count
+from core.consistency import (
+    FINDING_LABELS,
+    MODEL_TRIAGED,
+    STATUS_DISMISSED,
+    STATUS_ISSUE,
+    STATUS_LABELS as FINDING_STATUS_LABELS,
+    STATUS_OK,
+    STATUS_UNVERIFIED,
+    ConsistencyRunner,
+    apply_preferred,
+    apply_verdicts,
+    collect_candidates,
+)
 from core.models import ACCEPTED, PENDING, REJECTED
 from core.statistics import project_statistics, statistics_markdown
 from core.workflow import (
@@ -414,6 +427,7 @@ class WorkflowScreen(ttk.Frame):
                                         on_add_to_glossary=self.add_to_glossary, on_reevaluate=self.reevaluate)
         self.decision_dialog = None
         self.statistics_dialog = None
+        self.consistency_runner = None
         self.start_view.pack(fill=tk.BOTH, expand=True)
 
     # ----------------------------------------------------------- lifecycle
@@ -561,6 +575,8 @@ class WorkflowScreen(ttk.Frame):
             return False
         summary = resync_project(self.project, text)
         self.running_tasks = set()
+        if self.project.consistency:
+            self.project.consistency = collect_candidates(self.project, previous=self.project.consistency)
         try:
             self.project.write_chapter_files()
         except OSError:
@@ -737,6 +753,9 @@ class WorkflowScreen(ttk.Frame):
             if not messagebox.askyesno("Stop evaluation?", "The evaluation is still running. Stop it and close the project?"):
                 return
             self.runner.cancel()
+        if self.checking_consistency:
+            self.consistency_runner.cancel()
+        self.consistency_runner = None
         self._save_now()
         self.project = None
         self.runner = None
@@ -753,7 +772,49 @@ class WorkflowScreen(ttk.Frame):
         """Called when the application closes."""
         if self.runner is not None:
             self.runner.cancel()
+        if self.consistency_runner is not None:
+            self.consistency_runner.cancel()
         self._save_now()
+
+    # --------------------------------------------------------- consistency
+    @property
+    def checking_consistency(self):
+        return self.consistency_runner is not None and self.consistency_runner.active
+
+    def run_consistency(self):
+        """Collect the deterministic candidates at once and ask the model about the doubtful ones."""
+        if self.project is None:
+            return
+        if self.checking_consistency:
+            self.host.set_status("The consistency check is already running.")
+            return
+        if self.evaluating or self.project.pending_tasks():
+            messagebox.showinfo("Evaluation first",
+                                "Run the consistency check once every segment has been evaluated; it reads the "
+                                "manuscript with the accepted corrections applied.")
+            return
+        self.project.consistency = collect_candidates(self.project, previous=self.project.consistency)
+        self.project_view.refresh_consistency()
+        self.project_view.notebook.select(self.project_view.consistency_tab)
+        self.schedule_save()
+        service = self.host.get_service()
+        model = self.host.get_model() or self.project.model
+        self.consistency_runner = ConsistencyRunner(self.project, self.project.consistency, service, model,
+                                                    self.host.events)
+        requests = self.consistency_runner.start()
+        undecided = sum(1 for f in self.project.consistency if f.kind in MODEL_TRIAGED and f.status == STATUS_UNVERIFIED)
+        if requests:
+            self.host.set_status("Found {0} candidate group(s); asking {1} about {2} of them in {3} request(s)...".format(
+                len(self.project.consistency), model, undecided, requests))
+            self.project_view.set_consistency_progress(0, requests)
+        else:
+            self.host.set_status("Consistency check: {0} finding(s), nothing left to ask the model.".format(
+                len(self.project.consistency)))
+
+    def cancel_consistency(self):
+        if self.checking_consistency:
+            self.consistency_runner.cancel()
+            self.host.set_status("Stopping the consistency check after the running request...")
 
     # -------------------------------------------------------------- saving
     def schedule_save(self):
@@ -804,6 +865,28 @@ class WorkflowScreen(ttk.Frame):
             if segment is not None:
                 self.project_view.segment_updated(chapter_index, segment_index)
             self.schedule_save()
+            return True
+        if kind == "consistency_verdicts":
+            updated = apply_verdicts(self.project.consistency, event[1])
+            if updated:
+                self.project_view.refresh_consistency()
+                self.schedule_save()
+            return True
+        if kind == "consistency_progress":
+            self.project_view.set_consistency_progress(event[1], event[2])
+            return True
+        if kind == "consistency_finished":
+            _, verdicts, error = event
+            self.consistency_runner = None
+            self.project_view.set_consistency_progress(None, None)
+            self.project_view.refresh_consistency()
+            self._save_now()
+            issues = sum(1 for finding in self.project.consistency if finding.status == STATUS_ISSUE)
+            if error:
+                self.host.set_status("Consistency check stopped: {0}. Unverified candidates stay listed.".format(error))
+            else:
+                self.host.set_status("Consistency check finished: {0} issue(s) among {1} finding(s).".format(
+                    issues, len(self.project.consistency)))
             return True
         if kind == "workflow_progress":
             _, done, total, running = event
@@ -1392,6 +1475,11 @@ class ProjectView(ttk.Frame):
         ttk.Button(buttons, text="Options...", command=self.on_options).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(buttons, text="Decisions...", command=lambda: self.master.show_decisions()).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(buttons, text="Statistics...", command=lambda: self.master.show_statistics()).pack(side=tk.LEFT, padx=(6, 0))
+        self.consistency_button = ttk.Button(buttons, text="Consistency...", command=lambda: self.master.run_consistency())
+        self.consistency_button.pack(side=tk.LEFT, padx=(6, 0))
+        Tooltip(self.consistency_button, "Look for names spelled two ways, hyphenation and number-style variants, "
+                                         "mixed quotation marks and POV/tense drift across chapters. Available once "
+                                         "every segment has been evaluated.")
         check_source = ttk.Button(buttons, text="Check source", command=lambda: self.master.check_source())
         check_source.pack(side=tk.LEFT, padx=(6, 0))
         Tooltip(check_source, "Compare the manuscript file with this project and re-sync when it changed: "
@@ -1466,6 +1554,8 @@ class ProjectView(ttk.Frame):
         self.notebook.add(self.chapter_tab, text="Chapter")
         self.list_tab = self._build_list_tab()
         self.notebook.add(self.list_tab, text="All changes")
+        self.consistency_tab = self._build_consistency_tab()
+        self.notebook.add(self.consistency_tab, text="Consistency")
         self.notebook.bind("<<NotebookTabChanged>>", self._tab_changed)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=2)
@@ -1599,6 +1689,176 @@ class ProjectView(ttk.Frame):
                    command=lambda: self.decide_listed(ACCEPTED)).pack(side=tk.RIGHT, padx=(0, 6))
         return tab
 
+    def _build_consistency_tab(self):
+        """Findings of the chapter-spanning consistency check with their occurrences."""
+        tab = ttk.Frame(self.notebook)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        header = ttk.Frame(tab)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=(10, 0), pady=(4, 4))
+        self.consistency_summary_var = tk.StringVar(value="No consistency check has run yet.")
+        ttk.Label(header, textvariable=self.consistency_summary_var, style="Muted.TLabel").pack(side=tk.LEFT)
+        self.show_dismissed_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(header, text="Show dismissed", variable=self.show_dismissed_var,
+                        command=self.refresh_consistency).pack(side=tk.RIGHT)
+        self.consistency_tree = ttk.Treeview(tab, columns=("kind", "preferred", "status", "reason"),
+                                             show="tree headings", selectmode="browse")
+        self.consistency_tree.heading("#0", text="Variants (count) / occurrences", anchor="w")
+        self.consistency_tree.column("#0", width=300, stretch=True)
+        for key, heading, width in (("kind", "Type", 110), ("preferred", "Preferred", 110),
+                                    ("status", "Status", 90), ("reason", "Reason", 260)):
+            self.consistency_tree.heading(key, text=heading, anchor="w")
+            self.consistency_tree.column(key, width=width, stretch=(key == "reason"), anchor="w")
+        self.consistency_tree.grid(row=1, column=0, sticky="nsew", padx=(10, 0))
+        scroll = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=self.consistency_tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.consistency_tree.configure(yscrollcommand=scroll.set)
+        self.consistency_tree.tag_configure(STATUS_ISSUE, foreground=PALETTE["danger"])
+        self.consistency_tree.tag_configure(STATUS_OK, foreground=PALETTE["success"])
+        self.consistency_tree.tag_configure(STATUS_UNVERIFIED, foreground=PALETTE["warning"])
+        self.consistency_tree.tag_configure(STATUS_DISMISSED, foreground=PALETTE["faint"])
+        self.consistency_tree.tag_configure("occurrence", foreground=PALETTE["muted"])
+        self.consistency_tree.bind("<Double-1>", self._consistency_jump)
+        self.consistency_tree.bind("<Return>", self._consistency_jump)
+        self.consistency_tree.bind("<<TreeviewSelect>>", lambda event: self._update_consistency_buttons())
+        self.consistency_rows = {}  # iid -> ("finding", finding) or ("occurrence", finding, occurrence)
+        actions = ttk.Frame(tab)
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=(10, 0), pady=(4, 0))
+        ttk.Button(actions, text="Run check", style="Small.TButton",
+                   command=lambda: self.master.run_consistency()).pack(side=tk.LEFT)
+        self.consistency_stop = ttk.Button(actions, text="Stop", style="Small.TButton",
+                                           command=lambda: self.master.cancel_consistency())
+        self.consistency_progress_var = tk.StringVar(value="")
+        ttk.Label(actions, textvariable=self.consistency_progress_var, style="Muted.TLabel",
+                  font=font(9)).pack(side=tk.LEFT, padx=(10, 0))
+        self.dismiss_button = ttk.Button(actions, text="Dismiss", style="Small.TButton", command=self.dismiss_finding)
+        self.dismiss_button.pack(side=tk.RIGHT)
+        self.apply_button = ttk.Button(actions, text="Apply preferred everywhere", style="Small.Success.TButton",
+                                       command=self.apply_finding)
+        self.apply_button.pack(side=tk.RIGHT, padx=(0, 6))
+        Tooltip(self.apply_button, "Replace every other variant by the preferred form as author corrections "
+                                   "(one undo step). Double-click an occurrence to look at it first.")
+        self._update_consistency_buttons()
+        return tab
+
+    # ------------------------------------------------------- consistency
+    def set_consistency_progress(self, done, total):
+        if done is None:
+            self.consistency_progress_var.set("")
+            self.consistency_stop.pack_forget()
+        else:
+            self.consistency_progress_var.set("Asking the model... {0}/{1} request(s)".format(done, total))
+            self.consistency_stop.pack(side=tk.LEFT, padx=(6, 0))
+
+    def refresh_consistency(self):
+        tree = self.consistency_tree
+        tree.delete(*tree.get_children())
+        self.consistency_rows = {}
+        if self.project is None:
+            return
+        findings = self.project.consistency
+        show_dismissed = self.show_dismissed_var.get()
+        counts = {}
+        for finding in findings:
+            counts[finding.status] = counts.get(finding.status, 0) + 1
+        if not findings:
+            self.consistency_summary_var.set("No consistency check has run yet." if not self.project.pending_tasks()
+                                             else "Available once every segment has been evaluated.")
+        else:
+            self.consistency_summary_var.set(
+                "{0} finding(s): {1} issue(s), {2} intentional, {3} unverified, {4} dismissed".format(
+                    len(findings), counts.get(STATUS_ISSUE, 0), counts.get(STATUS_OK, 0),
+                    counts.get(STATUS_UNVERIFIED, 0), counts.get(STATUS_DISMISSED, 0)))
+        order = {STATUS_ISSUE: 0, STATUS_UNVERIFIED: 1, STATUS_OK: 2, STATUS_DISMISSED: 3}
+        for number, finding in enumerate(sorted(findings, key=lambda f: (order.get(f.status, 9), -f.total))):
+            if finding.status == STATUS_DISMISSED and not show_dismissed:
+                continue
+            iid = "f{0}".format(number)
+            label = ", ".join("{0} ({1})".format(variant, finding.counts.get(variant, 0)) for variant in finding.variants)
+            tree.insert("", tk.END, iid=iid, text=label, open=False, tags=(finding.status,), values=(
+                FINDING_LABELS.get(finding.kind, finding.kind), finding.preferred,
+                FINDING_STATUS_LABELS.get(finding.status, finding.status),
+                finding.reason or finding.detail))
+            self.consistency_rows[iid] = ("finding", finding)
+            for variant in finding.variants:
+                for position, occurrence in enumerate(finding.occurrences.get(variant, [])):
+                    chapter, _ = self.project.find(occurrence["chapter"], occurrence["segment"])
+                    child = "{0}-{1}-{2}".format(iid, variant, position)
+                    tree.insert(iid, tk.END, iid=child, tags=("occurrence",),
+                                text="{0} · {1} · segment {2}".format(
+                                    variant, chapter.title if chapter else occurrence["chapter"], occurrence["segment"]),
+                                values=("", "", "", _one_line(occurrence.get("text", ""), 80)))
+                    self.consistency_rows[child] = ("occurrence", finding, occurrence)
+        self._update_consistency_buttons()
+
+    def _selected_finding(self):
+        selection = self.consistency_tree.selection()
+        row = self.consistency_rows.get(selection[0]) if selection else None
+        return row[1] if row else None
+
+    def _update_consistency_buttons(self):
+        finding = self._selected_finding()
+        self.apply_button.configure(state=tk.NORMAL if finding is not None and finding.applicable
+                                    and finding.status != STATUS_DISMISSED else tk.DISABLED)
+        if finding is None:
+            self.dismiss_button.configure(text="Dismiss", state=tk.DISABLED)
+        else:
+            self.dismiss_button.configure(text="Restore" if finding.status == STATUS_DISMISSED else "Dismiss",
+                                          state=tk.NORMAL)
+
+    def _consistency_jump(self, event=None):
+        selection = self.consistency_tree.selection()
+        row = self.consistency_rows.get(selection[0]) if selection else None
+        if row is None:
+            return "break"
+        if row[0] == "occurrence":
+            occurrence = row[2]
+        else:
+            finding = row[1]
+            occurrence = next((items[0] for variant in finding.variants
+                               for items in [finding.occurrences.get(variant, [])] if items), None)
+        if occurrence is not None:
+            self.show_span(occurrence["chapter"], occurrence["segment"], occurrence["start"], occurrence["end"])
+        return "break"
+
+    def show_span(self, chapter_index, segment_index, start, end):
+        """Open a segment in the Segment tab and select ``[start, end)`` of its text."""
+        if self.project is None or self.project.find(chapter_index, segment_index)[1] is None:
+            return
+        self.preview_var.set(False)
+        self.select_segment(chapter_index, segment_index)
+        self.notebook.select(self.segment_tab)
+        self.text.tag_remove("sel", "1.0", tk.END)
+        self.text.tag_add("sel", "1.0+{0}c".format(start), "1.0+{0}c".format(max(end, start + 1)))
+        self.text.see("1.0+{0}c".format(start))
+
+    def dismiss_finding(self):
+        finding = self._selected_finding()
+        if finding is None:
+            return
+        finding.status = STATUS_UNVERIFIED if finding.status == STATUS_DISMISSED else STATUS_DISMISSED
+        self.refresh_consistency()
+        self.master.schedule_save()
+
+    def apply_finding(self):
+        finding = self._selected_finding()
+        if finding is None or not finding.applicable:
+            return
+        others = [variant for variant in finding.variants if variant != finding.preferred]
+        total = sum(finding.counts.get(variant, 0) for variant in others)
+        if not messagebox.askyesno(
+                "Apply preferred spelling?",
+                "Replace {0} occurrence(s) of {1} by “{2}” as your own corrections?\n\nAlt+Z reverts them all."
+                .format(total, " / ".join("“{0}”".format(v) for v in others), finding.preferred)):
+            return
+        count, _ = apply_preferred(self.project, finding)
+        self.project.consistency = collect_candidates(self.project, previous=self.project.consistency)
+        self.refresh_all()
+        self.refresh_consistency()
+        self._after_decision()
+        self.master.host.set_status("Wrote {0} author correction(s) for “{1}”. Alt+Z reverts them.".format(
+            count, finding.preferred))
+
     # -------------------------------------------------------- chapter tab
     def _tab_changed(self, event=None):
         if self.project is None:
@@ -1608,6 +1868,8 @@ class ProjectView(ttk.Frame):
             self.render_chapter_view()
         elif tab == str(self.list_tab):
             self.refresh_list()
+        elif tab == str(self.consistency_tab):
+            self.refresh_consistency()
 
     def _tab_visible(self, tab):
         try:
@@ -1777,6 +2039,8 @@ class ProjectView(ttk.Frame):
         self.chapter_shown = None
         self.chapter_spans = []
         self.notebook.select(self.segment_tab)
+        self.set_consistency_progress(None, None)
+        self.refresh_consistency()
         self.refresh_all()
         first = self._first_segment_with(lambda status: status == STATUS_READY) or self._first_segment_with(lambda status: True)
         if first:
@@ -1855,6 +2119,8 @@ class ProjectView(ttk.Frame):
             self.retry_button.pack(side=tk.LEFT, padx=(8, 0))
         else:
             self.retry_button.pack_forget()
+        self.consistency_button.configure(
+            state=tk.NORMAL if not self.running and not self.project.pending_tasks() else tk.DISABLED)
         if self.current:
             self.render_segment()
         self.schedule_chapter_render()

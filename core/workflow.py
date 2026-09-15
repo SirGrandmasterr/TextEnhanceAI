@@ -464,6 +464,7 @@ class Project:
     decision_log: List[dict] = field(default_factory=list)
     source_sha256: str = ""  # fingerprint of the manuscript text the project was split from
     source_mtime: float = 0.0
+    consistency: list = field(default_factory=list)  # consistency.Finding objects, see core/consistency.py
     root: Optional[Path] = field(default=None, repr=False, compare=False)
     source_check_reason: str = field(default="", repr=False, compare=False)  # set by source_changed()
 
@@ -795,12 +796,21 @@ class Project:
             "decision_log": [dict(entry) for entry in self.decision_log],
             "source_sha256": self.source_sha256,
             "source_mtime": self.source_mtime,
+            "consistency": [finding.to_dict() for finding in self.consistency],
         }
 
     @classmethod
     def from_dict(cls, data, root=None):
+        from .consistency import Finding  # consistency imports this module
+
         if data.get("format", PROJECT_FORMAT) > PROJECT_FORMAT:
             raise ValueError("This project was saved by a newer TextEnhanceAI version.")
+        findings = []
+        for item in data.get("consistency") or []:
+            try:
+                findings.append(Finding.from_dict(item))
+            except (KeyError, TypeError, ValueError):
+                continue  # a damaged finding is dropped, the project still loads
         return cls(
             data["name"], data.get("source_path", ""), data.get("created_at", ""),
             ProjectOptions.from_dict(data.get("options")),
@@ -809,6 +819,7 @@ class Project:
             decision_log=[dict(entry) for entry in data.get("decision_log") or []],
             source_sha256=str(data.get("source_sha256") or ""),
             source_mtime=float(data.get("source_mtime") or 0.0),
+            consistency=findings,
             root=root,
         )
 
