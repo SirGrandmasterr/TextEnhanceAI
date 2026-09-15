@@ -34,6 +34,7 @@ from core.workflow import (
     change_states,
     create_project,
     normalise_style_guide,
+    parse_glossary,
     parse_outline,
     render_segment,
 )
@@ -65,6 +66,14 @@ LANGUAGES = [SAME_LANGUAGE, "English", "German", "French", "Spanish", "Italian",
 STYLE_GUIDE_PLACEHOLDER = "British spelling · keep dialect inside dialogue · never touch quotations"
 STYLE_GUIDE_HINT = ("Standing rules every check must respect, one per line. They are sent with every request "
                     "and take precedence over the built-in rules where they conflict.")
+GLOSSARY_PLACEHOLDER = "Thalbrück\nMeret Aubinger\nhyper*"
+GLOSSARY_HINT = ("Protected terms: names, invented words and technical terms the checks must never change, one per "
+                 "line. A trailing * protects every word starting with it (hyper* covers hyperdrive). Changes that "
+                 "touch a protected term are dropped before you see them.")
+
+
+def _suppressed_note(stats):
+    return " · {0} suppressed by glossary".format(stats["suppressed"]) if stats.get("suppressed") else ""
 
 
 def _format_eta(seconds):
@@ -119,9 +128,9 @@ class StyleGuideBox(tk.Text):
 
 
 class StyleGuideDialog(tk.Toplevel):
-    """Edit the author's instructions of an open project."""
+    """Edit the author's instructions and protected terms of an open project."""
 
-    def __init__(self, parent, style_guide, on_save):
+    def __init__(self, parent, style_guide, on_save, glossary=()):
         super().__init__(parent)
         self.on_save = on_save
         self.title("Review options")
@@ -131,9 +140,14 @@ class StyleGuideDialog(tk.Toplevel):
         body.pack(fill=tk.BOTH, expand=True)
         ttk.Label(body, text="Author's instructions", font=font(11, "bold")).pack(anchor="w")
         ttk.Label(body, text=STYLE_GUIDE_HINT, style="Muted.TLabel", wraplength=460).pack(anchor="w", pady=(2, 8))
-        self.box = StyleGuideBox(body, height=6, width=60)
+        self.box = StyleGuideBox(body, height=5, width=60)
         self.box.pack(fill=tk.BOTH, expand=True)
         self.box.set(style_guide)
+        ttk.Label(body, text="Protected terms", font=font(11, "bold")).pack(anchor="w", pady=(12, 0))
+        ttk.Label(body, text=GLOSSARY_HINT, style="Muted.TLabel", wraplength=460).pack(anchor="w", pady=(2, 8))
+        self.glossary_box = StyleGuideBox(body, height=5, width=60, placeholder=GLOSSARY_PLACEHOLDER)
+        self.glossary_box.pack(fill=tk.BOTH, expand=True)
+        self.glossary_box.set("\n".join(glossary))
         buttons = ttk.Frame(body)
         buttons.pack(fill=tk.X, pady=(12, 0))
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
@@ -153,8 +167,9 @@ class StyleGuideDialog(tk.Toplevel):
 
     def save(self):
         text = self.box.get_text()
+        glossary = parse_glossary(self.glossary_box.get_text())
         self.destroy()
-        self.on_save(text)
+        self.on_save(text, glossary)
 
 
 class WorkflowScreen(ttk.Frame):
@@ -170,7 +185,8 @@ class WorkflowScreen(ttk.Frame):
         self.start_view = StartView(self, on_start=self.start_project, on_open=self.open_project)
         self.project_view = ProjectView(self, on_close=self.close_project, on_pause=self.toggle_pause,
                                         on_export=self.export_project, on_retry=self.resume_runner,
-                                        on_checks_changed=self.checks_changed, on_options=self.edit_options)
+                                        on_checks_changed=self.checks_changed, on_options=self.edit_options,
+                                        on_add_to_glossary=self.add_to_glossary)
         self.start_view.pack(fill=tk.BOTH, expand=True)
 
     # ----------------------------------------------------------- lifecycle
@@ -206,6 +222,7 @@ class WorkflowScreen(ttk.Frame):
             return
         project = create_project(path, text, options, model=model, backend=self.host.backend_id())
         self.host.remember_style_guide(options.style_guide)
+        self.host.remember_glossary(options.glossary)
         if project.root.exists() and (project.root / PROJECT_FILE).exists():
             if not messagebox.askyesno(
                 "Replace previous review?",
@@ -311,18 +328,37 @@ class WorkflowScreen(ttk.Frame):
         if self.evaluating:
             messagebox.showinfo("Evaluation running", "Pause the evaluation before changing the instructions.")
             return
-        StyleGuideDialog(self, self.project.options.style_guide, on_save=self._apply_style_guide)
+        StyleGuideDialog(self, self.project.options.style_guide, on_save=self._apply_review_options,
+                         glossary=self.project.options.glossary)
 
-    def _apply_style_guide(self, style_guide):
+    def add_to_glossary(self, term):
+        """Protect ``term`` from now on (called from a change card); returns whether it was new."""
+        if self.project is None:
+            return False
+        term = " ".join((term or "").split())
+        if not term or term in self.project.options.glossary:
+            return False
+        self.project.options.glossary.append(term)
+        self.host.remember_glossary(self.project.options.glossary)
+        self.schedule_save()
+        self.host.set_status("Added \u201c{0}\u201d to the protected terms; it applies to segments evaluated from now on.".format(term))
+        return True
+
+    def _apply_review_options(self, style_guide, glossary):
         if self.project is None:
             return
-        if normalise_style_guide(style_guide) == normalise_style_guide(self.project.options.style_guide):
-            self.project.options.style_guide = style_guide
-            self.project.save()
-            return
-        self.project.options.style_guide = style_guide
+        options = self.project.options
+        unchanged = (
+            normalise_style_guide(style_guide) == normalise_style_guide(options.style_guide)
+            and list(glossary) == list(options.glossary)
+        )
+        options.style_guide = style_guide
+        options.glossary = list(glossary)
         self.project.save()
+        if unchanged:
+            return
         self.host.remember_style_guide(style_guide)
+        self.host.remember_glossary(options.glossary)
         has_results = any(segment.results for _, segment in self.project.all_segments())
         if has_results and messagebox.askyesno(
             "Re-evaluate?",
@@ -608,11 +644,15 @@ class StartView(ttk.Frame):
         self.language_var = tk.StringVar(value=SAME_LANGUAGE)
         ttk.Combobox(expl_row, textvariable=self.language_var, values=LANGUAGES, width=14).pack(side=tk.LEFT)
 
-        # --- author's instructions
+        # --- author's instructions and protected terms
         guide = self._card(body, "4. Author's instructions", STYLE_GUIDE_HINT)
         guide.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         self.style_guide_box = StyleGuideBox(guide, height=4)
         self.style_guide_box.pack(fill=tk.X)
+        ttk.Label(guide, text="Protected terms", style="CardTitle.TLabel").pack(anchor="w", pady=(12, 0))
+        ttk.Label(guide, text=GLOSSARY_HINT, style="SurfaceMuted.TLabel", wraplength=640).pack(anchor="w", pady=(2, 8))
+        self.glossary_box = StyleGuideBox(guide, height=4, placeholder=GLOSSARY_PLACEHOLDER)
+        self.glossary_box.pack(fill=tk.X)
 
         # --- actions
         actions = ttk.Frame(body)
@@ -633,6 +673,8 @@ class StartView(ttk.Frame):
         try:
             if not self.style_guide_box.get_text():
                 self.style_guide_box.set(host.default_style_guide())
+            if not self.glossary_box.get_text():
+                self.glossary_box.set("\n".join(host.default_glossary()))
         except Exception:
             pass
 
@@ -677,6 +719,7 @@ class StartView(ttk.Frame):
             language=self.language_var.get().strip() or SAME_LANGUAGE,
             parallelism=parallel,
             style_guide=self.style_guide_box.get_text(),
+            glossary=parse_glossary(self.glossary_box.get_text()),
         )
 
     def _update_preview(self):
@@ -729,11 +772,12 @@ class StartView(ttk.Frame):
 class ChangeCard(ttk.Frame):
     """One proposed change with explanation and accept/reject buttons."""
 
-    def __init__(self, parent, change, segment_text, state, on_select, on_decide):
+    def __init__(self, parent, change, segment_text, state, on_select, on_decide, on_add_to_glossary=None):
         super().__init__(parent, style="Card.TFrame", padding=(10, 8))
         self.change = change
         self.on_select = on_select
         self.on_decide = on_decide
+        self.on_add_to_glossary = on_add_to_glossary
         self.selected = False
         fg, bg = CHECK_COLORS[change.check]
 
@@ -743,6 +787,13 @@ class ChangeCard(ttk.Frame):
         self.badge.pack(side=tk.LEFT)
         self.state_label = ttk.Label(top, text=STATE_LABELS[state], style="{0}.State.TLabel".format(state.title()))
         self.state_label.pack(side=tk.LEFT, padx=8)
+        self.glossary_link = None
+        if on_add_to_glossary is not None and change.original_text.strip():
+            # A small link: reject this change and protect the original wording from now on.
+            self.glossary_link = tk.Label(top, text="Add to glossary", cursor="hand2", font=font(9),
+                                          foreground=PALETTE["accent"], background=PALETTE["surface"])
+            self.glossary_link.pack(side=tk.LEFT, padx=(4, 0))
+            self.glossary_link.bind("<Button-1>", self._add_to_glossary)
         self.reject_button = ttk.Button(top, text="Reject", style="Small.Danger.TButton",
                                         command=lambda: self.on_decide(self.change, REJECTED))
         self.reject_button.pack(side=tk.RIGHT)
@@ -796,6 +847,11 @@ class ChangeCard(ttk.Frame):
         self.on_select(self.change)
         return "break"
 
+    def _add_to_glossary(self, event=None):
+        if self.on_add_to_glossary is not None:
+            self.on_add_to_glossary(self.change)
+        return "break"
+
     def refresh(self, state, selected=None):
         if selected is not None:
             self.selected = selected
@@ -803,6 +859,8 @@ class ChangeCard(ttk.Frame):
         self.configure(style="Selected.Card.TFrame" if self.selected else "Card.TFrame")
         surface = PALETTE["selection"] if self.selected else PALETTE["surface"]
         self.diff.configure(background=surface)
+        if self.glossary_link is not None:
+            self.glossary_link.configure(background=surface)
         self.explanation.configure(style="SelectedMuted.TLabel" if self.selected else "SurfaceMuted.TLabel")
         for child in self.winfo_children():
             if isinstance(child, ttk.Frame):
@@ -814,7 +872,8 @@ class ChangeCard(ttk.Frame):
 class ProjectView(ttk.Frame):
     """Chapter/segment navigation, highlighted text and change cards."""
 
-    def __init__(self, parent, on_close, on_pause, on_export, on_retry, on_checks_changed, on_options=None):
+    def __init__(self, parent, on_close, on_pause, on_export, on_retry, on_checks_changed, on_options=None,
+                 on_add_to_glossary=None):
         super().__init__(parent, padding=(12, 8))
         self.on_close = on_close
         self.on_pause = on_pause
@@ -822,6 +881,7 @@ class ProjectView(ttk.Frame):
         self.on_retry = on_retry
         self.on_checks_changed = on_checks_changed
         self.on_options = on_options or (lambda: None)
+        self.on_add_to_glossary = on_add_to_glossary
         self.project = None
         self.current = None  # (chapter_index, segment_index)
         self.running = set()  # (chapter_index, segment_index) currently being evaluated
@@ -999,19 +1059,23 @@ class ProjectView(ttk.Frame):
 
     def summary_text(self):
         stats = self.project.progress()
-        return "{0} segments · {1} changes: {2} accepted, {3} rejected, {4} pending".format(
-            stats["segments"], stats["changes"], stats["accepted"], stats["rejected"], stats["pending"]
+        return "{0} segments · {1} changes: {2} accepted, {3} rejected, {4} pending{5}".format(
+            stats["segments"], stats["changes"], stats["accepted"], stats["rejected"], stats["pending"],
+            _suppressed_note(stats),
         )
+
+    def _summary_line(self, stats):
+        return (
+            "{0} chapters · {1} segments · {2:,} words   |   {3} changes proposed · {4} accepted · {5} rejected · "
+            "{6} pending{7}"
+        ).format(len(self.project.chapters), stats["segments"], stats["words"], stats["changes"],
+                 stats["accepted"], stats["rejected"], stats["pending"], _suppressed_note(stats))
 
     def refresh_all(self):
         if self.project is None:
             return
         stats = self.project.progress()
-        self.summary_var.set(
-            "{0} chapters · {1} segments · {2:,} words   |   {3} changes proposed · {4} accepted · {5} rejected · {6} pending"
-            .format(len(self.project.chapters), stats["segments"], stats["words"], stats["changes"],
-                    stats["accepted"], stats["rejected"], stats["pending"])
-        )
+        self.summary_var.set(self._summary_line(stats))
         for check in CHECKS:
             per = stats["per_check"][check]
             self.check_buttons[check].configure(text="{0} ({1})".format(CHECK_LABELS[check], per["changes"]))
@@ -1103,10 +1167,18 @@ class ProjectView(ttk.Frame):
         changes = self._visible_changes(segment)
         states = change_states(segment, enabled)
         pending = sum(1 for change in changes if change.decision == PENDING)
+        suppressed = sum(
+            len(result.suppressed) for check, result in segment.results.items()
+            if enabled.get(check) and result.status == "done"
+        )
         self.segment_var.set("{0} · Segment {1} of {2} · {3} words".format(
             chapter.title, segment.index, len(chapter.segments), word_count(segment.text)))
         self.segment_status.configure(
-            text="{0}{1}".format(STATUS_LABELS[status], " · {0} pending".format(pending) if pending else ""),
+            text="{0}{1}{2}".format(
+                STATUS_LABELS[status],
+                " · {0} pending".format(pending) if pending else "",
+                " · {0} suppressed by glossary".format(suppressed) if suppressed else "",
+            ),
             style="{0}.Status.TLabel".format(status.title()),
         )
         if self.selected_change_id and not any(c.change_id == self.selected_change_id for c in changes):
@@ -1149,7 +1221,8 @@ class ProjectView(ttk.Frame):
             return
         for change in changes:
             card = ChangeCard(self.cards_frame.inner, change, segment.text, states[change.change_id],
-                              on_select=self._card_selected, on_decide=self.decide)
+                              on_select=self._card_selected, on_decide=self.decide,
+                              on_add_to_glossary=self.add_to_glossary if self.on_add_to_glossary else None)
             card.pack(fill=tk.X, padx=(0, 4), pady=(0, 6))
             card.refresh(states[change.change_id], selected=change.change_id == self.selected_change_id)
             self.cards[change.change_id] = card
@@ -1201,6 +1274,11 @@ class ProjectView(ttk.Frame):
         # move on to the next pending change for a fast keyboard flow
         self.step_change(1, pending_only=True)
 
+    def add_to_glossary(self, change):
+        """Reject ``change`` and protect its original wording (the "Add to glossary" link)."""
+        self.on_add_to_glossary(change.original_text)
+        self.decide(change, REJECTED)
+
     def decide_selected(self, decision):
         card = self.cards.get(self.selected_change_id)
         if card is not None:
@@ -1216,12 +1294,7 @@ class ProjectView(ttk.Frame):
         self._after_decision()
 
     def _after_decision(self):
-        stats = self.project.progress()
-        self.summary_var.set(
-            "{0} chapters · {1} segments · {2:,} words   |   {3} changes proposed · {4} accepted · {5} rejected · {6} pending"
-            .format(len(self.project.chapters), stats["segments"], stats["words"], stats["changes"],
-                    stats["accepted"], stats["rejected"], stats["pending"])
-        )
+        self.summary_var.set(self._summary_line(self.project.progress()))
         self.master.schedule_save()
 
     def step_change(self, delta, pending_only=False):
