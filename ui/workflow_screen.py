@@ -10,6 +10,7 @@ from core.backend import EditCancelled
 from core.change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS
 from core.chunking import read_text_file, split_document, word_count
 from core.models import ACCEPTED, PENDING, REJECTED
+from core.statistics import project_statistics, statistics_markdown
 from core.workflow import (
     CHECK_AUTHOR,
     CHECK_DESCRIPTIONS,
@@ -268,6 +269,121 @@ class DecisionLogDialog(tk.Toplevel):
         return "break"
 
 
+class StatisticsDialog(tk.Toplevel):
+    """Chapters, checks and frequent corrections as tables, with Markdown export."""
+
+    def __init__(self, parent, project, on_jump):
+        super().__init__(parent)
+        self.title("Statistics · {0}".format(project.name))
+        self.transient(parent.winfo_toplevel())
+        self.geometry("900x460")
+        self.project = project
+        self.on_jump = on_jump
+        self.stats = None
+        self.frequent_rows = {}
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        self.summary_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.summary_var, style="Muted.TLabel", wraplength=860,
+                  justify=tk.LEFT).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.notebook = ttk.Notebook(frame)
+        self.notebook.grid(row=1, column=0, sticky="nsew")
+        self.chapters_tree = self._table(
+            "Chapters", (("index", "#", 40), ("title", "Chapter", 220), ("words", "Words", 80),
+                         ("changes", "Changes", 80), ("per_1000", "per 1,000", 80), ("accepted", "Accepted", 80),
+                         ("rejected", "Rejected", 80), ("pending", "Pending", 80), ("rate", "Acceptance", 90)))
+        self.checks_tree = self._table(
+            "Checks", (("check", "Check", 160), ("changes", "Changes", 90), ("per_1000", "per 1,000", 90),
+                       ("accepted", "Accepted", 90), ("rejected", "Rejected", 90), ("pending", "Pending", 90),
+                       ("rate", "Acceptance", 100)))
+        self.kinds_tree = self._table(
+            "Kinds", (("kind", "Kind", 160), ("changes", "Changes", 90), ("accepted", "Accepted", 90),
+                      ("rejected", "Rejected", 90), ("pending", "Pending", 90), ("rate", "Acceptance", 100)))
+        self.frequent_tree = self._table(
+            "Frequent corrections", (("original", "Original", 220), ("proposed", "Proposed", 220),
+                                     ("count", "Count", 70), ("check", "Check", 100), ("accepted", "Accepted", 80),
+                                     ("rejected", "Rejected", 80)))
+        self.frequent_tree.bind("<Double-1>", self._jump)
+        self.frequent_tree.bind("<Return>", self._jump)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(buttons, text="Double-click a frequent correction to open its first occurrence.",
+                  style="Muted.TLabel", font=font(9)).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Close", style="Ghost.TButton", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Refresh", command=self.refresh).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(buttons, text="Copy as Markdown", command=self.copy_markdown).pack(side=tk.RIGHT, padx=(0, 6))
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.refresh()
+
+    def _table(self, title, columns):
+        tab = ttk.Frame(self.notebook)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        self.notebook.add(tab, text=title)
+        tree = ttk.Treeview(tab, columns=[key for key, _, _ in columns], show="headings", selectmode="browse")
+        for position, (key, heading, width) in enumerate(columns):
+            numeric = key not in ("title", "chapter", "check", "kind", "original", "proposed")
+            tree.heading(key, text=heading, anchor="e" if numeric else "w")
+            tree.column(key, width=width, anchor="e" if numeric else "w",
+                        stretch=(key in ("title", "original", "proposed") or position == 0 and key in ("check", "kind")))
+        scroll = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        return tree
+
+    @staticmethod
+    def _percent(rate):
+        return "{0:.0f}%".format(rate * 100)
+
+    def refresh(self):
+        stats = self.stats = project_statistics(self.project)
+        totals = stats["totals"]
+        self.summary_var.set(
+            "{0:,} words · {1} changes ({2} per 1,000 words) · {3} accepted, {4} rejected, {5} pending "
+            "· acceptance rate {6} (accepted share of the decided changes)".format(
+                totals["words"], totals["changes"], totals["per_1000"], totals["accepted"], totals["rejected"],
+                totals["pending"], self._percent(totals["acceptance_rate"])))
+        for tree in (self.chapters_tree, self.checks_tree, self.kinds_tree, self.frequent_tree):
+            tree.delete(*tree.get_children())
+        for row in stats["chapters"]:
+            self.chapters_tree.insert("", tk.END, values=(
+                row["index"], row["title"], "{0:,}".format(row["words"]), row["changes"], row["per_1000"],
+                row["accepted"], row["rejected"], row["pending"], self._percent(row["acceptance_rate"])))
+        for check, counter in stats["checks"].items():
+            if not counter["changes"] and check not in self.project.options.enabled_checks():
+                continue
+            self.checks_tree.insert("", tk.END, values=(
+                CHECK_LABELS[check], counter["changes"], counter["per_1000"], counter["accepted"],
+                counter["rejected"], counter["pending"], self._percent(counter["acceptance_rate"])))
+        for kind, counter in stats["kinds"].items():
+            self.kinds_tree.insert("", tk.END, values=(
+                CHANGE_KIND_LABELS[kind], counter["changes"], counter["accepted"], counter["rejected"],
+                counter["pending"], self._percent(counter["acceptance_rate"])))
+        self.frequent_rows = {}
+        for position, item in enumerate(stats["frequent"]):
+            iid = "f{0}".format(position)
+            self.frequent_tree.insert("", tk.END, iid=iid, values=(
+                item["original"] or "∅", item["proposed"] or "∅", item["count"],
+                CHECK_LABELS.get(item["check"], item["check"]), item["accepted"], item["rejected"]))
+            self.frequent_rows[iid] = item["first"]
+
+    def copy_markdown(self):
+        markdown = statistics_markdown(self.stats or project_statistics(self.project))
+        self.clipboard_clear()
+        self.clipboard_append(markdown)
+        self.summary_var.set("Copied the statistics as Markdown to the clipboard.")
+
+    def _jump(self, event=None):
+        selection = self.frequent_tree.selection()
+        target = self.frequent_rows.get(selection[0]) if selection else None
+        if target is not None:
+            self.on_jump(*target)
+        return "break"
+
+
 def _one_line(text, limit=60):
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[:limit - 1] + "…"
@@ -289,6 +405,7 @@ class WorkflowScreen(ttk.Frame):
                                         on_checks_changed=self.checks_changed, on_options=self.edit_options,
                                         on_add_to_glossary=self.add_to_glossary, on_reevaluate=self.reevaluate)
         self.decision_dialog = None
+        self.statistics_dialog = None
         self.start_view.pack(fill=tk.BOTH, expand=True)
 
     # ----------------------------------------------------------- lifecycle
@@ -540,9 +657,11 @@ class WorkflowScreen(ttk.Frame):
         self._save_now()
         self.project = None
         self.runner = None
-        if self.decision_dialog is not None and self.decision_dialog.winfo_exists():
-            self.decision_dialog.destroy()
+        for dialog in (self.decision_dialog, self.statistics_dialog):
+            if dialog is not None and dialog.winfo_exists():
+                dialog.destroy()
         self.decision_dialog = None
+        self.statistics_dialog = None
         self.host.lock_controls(False)
         self.show_start()
         self.host.set_status("Project closed. Progress was saved; open it again any time.")
@@ -677,6 +796,17 @@ class WorkflowScreen(ttk.Frame):
     def _refresh_decision_dialog(self):
         if self.decision_dialog is not None and self.decision_dialog.winfo_exists():
             self.decision_dialog.refresh()
+
+    def show_statistics(self):
+        """Open (or raise and refresh) the statistics window."""
+        if not self.active:
+            return
+        if self.statistics_dialog is not None and self.statistics_dialog.winfo_exists():
+            self.statistics_dialog.project = self.project
+            self.statistics_dialog.refresh()
+            self.statistics_dialog.lift()
+            return
+        self.statistics_dialog = StatisticsDialog(self, self.project, on_jump=self.project_view.show_change)
 
     def previous(self, event=None):
         if self.active:
@@ -1178,6 +1308,7 @@ class ProjectView(ttk.Frame):
         self.pause_button.pack(side=tk.LEFT)
         ttk.Button(buttons, text="Options...", command=self.on_options).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(buttons, text="Decisions...", command=lambda: self.master.show_decisions()).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(buttons, text="Statistics...", command=lambda: self.master.show_statistics()).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(buttons, text="Export...", style="Accent.TButton", command=self.on_export).pack(side=tk.LEFT, padx=6)
         ttk.Button(buttons, text="Close project", style="Ghost.TButton", command=self.on_close).pack(side=tk.LEFT)
 

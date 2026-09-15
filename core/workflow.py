@@ -815,6 +815,8 @@ class Project:
         return {"chapters": written, "document": combined, "report": report}
 
     def build_report(self):
+        from .statistics import project_statistics, statistics_markdown  # statistics imports this module
+
         stats = self.progress()
         lines = [
             "# Review report: {0}\n".format(self.name),
@@ -869,6 +871,8 @@ class Project:
                         line += " — {0} (model proposed `{1}`)".format(EDITED_REPORT_MARK, _inline(change.model_proposed_text))
                     lines.append(line)
             lines.append("")
+        lines.append(statistics_markdown(project_statistics(self)))
+        lines.append("")
         return "\n".join(lines)
 
 
