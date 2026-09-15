@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .backend import BackendUnavailable, EditCancelled, OutputTruncated, StructuredOutputUnsupported
-from .change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS, classify_change
+from .change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS, classify_change, edit_distance
 from .chunking import (
     DEFAULT_MAX_CHAPTER_CHARS,
     DEFAULT_MAX_CHARS,
@@ -87,6 +87,32 @@ EXPLANATION_SYSTEM_PROMPT = (
     "single JSON object and nothing else."
 )
 SAME_LANGUAGE = "same as text"
+
+# Explanations that need no model: trivial kinds get a fixed sentence in the
+# explanation language (see ``canned_explanation``); everything else is asked
+# in batches of EXPLANATION_GROUP_SIZE changes of one check per request.
+CANNED_EXPLANATIONS = {
+    "whitespace": {"en": "Spacing corrected.", "de": "Leerzeichen korrigiert."},
+    "punctuation": {"en": "Punctuation corrected.", "de": "Zeichensetzung korrigiert."},
+    "capitalization": {"en": "Capitalization corrected.", "de": "Groß-/Kleinschreibung korrigiert."},
+    "spelling": {"en": "Typo: one letter corrected.", "de": "Tippfehler: ein Buchstabe korrigiert."},
+}
+CANNED_SPELLING_MAX_DISTANCE = 1
+EXPLANATION_GROUP_SIZE = 6
+EXPLANATION_MAX_TOKENS = 2048
+LANGUAGE_CODES = {
+    "english": "en", "englisch": "en", "en": "en",
+    "german": "de", "deutsch": "de", "de": "de",
+}
+# Frequent function words used to guess whether a segment is German or English.
+_GERMAN_MARKERS = frozenset(
+    "der die das und nicht ist ein eine mit sich auf für von dem den dass ich er sie es zu wir "
+    "auch wie oder aber noch wenn nur nach bei aus über als war hatte wurde sind".split()
+)
+_ENGLISH_MARKERS = frozenset(
+    "the and of to is in that it was for with as his her on at be this have not but are they "
+    "were she he you by from had which their there been would could into".split()
+)
 
 # Standing instructions from the author, appended to every check's instruction
 # and to the explanation prompt (see ``format_style_guide``).
@@ -231,6 +257,11 @@ class Change:
     @property
     def flagged(self):
         return bool(self.flags)
+
+    @property
+    def distance(self):
+        """Levenshtein distance between the collapsed original and proposed text."""
+        return edit_distance(self.original_text, self.proposed_text)
 
     @property
     def priority(self):
@@ -1043,24 +1074,62 @@ def _context(text, start, end, radius=40):
     return before, after
 
 
-def build_explanation_messages(segment_text, changes, check, language=SAME_LANGUAGE, style_guide=""):
-    """Build the prompt asking for one short explanation per change.
+def detect_language(text):
+    """Return ``"de"`` when a text uses more German than English function words, else ``"en"``."""
+    words = _WORD_RE.findall((text or "").lower())
+    german = sum(1 for word in words if word in _GERMAN_MARKERS)
+    english = sum(1 for word in words if word in _ENGLISH_MARKERS)
+    return "de" if german > english else "en"
 
-    The author's rules are appended after the check description so the
-    explanations do not argue against them.
-    """
+
+def explanation_language(language, segment_text):
+    """Return the code ("en"/"de") canned explanations may use, or ``None`` for other languages."""
+    if language == SAME_LANGUAGE:
+        return detect_language(segment_text)
+    return LANGUAGE_CODES.get((language or "").strip().lower())
+
+
+def canned_explanation(change, language):
+    """Return a fixed explanation for a trivial change in ``language`` ("en"/"de"), else ``None``."""
+    texts = CANNED_EXPLANATIONS.get(change.kind)
+    if not texts or language not in texts:
+        return None
+    if change.kind == "spelling" and change.distance > CANNED_SPELLING_MAX_DISTANCE:
+        return None
+    return texts[language]
+
+
+def apply_canned_explanations(segment_text, changes, language=SAME_LANGUAGE):
+    """Fill canned explanations in place; returns the changes that still need the model."""
+    code = explanation_language(language, segment_text)
+    remaining = []
+    for change in changes:
+        canned = canned_explanation(change, code) if code else None
+        if canned:
+            change.explanation = canned
+        else:
+            remaining.append(change)
+    return remaining
+
+
+def _change_lines(segment_text, changes, first_number):
     lines = []
-    for number, change in enumerate(changes, 1):
+    for number, change in enumerate(changes, first_number):
         before, after = _context(segment_text, change.start, change.end)
         lines.append(
             "{0}. \"{1}\" → \"{2}\"   (context: …{3}[{1}]{4}…)".format(
                 number, change.original_text, change.proposed_text, before, after
             )
         )
-    if language == SAME_LANGUAGE:
-        language_clause = "in the same language as the text"
-    else:
-        language_clause = "in " + language
+    return lines
+
+
+def build_explanation_messages(segment_text, changes, check, language=SAME_LANGUAGE, style_guide=""):
+    """Build the prompt asking for one short explanation per change of one segment.
+
+    The author's rules are appended after the check description so the
+    explanations do not argue against them.
+    """
     return [
         {"role": "system", "content": EXPLANATION_SYSTEM_PROMPT},
         {
@@ -1072,8 +1141,43 @@ def build_explanation_messages(segment_text, changes, check, language=SAME_LANGU
                 "number to its explanation, e.g. {{\"1\": \"...\", \"2\": \"...\"}}.\n\n"
                 "Check: {2}{3}\n\nText:\n{4}\n\nChanges:\n{5}"
             ).format(
-                CHECK_LABELS[check].lower(), language_clause, CHECK_DESCRIPTIONS[check],
-                format_style_guide(style_guide), segment_text, "\n".join(lines),
+                CHECK_LABELS[check].lower(), _language_clause(language), CHECK_DESCRIPTIONS[check],
+                format_style_guide(style_guide), segment_text, "\n".join(_change_lines(segment_text, changes, 1)),
+            ),
+        },
+    ]
+
+
+def build_grouped_explanation_messages(entries, check, language=SAME_LANGUAGE, style_guide=""):
+    """Build one explanation prompt for several segments' changes of the same check.
+
+    ``entries`` is a list of ``(segment_text, changes)``. Numbering continues
+    across segments, every segment text appears once under a "Segment N"
+    header, and the answer is the same flat number → explanation object. A
+    single entry produces exactly the single-segment prompt.
+    """
+    if len(entries) == 1:
+        return build_explanation_messages(entries[0][0], entries[0][1], check, language, style_guide)
+    blocks = []
+    number = 1
+    for position, (segment_text, changes) in enumerate(entries, 1):
+        blocks.append("Segment {0}:\n{1}\n\nChanges in segment {0}:\n{2}".format(
+            position, segment_text, "\n".join(_change_lines(segment_text, changes, number))
+        ))
+        number += len(changes)
+    return [
+        {"role": "system", "content": EXPLANATION_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "A {0} check proposed the changes listed below for {1} segments of a manuscript. For "
+                "each numbered change, write one short explanation (at most 15 words, {2}) of why the "
+                "new version is better. Return a JSON object mapping the change number to its "
+                "explanation, e.g. {{\"1\": \"...\", \"2\": \"...\"}}.\n\n"
+                "Check: {3}{4}\n\n{5}"
+            ).format(
+                CHECK_LABELS[check].lower(), len(entries), _language_clause(language),
+                CHECK_DESCRIPTIONS[check], format_style_guide(style_guide), "\n\n".join(blocks),
             ),
         },
     ]
@@ -1141,17 +1245,16 @@ def sanity_check_proposal(original, proposed):
         )
 
 
-def run_check(service, model, text, check, cancel_event, explain=True, language=SAME_LANGUAGE, retries=1,
-              style_guide="", glossary=None):
-    """Evaluate one check on one segment; returns a CheckResult (never raises except on cancel).
+def evaluate(service, model, text, check, cancel_event, retries=1, style_guide="", glossary=None):
+    """Run the edit request of one check on one segment; returns a CheckResult without explanations.
 
     Edits are requested with ``text_first=True``: the segment comes before the
     check's instruction, so the three checks of one segment share a prompt
     prefix that the GPU server can serve from its prefix cache. ``style_guide``
     holds the author's standing instructions; they are appended to the check's
-    instruction and to the explanation prompt. ``glossary`` lists protected
-    terms: they are named in the prompt and any change touching one is moved
-    to ``CheckResult.suppressed`` instead of being proposed.
+    instruction. ``glossary`` lists protected terms: they are named in the
+    prompt and any change touching one is moved to ``CheckResult.suppressed``
+    instead of being proposed. Never raises except on cancel.
     """
     started = time.time()
     attempt = 0
@@ -1174,26 +1277,77 @@ def run_check(service, model, text, check, cancel_event, explain=True, language=
 
     changes, suppressed = suppress_glossary_changes(text, extract_changes(text, proposed, check), glossary_matcher(glossary))
     flag_changes(text, changes)
-    explained = False
-    explanations = {}
-    if changes and explain:
-        try:
-            answer = service.generate(
-                model, build_explanation_messages(text, changes, check, language, style_guide), cancel_event,
-                max_tokens=2048,
-            )
-            explanations = parse_explanations(answer)
-            explained = bool(explanations)
-        except EditCancelled:
-            raise
-        except Exception:  # explanations are best effort
-            explanations = {}
-    for number, change in enumerate(changes, 1):
-        change.explanation = explanations.get(number) or FALLBACK_EXPLANATIONS[check]
     return CheckResult(
-        check, "done", proposed, changes, model=model, duration=time.time() - started, explained=explained,
-        suppressed=suppressed,
+        check, "done", proposed, changes, model=model, duration=time.time() - started, suppressed=suppressed,
     )
+
+
+def finish_explanations(result):
+    """Fill missing explanations with the fallback text and set ``explained``.
+
+    ``explained`` is True only when every change carries a real (canned or
+    model-written) explanation.
+    """
+    fallback = FALLBACK_EXPLANATIONS[result.check]
+    for change in result.changes:
+        change.explanation = change.explanation or fallback
+    result.explained = bool(result.changes) and all(change.explanation != fallback for change in result.changes)
+    return result
+
+
+def request_explanations(service, model, entries, check, cancel_event, language=SAME_LANGUAGE, style_guide=""):
+    """Ask the model to explain the changes of one or more segments; returns {number: text}.
+
+    ``entries`` is a list of ``(segment_text, changes)``; numbers continue
+    across segments in the order given. Failures other than cancellation
+    yield an empty mapping (explanations are best effort).
+    """
+    if not any(changes for _, changes in entries):
+        return {}
+    try:
+        answer = service.generate(
+            model, build_grouped_explanation_messages(entries, check, language, style_guide), cancel_event,
+            max_tokens=EXPLANATION_MAX_TOKENS,
+        )
+    except EditCancelled:
+        raise
+    except Exception:
+        return {}
+    return parse_explanations(answer)
+
+
+def distribute_explanations(changes, numbered):
+    """Write the model's numbered answers into ``changes`` (numbered from 1 in list order)."""
+    for number, change in enumerate(changes, 1):
+        if numbered.get(number):
+            change.explanation = numbered[number]
+
+
+def explain_result(service, model, text, result, cancel_event, language=SAME_LANGUAGE, style_guide=""):
+    """Explain the changes of one evaluated result: canned sentences first, one request for the rest."""
+    remaining = apply_canned_explanations(text, result.changes, language)
+    if remaining:
+        numbered = request_explanations(
+            service, model, [(text, remaining)], result.check, cancel_event, language, style_guide
+        )
+        distribute_explanations(remaining, numbered)
+    return finish_explanations(result)
+
+
+def run_check(service, model, text, check, cancel_event, explain=True, language=SAME_LANGUAGE, retries=1,
+              style_guide="", glossary=None):
+    """Evaluate one check on one segment and explain its changes; returns a CheckResult.
+
+    Convenience wrapper around ``evaluate`` and ``explain`` for callers that
+    want one result per call (the combined-mode fallback, scripts, tests).
+    The runner uses the two steps separately so explanations can be batched.
+    """
+    result = evaluate(service, model, text, check, cancel_event, retries, style_guide, glossary)
+    if result.status != "done":
+        return result
+    if explain:
+        return explain_result(service, model, text, result, cancel_event, language, style_guide)
+    return finish_explanations(result)
 
 
 # --------------------------------------------------------- combined pass
@@ -1367,6 +1521,16 @@ class ProjectRunner:
     ``workflow_result`` per check so the UI needs no special case. When the
     server rejects the JSON schema once, ``structured_output`` turns off for
     the rest of the run.
+
+    In separate mode with explanations enabled the evaluation workers only run
+    the edit requests; changes that still need an explanation after the
+    canned sentences are handed to a single *explainer* thread, which groups
+    up to ``EXPLANATION_GROUP_SIZE`` segments' changes of the same check into
+    one request and emits each ``workflow_result`` once its explanations are
+    in. Results without open explanations are emitted by the workers directly,
+    so every (segment, check) still produces exactly one result event. On
+    cancellation the explainer stops after the request in flight and emits
+    every waiting result with fallback text.
     """
 
     def __init__(self, project, service, model, events, parallelism=None):
@@ -1377,15 +1541,23 @@ class ProjectRunner:
         self.parallelism = max(1, int(parallelism or project.options.parallelism or 1))
         self.cancel_event = threading.Event()
         self.tasks = queue.Queue()
+        self.explain_queue = queue.Queue()  # (chapter, segment, check, result, remaining changes, text)
         self.total = 0
         self.done = 0
         self.failed = 0
         self.running = 0
+        self.explanation_requests = 0
         self._active_workers = 0
         self._lock = threading.Lock()
         self._threads = []
+        self._explainer = None
         self.started_at = None
         self.structured_output = True  # cleared when the backend rejects response_format
+
+    @property
+    def batches_explanations(self):
+        """Whether an explainer thread handles explanations (separate mode with explanations on)."""
+        return bool(self.project.options.explain) and not self.project.options.combined
 
     @property
     def active(self):
@@ -1412,11 +1584,29 @@ class ProjectRunner:
             return 0
         workers = min(self.parallelism, len(pending))
         self._active_workers = workers
+        if self.batches_explanations:
+            self._explainer = threading.Thread(target=self._explainer_loop, name="teai-explain", daemon=True)
+            self._threads.append(self._explainer)
+            self._explainer.start()
         for number in range(workers):
             thread = threading.Thread(target=self._worker, name="teai-eval-{0}".format(number), daemon=True)
             self._threads.append(thread)
             thread.start()
         return len(pending)
+
+    def _emit_results(self, chapter_index, segment_index, results):
+        """Publish the results of one finished task (one or several checks) plus its progress."""
+        with self._lock:
+            self.done += 1
+            if any(result.status == "error" for result in results.values()):
+                self.failed += 1
+            done, running = self.done, self.running
+        for check, result in results.items():
+            self.events.put(("workflow_result", chapter_index, segment_index, check, result))
+        self.events.put(("workflow_progress", done, self.total, running))
+
+    def _emit_result(self, chapter_index, segment_index, check, result):
+        self._emit_results(chapter_index, segment_index, {check: result})
 
     def cancel(self):
         self.cancel_event.set()
@@ -1439,6 +1629,7 @@ class ProjectRunner:
                     self.running += 1
                 for pending in checks:
                     self.events.put(("workflow_started", chapter_index, segment_index, pending))
+                deferred = None  # (result, remaining changes) handed to the explainer
                 try:
                     if check is None:
                         results = run_segment_combined(
@@ -1448,11 +1639,19 @@ class ProjectRunner:
                         )
                         results = {pending: results[pending] for pending in checks}
                     else:
-                        results = {check: run_check(
+                        result = evaluate(
                             self.service, self.model, segment.text, check, self.cancel_event,
-                            explain=options.explain, language=options.language, style_guide=options.style_guide,
-                            glossary=options.glossary,
-                        )}
+                            style_guide=options.style_guide, glossary=options.glossary,
+                        )
+                        if result.status == "done" and self.batches_explanations:
+                            remaining = apply_canned_explanations(segment.text, result.changes, options.language)
+                            if remaining:
+                                deferred = (result, remaining)
+                            else:
+                                finish_explanations(result)
+                        elif result.status == "done":
+                            finish_explanations(result)
+                        results = {check: result}
                 except EditCancelled:
                     with self._lock:
                         self.running -= 1
@@ -1464,19 +1663,90 @@ class ProjectRunner:
                     }
                 with self._lock:
                     self.running -= 1
-                    self.done += 1
-                    if any(result.status == "error" for result in results.values()):
-                        self.failed += 1
-                    done, running = self.done, self.running
-                for pending in checks:
-                    self.events.put(("workflow_result", chapter_index, segment_index, pending, results[pending]))
-                self.events.put(("workflow_progress", done, self.total, running))
+                if deferred is not None:
+                    self.explain_queue.put((chapter_index, segment_index, check, deferred[0], deferred[1], segment.text))
+                    continue
+                self._emit_results(chapter_index, segment_index, {pending: results[pending] for pending in checks})
         finally:
             with self._lock:
                 self._active_workers -= 1
                 last = self._active_workers == 0
             if last:
-                self.events.put(("workflow_finished", self.cancel_event.is_set()))
+                if self._explainer is not None:
+                    self.explain_queue.put(None)  # the explainer emits workflow_finished
+                else:
+                    self.events.put(("workflow_finished", self.cancel_event.is_set()))
+
+    # ------------------------------------------------------------ explainer
+    def _explainer_loop(self):
+        """Group waiting explanations per check and request them in batches.
+
+        Runs until the workers' sentinel arrives so ``workflow_finished`` is
+        the last event. Entries that arrive after a cancel, or that were
+        waiting when it happened, are emitted with fallback explanations.
+        """
+        finished = False
+        try:
+            while not finished:
+                try:
+                    item = self.explain_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                batch = []
+                if item is None:
+                    finished = True
+                else:
+                    batch.append(item)
+                while True:  # take everything that is ready now, so groups form naturally
+                    try:
+                        more = self.explain_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if more is None:
+                        finished = True
+                    else:
+                        batch.append(more)
+                if batch:
+                    self._explain_batch(batch)
+        finally:
+            while True:  # never leave a result unpublished
+                try:
+                    item = self.explain_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    self._emit_explained(item, cancelled=True)
+            self.events.put(("workflow_finished", self.cancel_event.is_set()))
+
+    def _explain_batch(self, entries):
+        options = self.project.options
+        by_check = {}
+        for entry in entries:
+            by_check.setdefault(entry[2], []).append(entry)
+        for check in CHECKS:
+            group = by_check.get(check) or []
+            for start in range(0, len(group), EXPLANATION_GROUP_SIZE):
+                chunk = group[start:start + EXPLANATION_GROUP_SIZE]
+                numbered = {}
+                if not self.cancel_event.is_set():
+                    try:
+                        with self._lock:
+                            self.explanation_requests += 1
+                        numbered = request_explanations(
+                            self.service, self.model, [(text, remaining) for _, _, _, _, remaining, text in chunk],
+                            check, self.cancel_event, options.language, options.style_guide,
+                        )
+                    except EditCancelled:
+                        numbered = {}
+                flat = [change for _, _, _, _, remaining, _ in chunk for change in remaining]
+                distribute_explanations(flat, numbered)
+                for entry in chunk:
+                    self._emit_explained(entry)
+
+    def _emit_explained(self, entry, cancelled=False):
+        chapter_index, segment_index, check, result, _, _ = entry
+        finish_explanations(result)
+        self._emit_result(chapter_index, segment_index, check, result)
 
     def _disable_structured_output(self):
         self.structured_output = False

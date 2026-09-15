@@ -17,9 +17,11 @@ from core.workflow import (
     CHECK_INSTRUCTIONS,
     CHECK_SPELLING,
     CHECKS,
+    CANNED_EXPLANATIONS,
     COMBINED_SCHEMA,
     EVALUATION_COMBINED,
     EVALUATION_SEPARATE,
+    EXPLANATION_GROUP_SIZE,
     FLAG_GROWTH,
     FLAG_NOVEL_WORDS,
     FLAG_REPORT_MARK,
@@ -50,9 +52,15 @@ from core.workflow import (
     build_check_instruction,
     build_combined_messages,
     build_explanation_messages,
+    build_grouped_explanation_messages,
+    canned_explanation,
     change_states,
     classify_change,
     create_project,
+    detect_language,
+    evaluate,
+    explain_result,
+    explanation_language,
     extract_changes,
     flag_changes,
     flag_suspicious,
@@ -67,6 +75,7 @@ from core.workflow import (
     parse_glossary,
     parse_outline,
     render_segment,
+    request_explanations,
     run_check,
     run_segment_combined,
     sanity_check_proposal,
@@ -1155,6 +1164,223 @@ def test_runner_disables_structured_output_after_a_rejection(tmp_path):
     assert runner.structured_output is False
     methods = [segment.results[check].method for _, segment in project.all_segments() for check in CHECKS if check in segment.results]
     assert EVALUATION_SEPARATE in methods and EVALUATION_COMBINED in methods  # first segment fell back, the rest did not
+
+
+# --------------------------------------------------------- explanations
+def test_canned_explanations_cover_trivial_kinds_only():
+    de = "Er wusste nicht ob der Zug kommt und ging nach Hause."
+    comma = extract_changes(de, "Er wusste nicht, ob der Zug kommt und ging nach Hause.", CHECK_GRAMMAR)[0]
+    assert comma.kind == "punctuation"
+    assert canned_explanation(comma, "de") == CANNED_EXPLANATIONS["punctuation"]["de"]
+    assert canned_explanation(comma, "en") == "Punctuation corrected."
+    assert canned_explanation(comma, None) is None and canned_explanation(comma, "fr") is None
+    assert canned_explanation(Change("x", CHECK_SPELLING, 0, 5, "hello", "Hello"), "en") == "Capitalization corrected."
+    assert canned_explanation(Change("x", CHECK_SPELLING, 0, 4, "a  b", "a b"), "en") == "Spacing corrected."
+    one_letter = Change("x", CHECK_SPELLING, 0, 7, "occured", "occurred")
+    assert one_letter.kind == "spelling" and one_letter.distance == 1
+    assert canned_explanation(one_letter, "en") == "Typo: one letter corrected."
+    two_letters = Change("x", CHECK_SPELLING, 0, 8, "recieved", "received")
+    assert two_letters.kind == "spelling" and two_letters.distance == 2
+    assert canned_explanation(two_letters, "en") is None
+    assert canned_explanation(Change("x", CHECK_GRAMMAR, 0, 4, "were", "was"), "en") is None  # word choice
+    assert canned_explanation(Change("x", CHECK_EXPRESSION, 0, 3, "", "a very long added clause"), "en") is None
+
+
+def test_language_heuristic_and_setting_mapping():
+    assert detect_language("Er hatte in der Nacht kaum geschlafen und wusste nicht, ob der Zug kommt.") == "de"
+    assert detect_language("She had barely slept that night and did not know whether the train would come.") == "en"
+    assert detect_language("") == "en"
+    assert explanation_language("same as text", "Der Zug ist da und wir sind froh.") == "de"
+    assert explanation_language("same as text", "The train is here and we are glad.") == "en"
+    assert explanation_language("German", "whatever") == "de" and explanation_language("Deutsch", "") == "de"
+    assert explanation_language("English", "Der Zug") == "en"
+    assert explanation_language("French", "Le train") is None
+
+
+class CommaService(FakeService):
+    """Grammar check that only inserts a comma (a canned kind); spelling fixes two letters."""
+
+    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None, text_first=False):
+        with self.lock:
+            self.calls.append(("edit", instruction[:20], text, text_first))
+            self.instructions.append(instruction)
+        if instruction.startswith("Fix grammar"):
+            return text.replace("nicht ob", "nicht, ob")
+        if instruction.startswith("Correct spelling"):
+            return text.replace("Bahnohf", "Bahnhof")  # transposition: distance 2, not canned
+        return text
+
+
+def test_explanation_request_is_skipped_when_every_change_is_canned():
+    service = CommaService()
+    text = "Er hatte kaum geschlafen und wusste nicht ob der Zug zum Bahnohf kommt."
+    result = run_check(service, "m", text, CHECK_GRAMMAR, threading.Event())
+
+    assert [c.explanation for c in result.changes] == ["Zeichensetzung korrigiert."]
+    assert result.explained is True
+    assert service.prompts == []  # no explanation request went out
+
+    # a two-letter typo still needs the model; canned changes are not re-asked
+    result = run_check(service, "m", text, CHECK_SPELLING, threading.Event())
+    assert [c.explanation for c in result.changes] == ["Reason 1"] and result.explained is True
+    assert len(service.prompts) == 1 and "Bahnohf" in service.prompts[0]
+
+    # explanations off: fallback text, explained False
+    result = run_check(CommaService(), "m", text, CHECK_GRAMMAR, threading.Event(), explain=False)
+    assert [c.explanation for c in result.changes] == ["Grammar or punctuation fix."] and result.explained is False
+
+
+def test_explained_is_true_only_when_no_fallback_remains():
+    class SilentService(FakeService):
+        def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
+            self.prompts.append(messages[1]["content"])
+            return "{}"  # the model answered nothing useful
+
+    result = run_check(SilentService(), "m", "Teh dog were big.", CHECK_SPELLING, threading.Event())
+    assert [c.explanation for c in result.changes] == ["Spelling correction."] and result.explained is False
+    result = evaluate(FakeService(), "m", "Teh dog were big.", CHECK_SPELLING, threading.Event())
+    assert result.changes[0].explanation == "" and result.explained is False
+    explained = explain_result(FakeService(), "m", "Teh dog were big.", result, threading.Event())
+    assert explained.changes[0].explanation == "Reason 1" and explained.explained is True
+
+
+def test_grouped_prompt_numbers_across_segments_and_includes_each_text_once():
+    first = "Teh dog were big."
+    second = "It run fast and it run far."
+    first_changes = extract_changes(first, "The dog was big.", CHECK_GRAMMAR)
+    second_changes = extract_changes(second, "It ran fast and it ran far.", CHECK_GRAMMAR)
+    assert len(first_changes) == 2 and len(second_changes) == 2
+
+    single = build_grouped_explanation_messages([(first, first_changes)], CHECK_GRAMMAR)
+    assert single == build_explanation_messages(first, first_changes, CHECK_GRAMMAR)
+
+    grouped = build_grouped_explanation_messages([(first, first_changes), (second, second_changes)], CHECK_GRAMMAR, "German")
+    content = grouped[1]["content"]
+    assert "for 2 segments" in content and "in German" in content
+    assert content.count(first) == 1 and content.count(second) == 1
+    assert content.index("Segment 1:\n" + first) < content.index("Segment 2:\n" + second)
+    for number, change in enumerate(first_changes + second_changes, 1):
+        assert '{0}. "{1}" → "{2}"'.format(number, change.original_text, change.proposed_text) in content
+    assert "Changes in segment 1:\n1." in content and "Changes in segment 2:\n3." in content
+
+    # the fake answers by counting arrows, so numbering is verified end to end
+    numbered = request_explanations(FakeService(), "m", [(first, first_changes), (second, second_changes)], CHECK_GRAMMAR, threading.Event())
+    assert numbered == {1: "Reason 1", 2: "Reason 2", 3: "Reason 3", 4: "Reason 4"}
+
+
+def test_explainer_batches_by_check_and_distributes_answers(tmp_path):
+    project = make_project(tmp_path)
+    events = queue.Queue()
+    service = FakeService()
+    runner = ProjectRunner(project, service, "m", events, parallelism=1)
+    entries = []
+    for n in range(EXPLANATION_GROUP_SIZE + 2):  # 8 grammar entries → 6 + 2
+        text = "Segment {0}: it were big and it were fast.".format(n)
+        result = evaluate(service, "m", text, CHECK_GRAMMAR, threading.Event())
+        entries.append((1, n + 1, CHECK_GRAMMAR, result, list(result.changes), text))
+    text = "Teh dog."
+    spelling = evaluate(service, "m", text, CHECK_SPELLING, threading.Event())
+    entries.append((2, 1, CHECK_SPELLING, spelling, list(spelling.changes), text))
+    service.prompts.clear()
+
+    runner._explain_batch(entries)
+
+    assert len(service.prompts) == 3  # grammar 6 + grammar 2 + spelling 1
+    assert "for 6 segments" in service.prompts[1] and "for 2 segments" in service.prompts[2]
+    assert "Text:\nTeh dog." in service.prompts[0]  # spelling group first (CHECKS order), single-segment prompt
+    # numbering continues across the six segments of the first group and restarts per request
+    assert [c.explanation for c in entries[0][3].changes] == ["Reason 1", "Reason 2"]
+    assert [c.explanation for c in entries[5][3].changes] == ["Reason 11", "Reason 12"]
+    assert [c.explanation for c in entries[6][3].changes] == ["Reason 1", "Reason 2"]
+    assert [c.explanation for c in entries[7][3].changes] == ["Reason 3", "Reason 4"]
+    assert [c.explanation for c in spelling.changes] == ["Reason 1"]
+    assert all(entry[3].explained for entry in entries)
+    emitted = [event for event in list(events.queue) if event[0] == "workflow_result"]
+    assert [(e[1], e[2], e[3]) for e in emitted] == [(2, 1, CHECK_SPELLING)] + [(1, n + 1, CHECK_GRAMMAR) for n in range(8)]
+    assert runner.done == 9 and runner.explanation_requests == 3
+
+
+class SlowExplainService(FakeService):
+    """Explanations take a moment so evaluations pile up and get grouped."""
+
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
+        if not messages[1]["content"].startswith("Review the text below"):
+            if cancel_event.wait(0.15):
+                raise EditCancelled("cancelled")
+        return super().generate(model, messages, cancel_event, on_progress, max_tokens, response_format)
+
+
+def test_runner_emits_each_result_once_with_batched_explanations(tmp_path):
+    body = "\n\n".join("Paragraph {0}: teh dog were very very big and it run fast.".format(n) for n in range(6))
+    source = tmp_path / "many.txt"
+    source.write_text(body, encoding="utf-8")
+    options = ProjectOptions(target_chars=60, max_chars=100, parallelism=3, evaluation_mode=EVALUATION_SEPARATE)
+    project = create_project(source, body, options, model="m", backend="fake")
+    segments = [(c.index, s.index) for c, s in project.all_segments() if not s.is_blank]
+    assert len(segments) >= 4
+    events = queue.Queue()
+    service = SlowExplainService()
+    runner = ProjectRunner(project, service, "m", events, parallelism=3)
+    queued = runner.start()
+    collected = drain(events, timeout=30)
+
+    results = [event for event in collected if event[0] == "workflow_result"]
+    keys = [(e[1], e[2], e[3]) for e in results]
+    assert sorted(keys) == sorted((c, s, check) for c, s in segments for check in CHECKS)
+    assert len(keys) == len(set(keys)) == queued == runner.total
+    assert collected[-1] == ("workflow_finished", False)
+    assert all(event[0] != "workflow_result" for event in collected[collected.index(collected[-1]):])
+    for _, chapter_index, segment_index, check, result in results:
+        apply_result(project, chapter_index, segment_index, check, result)
+        assert result.status == "done" and result.explained, (segment_index, check)
+    explained_results = sum(1 for _, s in project.all_segments() for r in s.results.values() if r.changes)
+    assert runner.explanation_requests < explained_results  # some requests covered several segments
+    assert runner.done == runner.total
+    progress = [event for event in collected if event[0] == "workflow_progress"]
+    assert progress[-1][1:3] == (runner.total, runner.total)
+
+
+class BlockingExplainService(FakeService):
+    """The first explanation request blocks until cancelled; lets a test cancel mid-explain."""
+
+    def __init__(self):
+        super().__init__()
+        self.explaining = threading.Event()
+
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
+        if not messages[1]["content"].startswith("Review the text below"):
+            self.explaining.set()
+            if cancel_event.wait(10):
+                raise EditCancelled("cancelled")
+        return super().generate(model, messages, cancel_event, on_progress, max_tokens, response_format)
+
+
+def test_cancel_during_the_explain_stage_finishes_cleanly(tmp_path):
+    project = make_project(tmp_path)
+    events = queue.Queue()
+    service = BlockingExplainService()
+    runner = ProjectRunner(project, service, "m", events, parallelism=2)
+    runner.start()
+    assert service.explaining.wait(10), "the explainer never started a request"
+    runner.cancel()
+    collected = drain(events, timeout=10)
+
+    assert collected[-1] == ("workflow_finished", True)
+    for thread in runner._threads:
+        thread.join(5)
+    assert not runner.active
+    results = [event for event in collected if event[0] == "workflow_result"]
+    keys = [(e[1], e[2], e[3]) for e in results]
+    assert len(keys) == len(set(keys))  # never twice
+    for _, chapter_index, segment_index, check, result in results:
+        apply_result(project, chapter_index, segment_index, check, result)
+        assert result.status == "done"
+        for change in result.changes:
+            assert change.explanation  # fallback or canned, never empty
+    # whatever was still waiting for an explanation came out with fallback text ...
+    assert any(not r.explained for _, s in project.all_segments() for r in s.results.values() if r.changes)
+    # ... and the project is consistent: every emitted result is stored, the rest is simply pending
+    assert len(results) + len(project.pending_tasks()) == runner.total
 
 
 def test_runner_with_nothing_to_do_finishes_immediately(tmp_path):
