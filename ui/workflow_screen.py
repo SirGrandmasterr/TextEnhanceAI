@@ -218,6 +218,7 @@ class DecisionLogDialog(tk.Toplevel):
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.grid(row=1, column=0, sticky="nsew")
         scroll.grid(row=1, column=1, sticky="ns")
+        self.tree.tag_configure("stale", foreground=PALETTE["faint"])
         self.tree.bind("<Double-1>", self._jump)
         self.tree.bind("<Return>", self._jump)
         buttons = ttk.Frame(frame)
@@ -242,8 +243,11 @@ class DecisionLogDialog(tk.Toplevel):
                                               _one_line(change.proposed_text) or "∅")
             else:
                 text = "(change no longer exists)"
+            stale = bool(entry.get("stale"))
+            if stale:
+                text += "  (re-evaluated)"
             iid = "d{0}".format(position)
-            self.tree.insert("", tk.END, iid=iid, values=(
+            self.tree.insert("", tk.END, iid=iid, tags=("stale",) if stale else (), values=(
                 str(entry.get("ts", "")).replace("T", " "),
                 chapter.title if chapter is not None else str(entry["chapter"]),
                 entry["segment"],
@@ -256,7 +260,8 @@ class DecisionLogDialog(tk.Toplevel):
         selection = self.tree.selection()
         entry = self.entries.get(selection[0]) if selection else None
         if entry is not None:
-            self.on_jump(entry["chapter"], entry["segment"], entry["change_id"])
+            # A stale entry's change was replaced by a re-evaluation: only the segment is left to show.
+            self.on_jump(entry["chapter"], entry["segment"], None if entry.get("stale") else entry["change_id"])
         return "break"
 
 
@@ -279,7 +284,7 @@ class WorkflowScreen(ttk.Frame):
         self.project_view = ProjectView(self, on_close=self.close_project, on_pause=self.toggle_pause,
                                         on_export=self.export_project, on_retry=self.resume_runner,
                                         on_checks_changed=self.checks_changed, on_options=self.edit_options,
-                                        on_add_to_glossary=self.add_to_glossary)
+                                        on_add_to_glossary=self.add_to_glossary, on_reevaluate=self.reevaluate)
         self.decision_dialog = None
         self.start_view.pack(fill=tk.BOTH, expand=True)
 
@@ -392,6 +397,32 @@ class WorkflowScreen(ttk.Frame):
                 )
             )
             self.project_view.update_progress(0, queued, 0, None)
+
+    def reevaluate(self, chapter_index, segment_index=None, checks=None):
+        """Drop results of a segment (or chapter) and evaluate them again right away."""
+        if self.project is None:
+            return 0
+        checks = list(checks) if checks else self.project.options.enabled_checks()
+        removed = self.project.invalidate(chapter_index, segment_index, checks)
+        self.project_view.refresh_all()
+        self.schedule_save()
+        self._refresh_decision_dialog()
+        if not removed:
+            self.host.set_status("Nothing to evaluate again there.")
+            return 0
+        tasks = [task for task in removed if task not in self.running_tasks]  # in-flight ones return anyway
+        if self.evaluating:
+            queued = self.runner.enqueue(tasks)
+            self.project_view.set_running(True)
+            self.host.lock_controls(True)
+            self.project_view.update_progress(self.runner.done, self.runner.total, self.runner.running,
+                                              self.runner.eta_seconds())
+        else:
+            self.host.lock_controls(True)
+            self.resume_runner()
+            queued = len(tasks)
+        self.host.set_status("Evaluating {0} check(s) again...".format(queued))
+        return queued
 
     def toggle_pause(self):
         if self.evaluating:
@@ -576,6 +607,8 @@ class WorkflowScreen(ttk.Frame):
             return True
         if kind == "workflow_finished":
             cancelled = event[1]
+            if self.runner is not None and self.runner.has_work():
+                return True  # stale: tasks were enqueued after this batch of workers retired
             self.project_view.set_running(False)
             self.host.lock_controls(False)
             self._save_now()
@@ -1004,9 +1037,10 @@ class ProjectView(ttk.Frame):
     """Chapter/segment navigation, highlighted text and change cards."""
 
     def __init__(self, parent, on_close, on_pause, on_export, on_retry, on_checks_changed, on_options=None,
-                 on_add_to_glossary=None):
+                 on_add_to_glossary=None, on_reevaluate=None):
         super().__init__(parent, padding=(12, 8))
         self.on_close = on_close
+        self.on_reevaluate = on_reevaluate or (lambda *args, **kwargs: 0)
         self.on_pause = on_pause
         self.on_export = on_export
         self.on_retry = on_retry
@@ -1094,6 +1128,12 @@ class ProjectView(ttk.Frame):
             self.tree.tag_configure(status, foreground=color)
         self.tree.tag_configure("chapter", font=font(10, "bold"))
         self.tree.bind("<<TreeviewSelect>>", self._tree_selected)
+        self.tree_menu = tk.Menu(self.tree, tearoff=False)
+        self.tree.bind("<Button-3>", self._tree_context)
+        self.tree.bind("<Button-2>", self._tree_context)  # macOS secondary click
+        self.tree.bind("<App>", self._tree_context_key)
+        self.tree.bind("<Menu>", self._tree_context_key)
+        self.tree.bind("<Shift-F10>", self._tree_context_key)
 
         right = ttk.Frame(paned)
         paned.add(right, weight=3)
@@ -1108,6 +1148,11 @@ class ProjectView(ttk.Frame):
         self.segment_status = ttk.Label(seg_header, text="", style="Status.TLabel")
         self.segment_status.pack(side=tk.LEFT, padx=10)
         ttk.Checkbutton(seg_header, text="Preview result", variable=self.preview_var, command=self.render_segment).pack(side=tk.RIGHT)
+        self.reevaluate_button = ttk.Button(seg_header, text="Re-evaluate", style="Small.TButton",
+                                            command=self.reevaluate_current)
+        self.reevaluate_button.pack(side=tk.RIGHT, padx=(0, 10))
+        Tooltip(self.reevaluate_button, "Discard this segment's results and decisions and run the enabled checks "
+                                        "on it again. Right-click a row in the tree for one check or a whole chapter.")
 
         self.text = tk.Text(right, height=9)
         style_text(self.text, size=11, readonly=True)
@@ -1274,6 +1319,62 @@ class ProjectView(ttk.Frame):
             return
         self.project.options.checks[check] = bool(self.check_vars[check].get())
         self.on_checks_changed()
+
+    # -------------------------------------------------------- re-evaluate
+    def _tree_context(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return "break"
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self._post_tree_menu(iid, event.x_root, event.y_root)
+        return "break"
+
+    def _tree_context_key(self, event=None):
+        iid = self.tree.focus() or (self.tree.selection() or [None])[0]
+        if not iid:
+            return "break"
+        x, y, width, height = self.tree.bbox(iid) or (0, 0, 0, 0)
+        self._post_tree_menu(iid, self.tree.winfo_rootx() + x + width // 3, self.tree.winfo_rooty() + y + height)
+        return "break"
+
+    def _post_tree_menu(self, iid, x, y):
+        if self.project is None:
+            return
+        menu = self.tree_menu
+        menu.delete(0, tk.END)
+        if iid.startswith("s"):
+            chapter_index, segment_index = (int(part) for part in iid[1:].split("-"))
+            _, segment = self.project.find(chapter_index, segment_index)
+            if segment is None or segment.is_blank:
+                return
+            submenu = tk.Menu(menu, tearoff=False)
+            submenu.add_command(label="All checks", command=lambda: self.on_reevaluate(chapter_index, segment_index))
+            submenu.add_separator()
+            for check in self.project.options.enabled_checks():
+                submenu.add_command(label=CHECK_LABELS[check],
+                                    command=lambda c=check: self.on_reevaluate(chapter_index, segment_index, [c]))
+            submenu.add_separator()
+            submenu.add_command(label="Whole chapter", command=lambda: self.on_reevaluate(chapter_index))
+            menu.add_cascade(label="Evaluate again", menu=submenu)
+        else:
+            chapter_index = int(iid[1:])
+            menu.add_command(label="Evaluate chapter again", command=lambda: self.on_reevaluate(chapter_index))
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def reevaluate_current(self):
+        chapter, segment = self._current_segment()
+        if segment is None or segment.is_blank:
+            return
+        if self.project.decision_log and any(
+                change.decision != PENDING for change in segment.changes(self.project.enabled)):
+            if not messagebox.askyesno("Evaluate again?",
+                                       "Discard the results and decisions of this segment and run the checks again?"):
+                return
+        self.on_reevaluate(chapter.index, segment.index)
 
     # -------------------------------------------------------------- kinds
     def _fill_kinds_menu(self):
@@ -1543,7 +1644,7 @@ class ProjectView(ttk.Frame):
         if self.project is None or self.project.find(chapter_index, segment_index)[1] is None:
             return
         self.select_segment(chapter_index, segment_index, change_id=change_id)
-        card = self.cards.get(change_id)
+        card = self.cards.get(change_id) if change_id else None
         if card is not None:
             self.cards_frame.scroll_to_widget(card)
 

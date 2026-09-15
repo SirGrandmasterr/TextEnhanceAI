@@ -1068,3 +1068,127 @@ def test_changes_by_kind_and_bulk_decide_only_touch_pending_changes_of_that_kind
     assert len(undone) == len(targets) - 1
     assert all(change.decision == PENDING for change in targets[1:])
     assert targets[0].decision == REJECTED  # the earlier single decision survives
+
+
+# ------------------------------------------------------------- re-evaluate
+def evaluated_project(tmp_path, **overrides):
+    """A fully evaluated project (FakeService results applied)."""
+    project = make_project(tmp_path, **overrides)
+    events = queue.Queue()
+    ProjectRunner(project, FakeService(), "m", events, parallelism=2).start()
+    for event in drain(events):
+        if event[0] == "workflow_result":
+            apply_result(project, *event[1:])
+    assert project.pending_tasks() == []
+    return project
+
+
+def test_invalidate_counts_and_reports_the_pending_tasks(tmp_path):
+    project = evaluated_project(tmp_path)
+    chapter = project.chapters[0]
+    segments = [segment for segment in chapter.segments if not segment.is_blank]
+    assert len(segments) >= 2
+    first, second = segments[0], segments[1]
+
+    removed = project.invalidate(chapter.index, first.index, [CHECK_GRAMMAR])
+    assert removed == [(chapter.index, first.index, CHECK_GRAMMAR)]
+    assert CHECK_GRAMMAR not in first.results and CHECK_SPELLING in first.results
+    assert project.pending_tasks() == removed
+    assert first.status(ALL) == STATUS_QUEUED
+
+    removed = project.invalidate(chapter.index, second.index)
+    assert sorted(removed) == sorted((chapter.index, second.index, check) for check in CHECKS)
+    assert second.results == {}
+    assert len(project.pending_tasks()) == 1 + len(CHECKS)
+
+    # whole chapter: everything still stored in it goes, other chapters are untouched
+    removed = project.invalidate(chapter.index)
+    assert len(removed) == sum(len(CHECKS) for segment in segments) - 1 - len(CHECKS)
+    assert all(segment.results == {} for segment in chapter.segments)
+    assert all(segment.results for segment in project.chapters[1].segments if not segment.is_blank)
+    assert project.invalidate(chapter.index) == []
+    assert project.invalidate(99) == []
+    assert project.invalidate(project.chapters[1].index, 999) == []
+
+
+def test_invalidate_marks_log_entries_stale_and_undo_skips_them(tmp_path):
+    project = evaluated_project(tmp_path)
+    chapter = project.chapters[0]
+    segment = next(segment for segment in chapter.segments if segment.changes(ALL))
+    change = next(c for c in segment.changes(ALL) if c.check == CHECK_SPELLING)
+    kept_change = next(c for c in segment.changes(ALL) if c.check == CHECK_GRAMMAR)
+
+    kept = project.decide(chapter.index, segment.index, kept_change, REJECTED)
+    doomed = project.decide(chapter.index, segment.index, change, ACCEPTED)
+    project.invalidate(chapter.index, segment.index, [change.check])
+    assert doomed.get("stale") is True and kept.get("stale") is None
+    assert len(project.decision_log) == 2  # nothing is dropped
+
+    # undo skips the stale entry (whose change no longer exists) and reverts the live one
+    assert project.undo() == [kept]
+    assert kept_change.decision == PENDING and CHECK_GRAMMAR in segment.results
+    assert project.decision_log == [doomed]
+    assert project.undo() is None  # only a stale entry is left: nothing to undo
+    assert project.decision_log == [doomed]
+
+    # stale entries survive a save/load round trip
+    project.save()
+    assert Project.load(project.root).decision_log[0]["stale"] is True
+
+    # a re-evaluated result with the same change ids is not touched by the stale entry
+    project.pending_tasks()
+    events = queue.Queue()
+    ProjectRunner(project, FakeService(), "m", events, parallelism=1).start()
+    for event in drain(events):
+        if event[0] == "workflow_result":
+            apply_result(project, *event[1:])
+    fresh = segment.find_change(change.change_id)
+    assert fresh is not None and fresh is not change and fresh.decision == PENDING
+
+
+def test_runner_picks_up_tasks_enqueued_mid_run(tmp_path):
+    project = make_project(tmp_path)
+    chapter = project.chapters[0]
+    target = next(segment for segment in chapter.segments if not segment.is_blank)
+    # pre-fill the target so it is not part of the initial batch ...
+    for check in CHECKS:
+        target.results[check] = CheckResult(check, "done", target.text)
+    initial = project.pending_tasks()
+    assert all(task[:2] != (chapter.index, target.index) for task in initial)
+
+    events = queue.Queue()
+    runner = ProjectRunner(project, FakeService(delay=0.2), "m", events, parallelism=2)
+    assert runner.start() == len(initial)
+    # ... then drop its results while the workers are busy and hand the tasks to the runner
+    removed = project.invalidate(chapter.index, target.index)
+    assert runner.enqueue(removed) == len(CHECKS)
+    assert runner.total == len(initial) + len(CHECKS)
+    assert runner.enqueue([]) == 0
+
+    collected = drain(events, timeout=30)
+    for event in collected:
+        if event[0] == "workflow_result":
+            apply_result(project, *event[1:])
+    finished = [event for event in collected if event[0] == "workflow_finished"]
+    assert finished == [("workflow_finished", False)]
+    started = {event[1:] for event in collected if event[0] == "workflow_started"}
+    assert set(removed) <= started
+    assert project.pending_tasks() == []
+    assert all(target.results[check].status == "done" for check in CHECKS)
+    assert not runner.active and not runner.has_work()
+
+
+def test_enqueue_after_the_runner_finished_starts_new_workers(tmp_path):
+    project = evaluated_project(tmp_path)
+    chapter = project.chapters[0]
+    target = next(segment for segment in chapter.segments if not segment.is_blank)
+    events = queue.Queue()
+    runner = ProjectRunner(project, FakeService(), "m", events, parallelism=2)
+    assert runner.start() == 0
+    assert events.get(timeout=1) == ("workflow_finished", False)
+
+    removed = project.invalidate(chapter.index, target.index, [CHECK_SPELLING])
+    assert runner.enqueue(removed) == 1
+    collected = drain(events)
+    assert [event[1:] for event in collected if event[0] == "workflow_started"] == removed
+    assert collected[-1] == ("workflow_finished", False)

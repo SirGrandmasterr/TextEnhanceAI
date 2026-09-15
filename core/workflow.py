@@ -460,6 +460,35 @@ class Project:
                         return chapter, segment
         return None, None
 
+    def invalidate(self, chapter_index, segment_index=None, checks=None):
+        """Drop the results of one segment (or a whole chapter) so they are evaluated again.
+
+        ``checks`` limits the drop to those checks (default: every stored
+        result). Decisions on the dropped changes are gone with the results;
+        their decision-log entries stay but are marked ``"stale": True`` so
+        the Decisions view can grey them out and undo() skips them.
+        Returns the removed (chapter_index, segment_index, check) tuples, which
+        are exactly the tasks pending_tasks() will report for enabled checks.
+        """
+        removed = []
+        for chapter in self.chapters:
+            if chapter.index != chapter_index:
+                continue
+            for segment in chapter.segments:
+                if segment_index is not None and segment.index != segment_index:
+                    continue
+                for check in list(segment.results):
+                    if checks is not None and check not in checks:
+                        continue
+                    result = segment.results.pop(check)
+                    removed.append((chapter.index, segment.index, check))
+                    stale_ids = {change.change_id for change in result.changes}
+                    for entry in self.decision_log:
+                        if (entry["chapter"], entry["segment"]) == (chapter.index, segment.index) \
+                                and entry["change_id"] in stale_ids:
+                            entry["stale"] = True
+        return removed
+
     def changes_by_kind(self, kind, decision=None):
         """Return (chapter, segment, change) for every change of ``kind`` in document order.
 
@@ -573,22 +602,25 @@ class Project:
         Returns the reverted entries in the order they were made, or None when
         there is nothing to undo.
         """
-        if not self.decision_log:
+        live = [index for index, entry in enumerate(self.decision_log) if not entry.get("stale")]
+        if not live:
             return None
-        group = self.decision_log[-1]["group"]
-        undone = []
-        while self.decision_log:
-            entry = self.decision_log[-1]
-            if undone and (group is None or entry["group"] != group):
+        group = self.decision_log[live[-1]]["group"]
+        indices = []
+        for index in reversed(live):
+            if indices and (group is None or self.decision_log[index]["group"] != group):
                 break
-            self.decision_log.pop()
+            indices.append(index)
+            if group is None:
+                break
+        undone = []
+        for index in indices:  # newest first, so the remaining indices stay valid
+            entry = self.decision_log.pop(index)
             _, segment = self.find(entry["chapter"], entry["segment"])
             change = segment.find_change(entry["change_id"]) if segment is not None else None
             if change is not None:
                 change.decision = entry["before"]
             undone.append(entry)
-            if group is None:
-                break
         undone.reverse()
         return undone
 
@@ -1242,6 +1274,11 @@ class ProjectRunner:
     def active(self):
         return any(thread.is_alive() for thread in self._threads)
 
+    def has_work(self):
+        """Whether tasks are queued or running (a finished event seen while this is True is stale)."""
+        with self._lock:
+            return self.running > 0 or not self.tasks.empty()
+
     def start(self):
         """Queue every pending task and start the workers; returns the task count.
 
@@ -1263,28 +1300,62 @@ class ProjectRunner:
             return 0
         workers = min(self.parallelism, len(pending))
         self._active_workers = workers
-        for number in range(workers):
-            thread = threading.Thread(target=self._worker, name="teai-eval-{0}".format(number), daemon=True)
+        self._spawn(workers)
+        return len(pending)
+
+    def enqueue(self, tasks):
+        """Add (chapter, segment, check) tasks to a running evaluation; returns how many were queued.
+
+        Workers retire as soon as the queue is empty, so new workers are started
+        (up to ``parallelism``) for the tasks. Works after the runner finished,
+        too: the new tasks then produce a second ``workflow_finished`` event.
+        """
+        tasks = list(tasks)
+        if not tasks:
+            return 0
+        if self.started_at is None:
+            self.started_at = time.time()
+        with self._lock:
+            self.total += len(tasks)
+            for task in tasks:
+                self.tasks.put(task)
+            spawn = max(0, min(self.parallelism - self._active_workers, len(tasks)))
+            self._active_workers += spawn
+        self._spawn(spawn)
+        return len(tasks)
+
+    def _spawn(self, count):
+        for _ in range(count):
+            thread = threading.Thread(target=self._worker, name="teai-eval-{0}".format(len(self._threads)), daemon=True)
             self._threads.append(thread)
             thread.start()
-        return len(pending)
 
     def cancel(self):
         self.cancel_event.set()
+
+    def _next_task(self):
+        """Take the next task and count it as running; None when the queue is empty."""
+        with self._lock:
+            try:
+                task = self.tasks.get_nowait()
+            except queue.Empty:
+                return None
+            self.running += 1
+            return task
 
     def _worker(self):
         options = self.project.options
         try:
             while not self.cancel_event.is_set():
-                try:
-                    chapter_index, segment_index, check = self.tasks.get_nowait()
-                except queue.Empty:
+                task = self._next_task()
+                if task is None:
                     break
+                chapter_index, segment_index, check = task
                 _, segment = self.project.find(chapter_index, segment_index)
                 if segment is None:
+                    with self._lock:
+                        self.running -= 1
                     continue
-                with self._lock:
-                    self.running += 1
                 self.events.put(("workflow_started", chapter_index, segment_index, check))
                 try:
                     result = run_check(
@@ -1308,10 +1379,11 @@ class ProjectRunner:
                 self.events.put(("workflow_progress", done, self.total, running))
         finally:
             with self._lock:
+                # Emitted under the lock so that enqueue() cannot slip new tasks in
+                # between the count reaching zero and the event being sent.
                 self._active_workers -= 1
-                last = self._active_workers == 0
-            if last:
-                self.events.put(("workflow_finished", self.cancel_event.is_set()))
+                if self._active_workers == 0:
+                    self.events.put(("workflow_finished", self.cancel_event.is_set()))
 
     def eta_seconds(self):
         """Rough remaining time based on the throughput so far."""
