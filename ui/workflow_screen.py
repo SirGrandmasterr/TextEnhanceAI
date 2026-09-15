@@ -40,6 +40,8 @@ from core.workflow import (
     normalise_style_guide,
     parse_glossary,
     parse_outline,
+    pending_changes,
+    render_chapter_annotated,
     render_segment,
 )
 from .theme import CHECK_COLORS, PALETTE, STATUS_COLORS, ScrollableFrame, Tooltip, font, style_text
@@ -1151,6 +1153,11 @@ class ProjectView(ttk.Frame):
         self.filter_vars = {check: tk.BooleanVar(value=True) for check in CHECKS}
         self.kind_vars = {kind: tk.BooleanVar(value=True) for kind in CHANGE_KINDS}  # True = shown
         self.preview_var = tk.BooleanVar(value=False)
+        self.chapter_spans = []  # spans of the chapter tab, see render_chapter_annotated
+        self.chapter_shown = None  # chapter index rendered in the chapter tab
+        self._chapter_after = None
+        self._list_after = None
+        self.listed = {}  # all-changes tab: row iid -> (chapter_index, segment_index, change_id)
         self._build()
 
     # ---------------------------------------------------------------- build
@@ -1232,8 +1239,16 @@ class ProjectView(ttk.Frame):
         self.tree.bind("<Menu>", self._tree_context_key)
         self.tree.bind("<Shift-F10>", self._tree_context_key)
 
-        right = ttk.Frame(paned)
-        paned.add(right, weight=3)
+        self.notebook = ttk.Notebook(paned)
+        paned.add(self.notebook, weight=3)
+        right = ttk.Frame(self.notebook)
+        self.segment_tab = right
+        self.notebook.add(right, text="Segment")
+        self.chapter_tab = self._build_chapter_tab()
+        self.notebook.add(self.chapter_tab, text="Chapter")
+        self.list_tab = self._build_list_tab()
+        self.notebook.add(self.list_tab, text="All changes")
+        self.notebook.bind("<<NotebookTabChanged>>", self._tab_changed)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=2)
         right.rowconfigure(3, weight=3)
@@ -1283,6 +1298,246 @@ class ProjectView(ttk.Frame):
         self.cards_frame = ScrollableFrame(right)
         self.cards_frame.grid(row=3, column=0, sticky="nsew", padx=(10, 0))
 
+    def _build_chapter_tab(self):
+        """Read-only rendering of the whole chapter with one tag per change state."""
+        tab = ttk.Frame(self.notebook)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        header = ttk.Frame(tab)
+        header.grid(row=0, column=0, sticky="ew", padx=(10, 0), pady=(4, 4))
+        self.chapter_title_var = tk.StringVar(value="")
+        ttk.Label(header, textvariable=self.chapter_title_var, font=font(11, "bold")).pack(side=tk.LEFT)
+        legend = ttk.Frame(header)
+        legend.pack(side=tk.RIGHT)
+        for label, style in (("applied", "Applied.State.TLabel"), ("pending", "Pending.State.TLabel"),
+                             ("rejected", "Rejected.State.TLabel"), ("superseded", "Superseded.State.TLabel"),
+                             ("⚠ flagged", "Flag.Badge.TLabel")):
+            ttk.Label(legend, text=label, style=style).pack(side=tk.LEFT, padx=(4, 0))
+        Tooltip(legend, "Click a highlighted passage to open its change in the Segment tab; "
+                        "Alt+A / Alt+R then decide on it.")
+        self.chapter_text = tk.Text(tab, height=20)
+        style_text(self.chapter_text, size=11, readonly=True)
+        self.chapter_text.grid(row=1, column=0, sticky="nsew", padx=(10, 0))
+        scroll = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=self.chapter_text.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.chapter_text.configure(yscrollcommand=scroll.set)
+        self.chapter_text.tag_configure(STATE_APPLIED, foreground=PALETTE["success"], underline=True)
+        self.chapter_text.tag_configure(STATE_PENDING, background=PALETTE["warning_soft"])
+        self.chapter_text.tag_configure(STATE_REJECTED, foreground=PALETTE["muted"], overstrike=True)
+        self.chapter_text.tag_configure(STATE_SUPERSEDED, foreground=PALETTE["muted"], underline=True)
+        self.chapter_text.tag_configure("flagged", foreground=PALETTE["warning"], underline=True)
+        self.chapter_text.tag_configure("current", background=PALETTE["accent_soft"])
+        self.chapter_text.tag_raise("current")
+        self.chapter_text.tag_raise("flagged")
+        self.chapter_text.bind("<Button-1>", self._chapter_clicked)
+        self.chapter_text.configure(cursor="hand2")
+        return tab
+
+    def _build_list_tab(self):
+        """Every pending change of the project in one table with filters and bulk buttons."""
+        tab = ttk.Frame(self.notebook)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        filters = ttk.Frame(tab)
+        filters.grid(row=0, column=0, columnspan=2, sticky="ew", padx=(10, 0), pady=(4, 4))
+        ttk.Label(filters, text="Check:", style="Muted.TLabel").pack(side=tk.LEFT)
+        self.list_check_var = tk.StringVar(value="All")
+        ttk.Combobox(filters, textvariable=self.list_check_var, state="readonly", width=12,
+                     values=["All"] + [CHECK_LABELS[check] for check in CHECKS] + [CHECK_LABELS[CHECK_AUTHOR]]
+                     ).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(filters, text="Kind:", style="Muted.TLabel").pack(side=tk.LEFT)
+        self.list_kind_var = tk.StringVar(value="All")
+        ttk.Combobox(filters, textvariable=self.list_kind_var, state="readonly", width=14,
+                     values=["All"] + [CHANGE_KIND_LABELS[kind] for kind in CHANGE_KINDS]).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(filters, text="Text:", style="Muted.TLabel").pack(side=tk.LEFT)
+        self.list_text_var = tk.StringVar(value="")
+        ttk.Entry(filters, textvariable=self.list_text_var, width=18).pack(side=tk.LEFT, padx=(4, 10))
+        for var in (self.list_check_var, self.list_kind_var, self.list_text_var):
+            var.trace_add("write", lambda *args: self.schedule_list_refresh())
+        self.list_count_var = tk.StringVar(value="")
+        ttk.Label(filters, textvariable=self.list_count_var, style="Muted.TLabel").pack(side=tk.RIGHT)
+
+        columns = ("chapter", "segment", "check", "kind", "change")
+        self.list_tree = ttk.Treeview(tab, columns=columns, show="headings", selectmode="extended")
+        for key, heading, width, stretch in (("chapter", "Chapter", 140, False), ("segment", "Seg.", 50, False),
+                                             ("check", "Check", 90, False), ("kind", "Kind", 100, False),
+                                             ("change", "Original → proposed", 360, True)):
+            self.list_tree.heading(key, text=heading, anchor="w")
+            self.list_tree.column(key, width=width, stretch=stretch, anchor="w")
+        self.list_tree.grid(row=1, column=0, sticky="nsew", padx=(10, 0))
+        scroll = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=self.list_tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.list_tree.configure(yscrollcommand=scroll.set)
+        self.list_tree.tag_configure("flagged", foreground=PALETTE["warning"])
+        self.list_tree.bind("<Double-1>", self._list_jump)
+        self.list_tree.bind("<Return>", self._list_jump)
+        actions = ttk.Frame(tab)
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=(10, 0), pady=(4, 0))
+        ttk.Label(actions, text="Alt+A / Alt+R decide on the selected rows; double-click opens the segment.",
+                  style="Muted.TLabel", font=font(9)).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Reject selected", style="Small.Danger.TButton",
+                   command=lambda: self.decide_listed(REJECTED)).pack(side=tk.RIGHT)
+        ttk.Button(actions, text="Accept selected", style="Small.Success.TButton",
+                   command=lambda: self.decide_listed(ACCEPTED)).pack(side=tk.RIGHT, padx=(0, 6))
+        return tab
+
+    # -------------------------------------------------------- chapter tab
+    def _tab_changed(self, event=None):
+        if self.project is None:
+            return
+        tab = self.notebook.select()
+        if tab == str(self.chapter_tab):
+            self.render_chapter_view()
+        elif tab == str(self.list_tab):
+            self.refresh_list()
+
+    def _tab_visible(self, tab):
+        try:
+            return self.notebook.select() == str(tab)
+        except tk.TclError:
+            return False
+
+    def schedule_chapter_render(self):
+        """Re-render the chapter tab shortly (coalesces bursts of decisions and results)."""
+        if self._chapter_after is not None:
+            try:
+                self.after_cancel(self._chapter_after)
+            except tk.TclError:
+                pass
+        self._chapter_after = self.after(150, self.render_chapter_view)
+
+    def render_chapter_view(self):
+        self._chapter_after = None
+        if self.project is None or not self._tab_visible(self.chapter_tab):
+            return
+        chapter, segment = self._current_segment()
+        if chapter is None:
+            chapter = self.project.chapters[0] if self.project.chapters else None
+        if chapter is None:
+            return
+        text, spans = render_chapter_annotated(self.project, chapter)
+        self.chapter_spans = spans
+        self.chapter_shown = chapter.index
+        counts = {}
+        for span in spans:
+            counts[span["state"]] = counts.get(span["state"], 0) + 1
+        self.chapter_title_var.set("{0}. {1} · {2} words · {3}".format(
+            chapter.index, chapter.title, word_count(text),
+            ", ".join("{0} {1}".format(counts[state], STATE_LABELS[state].lower())
+                      for state in (STATE_PENDING, STATE_APPLIED, STATE_REJECTED, STATE_SUPERSEDED) if counts.get(state))
+            or "no changes"))
+        widget = self.chapter_text
+        top = widget.yview()[0]
+        widget.configure(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", text)
+        for span in spans:
+            start = "1.0+{0}c".format(span["start"])
+            end = "1.0+{0}c".format(span["end"] if span["end"] > span["start"] else span["start"] + 1)
+            widget.tag_add(span["state"], start, end)
+            if span["flags"]:
+                widget.tag_add("flagged", start, end)
+            if segment is not None and span["segment"] == segment.index and span["change_id"] == self.selected_change_id:
+                widget.tag_add("current", start, end)
+        widget.configure(state=tk.DISABLED)
+        widget.yview_moveto(top)
+
+    def _chapter_clicked(self, event):
+        if self.project is None or not self.chapter_spans:
+            return "break"
+        index = self.chapter_text.index("@{0},{1}".format(event.x, event.y))
+        counted = self.chapter_text.count("1.0", index, "chars")
+        offset = counted[0] if counted else 0
+        hit = None
+        for span in self.chapter_spans:
+            end = span["end"] if span["end"] > span["start"] else span["start"] + 1
+            if span["start"] <= offset < end:
+                hit = span
+                if span["state"] == STATE_PENDING:
+                    break  # prefer the change that still needs a decision
+        if hit is None:
+            return "break"
+        self.show_change(self.chapter_shown, hit["segment"], hit["change_id"])
+        self.notebook.select(self.segment_tab)
+        return "break"
+
+    # --------------------------------------------------- all-changes tab
+    def schedule_list_refresh(self):
+        if self._list_after is not None:
+            try:
+                self.after_cancel(self._list_after)
+            except tk.TclError:
+                pass
+        self._list_after = self.after(150, self.refresh_list)
+
+    def _list_filters(self):
+        check = self.list_check_var.get()
+        kind = self.list_kind_var.get()
+        labels_to_check = {label: key for key, label in CHECK_LABELS.items()}
+        labels_to_kind = {label: key for key, label in CHANGE_KIND_LABELS.items()}
+        return labels_to_check.get(check), labels_to_kind.get(kind), self.list_text_var.get().strip().casefold()
+
+    def refresh_list(self):
+        self._list_after = None
+        if self.project is None or not self._tab_visible(self.list_tab):
+            return
+        check, kind, needle = self._list_filters()
+        keep = {iid for iid in self.list_tree.selection()}
+        self.list_tree.delete(*self.list_tree.get_children())
+        self.listed = {}
+        total = 0
+        for chapter, segment, change in pending_changes(self.project):
+            total += 1
+            if check and change.check != check:
+                continue
+            if kind and change.kind != kind:
+                continue
+            if needle and needle not in (change.original_text + " " + change.proposed_text).casefold():
+                continue
+            iid = "l{0}-{1}-{2}".format(chapter.index, segment.index, change.change_id)
+            self.list_tree.insert("", tk.END, iid=iid, tags=("flagged",) if change.flagged else (), values=(
+                chapter.title, segment.index, CHECK_LABELS[change.check], CHANGE_KIND_LABELS[change.kind],
+                "{0} → {1}{2}".format(_one_line(change.original_text) or "∅",
+                                          _one_line(change.proposed_text) or "∅",
+                                          "  ⚠" if change.flagged else ""),
+            ))
+            self.listed[iid] = (chapter.index, segment.index, change.change_id)
+        shown = len(self.listed)
+        self.list_count_var.set("{0} of {1} pending change(s)".format(shown, total) if shown != total
+                                else "{0} pending change(s)".format(total))
+        still = [iid for iid in keep if iid in self.listed]
+        if still:
+            self.list_tree.selection_set(still)
+
+    def _list_jump(self, event=None):
+        selection = self.list_tree.selection()
+        if selection and selection[0] in self.listed:
+            chapter_index, segment_index, change_id = self.listed[selection[0]]
+            self.show_change(chapter_index, segment_index, change_id)
+            self.notebook.select(self.segment_tab)
+        return "break"
+
+    def decide_listed(self, decision):
+        """Accept or reject the rows selected in the all-changes tab as one undo group."""
+        if self.project is None:
+            return 0
+        targets = [self.listed[iid] for iid in self.list_tree.selection() if iid in self.listed]
+        if not targets:
+            self.master.host.set_status("Select one or more rows in the list first.")
+            return 0
+        group = new_decision_group() if len(targets) > 1 else None
+        count = 0
+        for chapter_index, segment_index, change_id in targets:
+            _, segment = self.project.find(chapter_index, segment_index)
+            change = segment.find_change(change_id) if segment is not None else None
+            if change is not None and self.project.decide(chapter_index, segment_index, change, decision, group=group):
+                count += 1
+        self.refresh_all()
+        self._after_decision()
+        self.master.host.set_status("{0} change(s) {1}. Alt+Z reverts them.".format(
+            count, "accepted" if decision == ACCEPTED else "rejected"))
+        return count
+
     # ------------------------------------------------------------- loading
     def load_project(self, project):
         self.project = project
@@ -1301,6 +1556,9 @@ class ProjectView(ttk.Frame):
                                  text="Segment {0} · {1} words".format(segment.index, word_count(segment.text)),
                                  values=("",))
         self.current = None
+        self.chapter_shown = None
+        self.chapter_spans = []
+        self.notebook.select(self.segment_tab)
         self.refresh_all()
         first = self._first_segment_with(lambda status: status == STATUS_READY) or self._first_segment_with(lambda status: True)
         if first:
@@ -1381,6 +1639,8 @@ class ProjectView(ttk.Frame):
             self.retry_button.pack_forget()
         if self.current:
             self.render_segment()
+        self.schedule_chapter_render()
+        self.schedule_list_refresh()
 
     def _segment_status(self, chapter, segment):
         status = segment.status(self.project.enabled)
@@ -1414,6 +1674,9 @@ class ProjectView(ttk.Frame):
             self.check_buttons[check].configure(text="{0} ({1})".format(CHECK_LABELS[check], per["changes"]))
         if self.current == (chapter_index, segment_index):
             self.render_segment()
+        if self.current and self.current[0] == chapter_index:
+            self.schedule_chapter_render()
+        self.schedule_list_refresh()
 
     def _toggle_check(self, check):
         if self.project is None:
@@ -1552,6 +1815,8 @@ class ProjectView(ttk.Frame):
     def select_segment(self, chapter_index, segment_index, from_tree=False, change_id=None):
         self.current = (chapter_index, segment_index)
         self.selected_change_id = change_id
+        if self.chapter_shown != chapter_index:
+            self.schedule_chapter_render()
         if not from_tree:
             iid = self._segment_iid(chapter_index, segment_index)
             try:
@@ -1787,6 +2052,9 @@ class ProjectView(ttk.Frame):
         self.decide(change, REJECTED)
 
     def decide_selected(self, decision):
+        if self._tab_visible(self.list_tab):
+            self.decide_listed(decision)
+            return
         card = self.cards.get(self.selected_change_id)
         if card is not None:
             self.decide(card.change, decision)
@@ -1844,6 +2112,8 @@ class ProjectView(ttk.Frame):
         if segment is not None:
             self._refresh_tree_row(chapter, segment)
         self.master.schedule_save()
+        self.schedule_chapter_render()
+        self.schedule_list_refresh()
 
     def step_change(self, delta, pending_only=False):
         ids = list(self.cards.keys())

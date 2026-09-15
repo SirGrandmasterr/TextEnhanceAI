@@ -66,7 +66,10 @@ from core.workflow import (
     parse_explanations,
     parse_glossary,
     parse_outline,
+    pending_changes,
+    render_chapter_annotated,
     render_segment,
+    render_segment_annotated,
     run_check,
     sanity_check_proposal,
     strip_fences,
@@ -1301,3 +1304,100 @@ def test_edited_and_author_changes_round_trip_and_old_files_default(tmp_path):
     deletion = Change.from_dict({"id": "spelling-9", "check": CHECK_SPELLING, "start": 0, "end": 3,
                                  "original": "Teh", "proposed": ""})
     assert deletion.model_proposed_text == ""  # a deletion is not mistaken for an edit
+
+
+# ------------------------------------------------------------ chapter view
+def _check_spans(text, segment, spans):
+    """Every span must cover exactly the text it stands for.
+
+    A non-applied change that overlaps an applied replacement collapses onto
+    that replacement, so it may cover the replacement's text instead.
+    """
+    applied = [(span["start"], span["end"]) for span in spans if span["state"] == STATE_APPLIED]
+    for span in spans:
+        change = segment.find_change(span["change_id"])
+        covered = text[span["start"]:span["end"]]
+        if span["state"] == STATE_APPLIED:
+            assert covered == change.proposed_text, (span, covered)
+        elif covered != change.original_text:
+            assert any(start <= span["start"] and span["end"] <= end for start, end in applied), (span, covered)
+
+
+def test_annotated_segment_text_equals_render_segment_and_spans_line_up():
+    segment = make_segment()
+    changes = segment.changes(ALL)
+    text, spans = render_segment_annotated(segment, ALL)
+    assert text == render_segment(segment, ALL) == segment.text  # nothing accepted yet
+    assert [span["change_id"] for span in spans] == [change.change_id for change in changes]
+    assert all(span["state"] == STATE_PENDING and span["segment"] == 1 for span in spans)
+    _check_spans(text, segment, spans)
+
+    # accept a replacement (Teh->The), a deletion-like rewrite (very very big -> enormous)
+    # and the overlapping grammar fix that it supersedes, reject the rest
+    for change in changes:
+        change.decision = ACCEPTED if change.check != CHECK_GRAMMAR else REJECTED
+    grammar_was = next(c for c in changes if c.original_text == "were")
+    grammar_was.decision = ACCEPTED  # overlaps nothing, gets applied
+    text, spans = render_segment_annotated(segment, ALL, offset=10)
+    assert text == render_segment(segment, ALL) == "The dog was enormous and it ran fast."
+    shifted = [dict(span, start=span["start"] - 10, end=span["end"] - 10) for span in spans]
+    _check_spans(text, segment, shifted)
+    by_id = {span["change_id"]: span for span in shifted}
+    states = change_states(segment, ALL)
+    assert {span["state"] for span in shifted} == {STATE_APPLIED, STATE_REJECTED, STATE_SUPERSEDED}
+    assert all(by_id[cid]["state"] == state for cid, state in states.items())
+    applied = [span for span in shifted if span["state"] == STATE_APPLIED]
+    assert applied == sorted(applied, key=lambda span: span["start"])
+    assert text[by_id[grammar_was.change_id]["start"]:by_id[grammar_was.change_id]["end"]] == "was"
+
+
+def test_annotated_spans_collapse_inside_replacements_and_handle_insertions_and_deletions():
+    text = "a bb c dd e"
+    segment = Segment(1, text)
+    spelling = extract_changes(text, "a c dd e", CHECK_SPELLING)  # deletion of " bb"
+    grammar = extract_changes(text, "a bb c dd e f", CHECK_GRAMMAR)  # insertion at the end
+    expression = extract_changes(text, "a bb c XX e", CHECK_EXPRESSION)  # replacement of dd
+    segment.results[CHECK_SPELLING] = CheckResult(CHECK_SPELLING, "done", "", spelling)
+    segment.results[CHECK_GRAMMAR] = CheckResult(CHECK_GRAMMAR, "done", "", grammar)
+    segment.results[CHECK_EXPRESSION] = CheckResult(CHECK_EXPRESSION, "done", "", expression)
+    for change in segment.changes(ALL):
+        change.decision = ACCEPTED
+    rendered, spans = render_segment_annotated(segment, ALL)
+    assert rendered == render_segment(segment, ALL)
+    _check_spans(rendered, segment, spans)
+    by_id = {span["change_id"]: span for span in spans}
+    deletion = next(c for c in spelling if c.proposed_text == "")
+    insertion = next(c for c in grammar if c.original_text == "")
+    assert by_id[deletion.change_id]["start"] == by_id[deletion.change_id]["end"]  # zero width in the output
+    assert rendered[by_id[insertion.change_id]["start"]:by_id[insertion.change_id]["end"]] == insertion.proposed_text
+    # a pending change inside an applied replacement collapses onto the replacement
+    segment.results[CHECK_GRAMMAR].changes.append(Change("grammar-9", CHECK_GRAMMAR, 7, 8, "d", "p"))
+    rendered, spans = render_segment_annotated(segment, ALL)
+    inner = next(span for span in spans if span["change_id"] == "grammar-9")
+    outer = next(span for span in spans if span["check"] == CHECK_EXPRESSION)
+    assert inner["state"] == STATE_PENDING
+    assert (inner["start"], inner["end"]) == (outer["start"], outer["end"])
+
+
+def test_render_chapter_annotated_matches_render_chapter_across_segments(tmp_path):
+    project = evaluated_project(tmp_path)
+    for chapter in project.chapters:
+        text, spans = render_chapter_annotated(project, chapter)
+        assert text == project.render_chapter(chapter)
+        for span in spans:
+            _, segment = project.find(chapter.index, span["segment"])
+            _check_spans(text, segment, [span])
+    # accept everything in one chapter and check again, offsets must follow the shifted text
+    chapter = project.chapters[0]
+    listed = [(c.index, s.index, ch.change_id) for c, s, ch in pending_changes(project) if c is chapter]
+    assert listed
+    for _, segment in project.all_segments():
+        for change in segment.changes(ALL):
+            change.decision = ACCEPTED
+    text, spans = render_chapter_annotated(project, chapter)
+    assert text == project.render_chapter(chapter) != chapter.heading + chapter.body + chapter.trailing
+    assert len(spans) == len(listed) and all(span["state"] == STATE_APPLIED for span in spans)
+    for span in spans:
+        _, segment = project.find(chapter.index, span["segment"])
+        assert text[span["start"]:span["end"]] == segment.find_change(span["change_id"]).proposed_text
+    assert list(pending_changes(project)) == []

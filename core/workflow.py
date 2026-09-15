@@ -946,6 +946,90 @@ def render_segment(segment, enabled):
     return "".join(output)
 
 
+def render_segment_annotated(segment, enabled, offset=0):
+    """Render a segment like render_segment() and locate every change in the output.
+
+    Returns ``(text, spans)``; each span is a dict with ``start``/``end`` in
+    output coordinates (shifted by ``offset``), the change's ``state`` (see
+    change_states), ``change_id``, ``segment`` index, ``check`` and ``flags``.
+    Applied changes cover their proposed text, all others (pending, rejected,
+    superseded) the original text they would touch — inside an applied
+    replacement that collapses onto the replacement.
+    """
+    text = segment.text
+    applied = applied_changes(segment, enabled)
+    states = change_states(segment, enabled)
+    # start_map[i]/end_map[i]: where original character i begins/ends in the output
+    start_map = [0] * (len(text) + 1)
+    end_map = [0] * (len(text) + 1)
+    output = []
+    out = offset
+    position = 0
+    replaced = {}
+    for change in applied:
+        for index in range(position, change.start):
+            start_map[index] = out
+            out += 1
+            end_map[index] = out
+        replacement_start = out
+        out += len(change.proposed_text)
+        for index in range(change.start, change.end):
+            start_map[index] = replacement_start
+            end_map[index] = out
+        replaced[change.change_id] = (replacement_start, out)
+        output.append(text[position:change.start])
+        output.append(change.proposed_text)
+        position = change.end
+    for index in range(position, len(text)):
+        start_map[index] = out
+        out += 1
+        end_map[index] = out
+    start_map[len(text)] = end_map[len(text)] = out
+    output.append(text[position:])
+
+    spans = []
+    for change in segment.changes(enabled):
+        if change.change_id in replaced:
+            start, end = replaced[change.change_id]
+        elif change.end > change.start:
+            start, end = start_map[change.start], end_map[change.end - 1]
+        else:
+            start = end = start_map[change.start]
+        spans.append({
+            "start": start, "end": end, "state": states[change.change_id], "change_id": change.change_id,
+            "segment": segment.index, "check": change.check, "flags": list(change.flags),
+        })
+    return "".join(output), spans
+
+
+def render_chapter_annotated(project, chapter):
+    """Render a chapter with its heading and locate every change of every segment.
+
+    The text equals ``project.render_chapter(chapter)``; the spans (see
+    render_segment_annotated) use offsets into that text.
+    """
+    enabled = project.enabled
+    parts = [chapter.heading]
+    spans = []
+    offset = len(chapter.heading)
+    for segment in chapter.segments:
+        rendered, segment_spans = render_segment_annotated(segment, enabled, offset)
+        parts.append(rendered)
+        parts.append(segment.trailing)
+        spans.extend(segment_spans)
+        offset += len(rendered) + len(segment.trailing)
+    parts.append(chapter.trailing)
+    return "".join(parts), spans
+
+
+def pending_changes(project):
+    """Yield (chapter, segment, change) for every pending change in document order."""
+    for chapter, segment in project.all_segments():
+        for change in segment.changes(project.enabled):
+            if change.decision == PENDING:
+                yield chapter, segment, change
+
+
 # ------------------------------------------------------------- creation
 def create_project(source_path, text, options, model="", backend="", root=None):
     """Split a manuscript and return an unevaluated project."""
