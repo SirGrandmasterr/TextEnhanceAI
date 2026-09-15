@@ -12,6 +12,7 @@ the same words, the earlier check wins (spelling > grammar > expression) and
 the other is reported as *superseded* instead of being applied.
 """
 
+import hashlib
 import json
 import os
 import queue
@@ -32,6 +33,8 @@ from .chunking import (
     DEFAULT_TARGET_CHARS,
     chapters_from_outline,
     paragraph_outline,
+    paragraphs,
+    read_text_file,
     split_document,
     split_segments,
     word_count,
@@ -459,7 +462,10 @@ class Project:
     method: str = ""
     # one dict per accept/reject the author made, oldest first; see decide() for the keys
     decision_log: List[dict] = field(default_factory=list)
+    source_sha256: str = ""  # fingerprint of the manuscript text the project was split from
+    source_mtime: float = 0.0
     root: Optional[Path] = field(default=None, repr=False, compare=False)
+    source_check_reason: str = field(default="", repr=False, compare=False)  # set by source_changed()
 
     # ------------------------------------------------------------ queries
     def all_segments(self):
@@ -595,6 +601,48 @@ class Project:
                 else:
                     stats["pending"] += 1
         return stats
+
+    # ------------------------------------------------------------- source
+    def source_changed(self):
+        """Whether the manuscript file differs from the text this project was split from.
+
+        False when the file is missing or the project has no fingerprint; the
+        reason is left in ``source_check_reason`` ("missing", "unknown",
+        "unchanged" or "changed").
+        """
+        path = Path(self.source_path) if self.source_path else None
+        if path is None or not path.is_file():
+            self.source_check_reason = "missing"
+            return False
+        if not self.source_sha256:
+            self.source_check_reason = "unknown"
+            return False
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            self.source_check_reason = "missing"
+            return False
+        if self.source_mtime and abs(mtime - self.source_mtime) < 1e-6:
+            self.source_check_reason = "unchanged"
+            return False
+        try:
+            digest = text_fingerprint(read_text_file(path))
+        except (OSError, UnicodeError):
+            self.source_check_reason = "missing"
+            return False
+        changed = digest != self.source_sha256
+        self.source_check_reason = "changed" if changed else "unchanged"
+        if not changed:
+            self.source_mtime = mtime  # touched but identical: remember so the next check is cheap
+        return changed
+
+    def remember_source(self, text):
+        """Store the fingerprint (and mtime) of ``text`` as the manuscript this project reflects."""
+        self.source_sha256 = text_fingerprint(text)
+        try:
+            self.source_mtime = Path(self.source_path).stat().st_mtime
+        except (OSError, ValueError):
+            self.source_mtime = 0.0
 
     # ---------------------------------------------------------- decisions
     def decide(self, chapter_index, segment_index, change, decision, group=None):
@@ -745,6 +793,8 @@ class Project:
             "options": self.options.to_dict(),
             "chapters": [chapter.to_dict() for chapter in self.chapters],
             "decision_log": [dict(entry) for entry in self.decision_log],
+            "source_sha256": self.source_sha256,
+            "source_mtime": self.source_mtime,
         }
 
     @classmethod
@@ -757,6 +807,8 @@ class Project:
             [Chapter.from_dict(item) for item in data.get("chapters", [])],
             data.get("model", ""), data.get("backend", ""), data.get("method", ""),
             decision_log=[dict(entry) for entry in data.get("decision_log") or []],
+            source_sha256=str(data.get("source_sha256") or ""),
+            source_mtime=float(data.get("source_mtime") or 0.0),
             root=root,
         )
 
@@ -1055,7 +1107,139 @@ def create_project(source_path, text, options, model="", backend="", root=None):
         options, chapters, model, backend, result.method,
         root=Path(root) if root else source_path.with_name(source_path.stem + PROJECT_DIR_SUFFIX),
     )
+    project.remember_source(text)
     return project
+
+
+def text_fingerprint(text):
+    """SHA-256 of the manuscript text (after read_text_file's newline normalisation)."""
+    return hashlib.sha256(text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")).hexdigest()
+
+
+def _chapters_for_resync(project, text):
+    """Split ``text`` the way the project was split; model-chosen boundaries are kept by matching.
+
+    For ``chapter_mode == "model"`` each old chapter's first paragraph is looked
+    up in the new text; when every chapter is found again the old boundaries
+    (and titles) are reused, otherwise the automatic split is the fallback.
+    """
+    options = project.options
+    if options.chapter_mode == "model" and len(project.chapters) > 1:
+        new_paragraphs = [paragraph.strip() for paragraph, _ in paragraphs(text)]
+        starts = []
+        for chapter in project.chapters[1:]:
+            first = next((segment.text for segment in chapter.segments if segment.text.strip()), "")
+            lead = first.strip().split("\n\n")[0].strip()
+            index = next((number for number, paragraph in enumerate(new_paragraphs) if lead and paragraph == lead), None)
+            if index is None or (starts and index <= starts[-1]):
+                starts = None
+                break
+            starts.append(index)
+        if starts:
+            result = chapters_from_outline(text, starts, [chapter.title for chapter in project.chapters])
+            for chapter in result.chapters:
+                chapter.segments = split_segments(chapter.body, options.target_chars, options.max_chars)
+            return result
+    return split_document(
+        text, mode="auto" if options.chapter_mode == "model" else options.chapter_mode,
+        target_chars=options.target_chars, max_chars=options.max_chars, max_chapter_chars=options.max_chapter_chars,
+    )
+
+
+def resync_project(project, new_text):
+    """Re-split the changed manuscript and carry results and decisions over to identical segments.
+
+    Segments are matched by exact text (duplicates pair up in order). Unmatched
+    old segments that still carry pending or accepted changes are written to
+    ``<root>/resync-<timestamp>.md`` before they are dropped. Decision-log
+    entries are re-pointed at the kept segments' new positions, those of
+    dropped segments are marked stale, and a stale "resync" marker entry
+    records the summary. Returns ``{"kept", "new", "removed", "chapters", "report"}``.
+    """
+    result = _chapters_for_resync(project, new_text)
+    pool = {}
+    for chapter in project.chapters:
+        for segment in chapter.segments:
+            pool.setdefault(segment.text, []).append((chapter.index, segment.index, segment))
+    kept = new = 0
+    remap = {}
+    chapters = []
+    for chapter in result.chapters:
+        segments = []
+        for piece in chapter.segments:
+            candidates = pool.get(piece.text)
+            if candidates:
+                old_chapter, old_index, old_segment = candidates.pop(0)
+                segment = Segment(piece.index, piece.text, piece.trailing, old_segment.results)
+                remap[(old_chapter, old_index)] = (chapter.index, piece.index)
+                kept += 1
+            else:
+                segment = Segment(piece.index, piece.text, piece.trailing)
+                if piece.text.strip():
+                    new += 1
+            segments.append(segment)
+        chapters.append(Chapter(chapter.index, chapter.title, chapter.heading, chapter.trailing, segments))
+
+    dropped = [(chapter_index, segment_index, segment) for entries in pool.values()
+               for chapter_index, segment_index, segment in entries if segment.text.strip()]
+    report = None
+    if project.root is not None:
+        report = _write_resync_report(project, dropped)
+    removed = len(dropped)
+    dropped_keys = {(chapter_index, segment_index) for chapter_index, segment_index, _ in dropped}
+    for entry in project.decision_log:
+        key = (entry.get("chapter"), entry.get("segment"))
+        if key in remap:
+            entry["chapter"], entry["segment"] = remap[key]
+        elif key in dropped_keys or entry.get("chapter") is not None:
+            entry["stale"] = True
+    project.chapters = chapters
+    project.method = result.method
+    project.remember_source(new_text)
+    summary = {"kept": kept, "new": new, "removed": removed, "chapters": len(chapters), "report": report}
+    project.decision_log.append({
+        "ts": datetime.now().isoformat(timespec="seconds"), "chapter": None, "segment": None, "change_id": None,
+        "before": None, "after": None, "group": None, "stale": True,
+        "resync": {"kept": kept, "new": new, "removed": removed},
+    })
+    project._trim_log()
+    return summary
+
+
+def _write_resync_report(project, dropped):
+    """List the pending and accepted changes of segments that a re-sync dropped; None when there are none."""
+    enabled = project.enabled
+    lines = []
+    for chapter_index, segment_index, segment in dropped:
+        changes = [change for change in segment.changes(enabled) if change.decision != REJECTED]
+        if not changes:
+            continue
+        chapter, _ = project.find(chapter_index, segment_index)
+        title = chapter.title if chapter is not None else str(chapter_index)
+        lines.append("## {0} · segment {1}\n".format(title, segment_index))
+        lines.append("> " + segment.text.strip().replace("\n", "\n> ") + "\n")
+        states = change_states(segment, enabled)
+        for change in changes:
+            lines.append("- [{0}] `{1}` → `{2}` — {3}".format(
+                CHECK_LABELS[change.check], _inline(change.original_text), _inline(change.proposed_text),
+                states[change.change_id]))
+        lines.append("")
+    if not lines:
+        return None
+    project.root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = project.root / "resync-{0}.md".format(stamp)
+    number = 1
+    while path.exists():
+        number += 1
+        path = project.root / "resync-{0}-{1}.md".format(stamp, number)
+    header = [
+        "# Changes dropped by the re-sync of {0}\n".format(project.name),
+        "The manuscript changed and these segments no longer exist in it. Their pending and accepted "
+        "changes are listed here so that nothing is lost silently.\n",
+    ]
+    path.write_text("\n".join(header + lines), encoding="utf-8")
+    return path
 
 
 def apply_model_outline(project, text, starts, titles=None):

@@ -44,6 +44,7 @@ from core.workflow import (
     pending_changes,
     render_chapter_annotated,
     render_segment,
+    resync_project,
 )
 from .theme import CHECK_COLORS, PALETTE, STATUS_COLORS, ScrollableFrame, Tooltip, font, style_text
 
@@ -240,6 +241,13 @@ class DecisionLogDialog(tk.Toplevel):
             self.tree.insert("", tk.END, values=("", "", "", "No decisions yet.", ""))
             return
         for position, entry in enumerate(reversed(log)):
+            if entry.get("resync"):
+                summary = entry["resync"]
+                self.tree.insert("", tk.END, iid="d{0}".format(position), tags=("stale",), values=(
+                    str(entry.get("ts", "")).replace("T", " "), "—", "",
+                    "Re-synced with the manuscript: {0} segment(s) kept, {1} new, {2} removed".format(
+                        summary.get("kept", 0), summary.get("new", 0), summary.get("removed", 0)), ""))
+                continue
             chapter, segment = self.project.find(entry["chapter"], entry["segment"])
             change = segment.find_change(entry["change_id"]) if segment is not None else None
             if change is not None:
@@ -263,7 +271,7 @@ class DecisionLogDialog(tk.Toplevel):
     def _jump(self, event=None):
         selection = self.tree.selection()
         entry = self.entries.get(selection[0]) if selection else None
-        if entry is not None:
+        if entry is not None and entry.get("chapter") is not None:
             # A stale entry's change was replaced by a re-evaluation: only the segment is left to show.
             self.on_jump(entry["chapter"], entry["segment"], None if entry.get("stale") else entry["change_id"])
         return "break"
@@ -487,6 +495,8 @@ class WorkflowScreen(ttk.Frame):
         self.project = project
         self.project_view.load_project(project)
         self.show_project()
+        if project.source_changed() and self._offer_resync():
+            return
         pending = project.pending_tasks()
         if pending:
             if messagebox.askyesno(
@@ -497,6 +507,79 @@ class WorkflowScreen(ttk.Frame):
                 self.resume_runner()
                 return
         self.host.set_status("Project opened. {0}".format(self.project_view.summary_text()))
+
+    # -------------------------------------------------------------- source
+    def check_source(self):
+        """The "Check source" button: compare the manuscript file with the project and offer a re-sync."""
+        if self.project is None:
+            return
+        project = self.project
+        if project.source_changed():
+            self._offer_resync()
+            return
+        reason = project.source_check_reason
+        if reason == "missing":
+            messagebox.showwarning("Manuscript not found",
+                                   "The manuscript file was not found:\n{0}".format(project.source_path))
+        elif reason == "unknown":
+            if messagebox.askyesno(
+                "Re-sync?",
+                "This project was created before source tracking existed, so changes to the manuscript cannot be "
+                "detected automatically.\n\nRe-sync with the current file now? Segments with identical text keep "
+                "their results and decisions; new or edited segments are evaluated again.",
+            ):
+                self.resync()
+        else:
+            self.host.set_status("The manuscript has not changed since the project was created.")
+
+    def _offer_resync(self):
+        """Ask whether to re-sync a changed manuscript; returns whether a re-sync was done."""
+        if not messagebox.askyesno(
+            "Manuscript changed",
+            "The manuscript changed since the project was created. Re-sync?\n\nSegments with identical text keep "
+            "their results and decisions; new or edited segments are evaluated again. Pending changes of "
+            "segments that no longer exist are written to a resync-*.md file in the project folder.",
+        ):
+            self.host.set_status("The manuscript file changed; use “Check source” to re-sync later.")
+            return False
+        return self.resync()
+
+    def resync(self):
+        """Re-split the current manuscript file and carry decisions over; returns whether it happened."""
+        if self.project is None:
+            return False
+        if self.evaluating:
+            messagebox.showinfo("Evaluation running", "Pause the evaluation before re-syncing the manuscript.")
+            return False
+        try:
+            text = read_text_file(self.project.source_path)
+        except OSError as exc:
+            messagebox.showerror("Cannot read manuscript", str(exc))
+            return False
+        if not text.strip():
+            messagebox.showinfo("Empty file", "The manuscript file contains no text; nothing was changed.")
+            return False
+        summary = resync_project(self.project, text)
+        self.running_tasks = set()
+        try:
+            self.project.write_chapter_files()
+        except OSError:
+            pass
+        self._save_now()
+        self.project_view.load_project(self.project)
+        self._refresh_decision_dialog()
+        message = "Re-synced: {0} segment(s) kept, {1} new, {2} removed, {3} chapter(s).".format(
+            summary["kept"], summary["new"], summary["removed"], summary["chapters"])
+        if summary["report"]:
+            message += " Dropped changes were written to {0}.".format(summary["report"].name)
+        self.host.set_status(message)
+        pending = self.project.pending_tasks()
+        if pending and messagebox.askyesno(
+                "Evaluate now?", "{0}\n\n{1} check(s) are missing for the new or edited segments. Evaluate them now?"
+                .format(message, len(pending))):
+            self.host.lock_controls(True)
+            self.resume_runner()
+        return True
 
     def resume_runner(self):
         if self.project is None or self.evaluating:
@@ -1309,6 +1392,10 @@ class ProjectView(ttk.Frame):
         ttk.Button(buttons, text="Options...", command=self.on_options).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(buttons, text="Decisions...", command=lambda: self.master.show_decisions()).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(buttons, text="Statistics...", command=lambda: self.master.show_statistics()).pack(side=tk.LEFT, padx=(6, 0))
+        check_source = ttk.Button(buttons, text="Check source", command=lambda: self.master.check_source())
+        check_source.pack(side=tk.LEFT, padx=(6, 0))
+        Tooltip(check_source, "Compare the manuscript file with this project and re-sync when it changed: "
+                              "unchanged segments keep their results and decisions.")
         ttk.Button(buttons, text="Export...", style="Accent.TButton", command=self.on_export).pack(side=tk.LEFT, padx=6)
         ttk.Button(buttons, text="Close project", style="Ghost.TButton", command=self.on_close).pack(side=tk.LEFT)
 

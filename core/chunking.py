@@ -289,8 +289,12 @@ def paragraph_outline(text, max_paragraphs=400, preview_chars=100):
 
 
 # ---------------------------------------------------------------- segments
-def _paragraphs(text):
+def paragraphs(text):
     """Return [(paragraph_text, following_separator)] preserving every character."""
+    return _paragraphs(text)
+
+
+def _paragraphs(text):
     result = []
     position = 0
     for match in _PARAGRAPH_BREAK.finditer(text):

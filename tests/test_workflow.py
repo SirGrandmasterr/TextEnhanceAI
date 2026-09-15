@@ -1,9 +1,11 @@
 """Tests for the automatic manuscript workflow (core logic, no Tk)."""
 
 import json
+import os
 import queue
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -46,6 +48,7 @@ from core.workflow import (
     ProjectOptions,
     ProjectRunner,
     Segment,
+    apply_model_outline,
     apply_result,
     applied_changes,
     build_check_instruction,
@@ -70,6 +73,8 @@ from core.workflow import (
     render_chapter_annotated,
     render_segment,
     render_segment_annotated,
+    resync_project,
+    text_fingerprint,
     run_check,
     sanity_check_proposal,
     strip_fences,
@@ -1401,3 +1406,148 @@ def test_render_chapter_annotated_matches_render_chapter_across_segments(tmp_pat
         _, segment = project.find(chapter.index, span["segment"])
         assert text[span["start"]:span["end"]] == segment.find_change(span["change_id"]).proposed_text
     assert list(pending_changes(project)) == []
+
+
+# ------------------------------------------------------------------ re-sync
+def _source(project):
+    return Path(project.source_path)
+
+
+def test_unchanged_source_is_detected_cheaply_and_resync_is_a_noop(tmp_path):
+    project = evaluated_project(tmp_path)
+    assert project.source_sha256 == text_fingerprint(MANUSCRIPT) and project.source_mtime > 0
+    assert project.source_changed() is False and project.source_check_reason == "unchanged"
+    # touched but identical content: the hash decides, and the new mtime is remembered
+    os.utime(str(_source(project)), (time.time() + 5, time.time() + 5))
+    assert project.source_changed() is False and project.source_check_reason == "unchanged"
+    assert abs(project.source_mtime - _source(project).stat().st_mtime) < 1e-6
+
+    segment = next(s for _, s in project.all_segments() if s.changes(ALL))
+    change = segment.changes(ALL)[0]
+    project.decide(1, segment.index, change, ACCEPTED)
+    before = {(c.index, s.index): [ch.to_dict() for ch in s.changes(ALL)] for c, s in project.all_segments()}
+    summary = resync_project(project, MANUSCRIPT)
+    assert summary["new"] == 0 and summary["removed"] == 0 and summary["report"] is None
+    assert summary["kept"] == sum(len(c.segments) for c in project.chapters) and summary["chapters"] == 2
+    after = {(c.index, s.index): [ch.to_dict() for ch in s.changes(ALL)] for c, s in project.all_segments()}
+    assert after == before
+    assert project.pending_tasks() == []
+    marker = project.decision_log[-1]
+    assert marker["resync"] == {"kept": summary["kept"], "new": 0, "removed": 0} and marker["stale"] is True
+    assert project.undo()[0]["change_id"] == change.change_id  # the marker is skipped, the decision reverts
+
+
+def test_edited_paragraph_becomes_a_new_segment_while_others_keep_their_decisions(tmp_path):
+    project = evaluated_project(tmp_path)
+    first = project.chapters[0].segments[0]
+    change = next(c for c in first.changes(ALL) if c.original_text == "Teh")
+    entry = project.decide(1, 1, change, ACCEPTED)
+    edited = MANUSCRIPT.replace("settled quietly over the small town", "settled QUIETLY over the small town", 1)
+    assert edited != MANUSCRIPT
+    _source(project).write_text(edited, encoding="utf-8")
+    os.utime(str(_source(project)), (time.time() + 5, time.time() + 5))
+    assert project.source_changed() is True and project.source_check_reason == "changed"
+
+    summary = resync_project(project, edited)
+    assert (summary["kept"], summary["new"], summary["removed"]) == (2, 1, 1)
+    assert summary["report"] is None  # the dropped filler segment had no changes
+    kept = project.chapters[0].segments[0]
+    assert kept.find_change(change.change_id).decision == ACCEPTED and kept.results
+    fresh = project.chapters[0].segments[1]
+    assert "QUIETLY" in fresh.text and fresh.results == {}
+    assert sorted(project.pending_tasks()) == sorted((1, 2, check) for check in CHECKS)
+    assert project.chapters[1].segments[0].results
+    assert project.source_changed() is False and project.source_sha256 == text_fingerprint(edited)
+    # the decision log still points at the kept segment and undo works
+    assert entry in project.decision_log and entry.get("stale") is None
+    assert project.undo() == [entry] and kept.find_change(change.change_id).decision == PENDING
+
+    project.save()
+    reloaded = Project.load(project.root)
+    assert reloaded.source_sha256 == project.source_sha256 and reloaded.source_mtime == project.source_mtime
+    assert len(reloaded.pending_tasks()) == len(CHECKS)
+
+
+def test_deleted_paragraph_with_pending_changes_is_written_to_a_resync_report(tmp_path):
+    project = evaluated_project(tmp_path)
+    first = project.chapters[0].segments[0]
+    changes = first.changes(ALL)
+    assert changes
+    project.decide(1, 1, changes[0], ACCEPTED)
+    project.decide(1, 1, changes[1], REJECTED)
+    kept_entries = [dict(entry) for entry in project.decision_log]
+    shortened = MANUSCRIPT.replace("Teh dog were very very big. It run fast.\n\n", "")
+    summary = resync_project(project, shortened)
+    assert summary["removed"] == 1 and summary["new"] == 0
+    report = summary["report"]
+    assert report is not None and report.parent == project.root and report.name.startswith("resync-")
+    text = report.read_text(encoding="utf-8")
+    assert "Kapitel 1 · segment 1" in text and "Teh dog were very very big" in text
+    assert "`Teh` → `The` — applied" in text
+    assert changes[1].original_text in text and "rejected" not in text.split("\n> ")[-1].split("- [")[0]
+    assert all(entry["stale"] is True for entry in project.decision_log[:2])
+    assert [entry["change_id"] for entry in project.decision_log[:2]] == [e["change_id"] for e in kept_entries]
+    assert project.undo() is None  # nothing live is left to undo
+    # a second re-sync with dropped changes gets its own file
+    project.chapters[0].segments[0].results[CHECK_SPELLING] = CheckResult(
+        CHECK_SPELLING, "done", "", [Change("spelling-1", CHECK_SPELLING, 0, 3, "The", "Teh")])
+    other = resync_project(project, "Kapitel 1\n\nSomething else entirely.\n")
+    assert other["report"] is not None and other["report"] != report and other["report"].exists()
+
+
+def test_duplicate_segments_pair_up_in_order(tmp_path):
+    text = "Kapitel 1\n\n" + FILLER + "\n\n" + FILLER + "\n\n" + FILLER + "\n"
+    source = tmp_path / "twins.txt"
+    source.write_text(text, encoding="utf-8")
+    project = create_project(source, text, ProjectOptions(target_chars=200, max_chars=400), model="m", backend="fake")
+    segments = [segment for segment in project.chapters[0].segments if segment.text == FILLER]
+    assert len(segments) == 3
+    for number, segment in enumerate(segments, 1):
+        segment.results[CHECK_SPELLING] = CheckResult(CHECK_SPELLING, "done", "", [
+            Change("spelling-1", CHECK_SPELLING, 0, 3, "The", "Ze{0}".format(number))])
+    # drop the middle twin: the first two new segments take the first two old ones, in order
+    summary = resync_project(project, "Kapitel 1\n\n" + FILLER + "\n\n" + FILLER + "\n")
+    assert (summary["new"], summary["removed"]) == (0, 1)
+    proposed = [s.results[CHECK_SPELLING].changes[0].proposed_text
+                for s in project.chapters[0].segments if s.text == FILLER]
+    assert proposed == ["Ze1", "Ze2"]
+    assert summary["report"] is not None and "Ze3" in summary["report"].read_text(encoding="utf-8")
+
+
+def test_resync_keeps_model_chapter_boundaries_when_their_first_paragraphs_survive(tmp_path):
+    text = "Once upon a time.\n\n" + FILLER + "\n\nThe next morning.\n\n" + FILLER + "\n"
+    source = tmp_path / "model.txt"
+    source.write_text(text, encoding="utf-8")
+    project = create_project(source, text, ProjectOptions(target_chars=200, max_chars=400, chapter_mode="model"),
+                             model="m", backend="fake")
+    apply_model_outline(project, text, [2], ["Dawn", "Morning"])
+    assert [c.title for c in project.chapters] == ["Dawn", "Morning"] and project.method == "model"
+    for _, segment in project.all_segments():
+        segment.results[CHECK_SPELLING] = CheckResult(CHECK_SPELLING, "done", segment.text)
+
+    changed = text.replace("Once upon a time.", "Once upon a time, long ago.")
+    summary = resync_project(project, changed)
+    assert [c.title for c in project.chapters] == ["Dawn", "Morning"]
+    assert project.chapters[1].segments[0].text.startswith("The next morning.")
+    assert summary["removed"] == 1 and summary["new"] == 1
+    assert project.chapters[1].segments[0].results  # the second chapter's segments were kept
+
+    # when a chapter's first paragraph is gone the automatic split is the fallback
+    fallback = changed.replace("The next morning.", "Later.")
+    resync_project(project, fallback)
+    assert project.method != "model" and len(project.chapters) >= 1
+
+
+def test_source_tracking_reports_missing_files_and_old_projects(tmp_path):
+    project = make_project(tmp_path)
+    data = project.to_dict()
+    del data["source_sha256"]
+    del data["source_mtime"]
+    old = Project.from_dict(data, root=project.root)
+    assert old.source_sha256 == "" and old.source_mtime == 0.0
+    assert old.source_changed() is False and old.source_check_reason == "unknown"
+    _source(project).unlink()
+    assert project.source_changed() is False and project.source_check_reason == "missing"
+    project.source_path = ""
+    assert project.source_changed() is False and project.source_check_reason == "missing"
+    assert text_fingerprint("a\r\nb") == text_fingerprint("a\nb")
