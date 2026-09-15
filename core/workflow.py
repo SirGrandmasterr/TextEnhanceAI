@@ -67,13 +67,14 @@ CHECK_INSTRUCTIONS = {
         "Fix grammar and punctuation errors only: agreement, tense, cases, articles, "
         "prepositions, missing or misplaced commas, sentence fragments, and run-on "
         "sentences. Keep the author's wording and style; do not rephrase sentences "
-        "that are already correct."
+        "that are already correct. Do not rewrite sentences."
     ),
     CHECK_EXPRESSION: (
         "Improve expression only where it clearly helps: replace awkward, repetitive, "
         "vague, or unidiomatic phrasing with clearer and more natural wording. "
         "Preserve the author's voice, tone, meaning, and rhythm; leave sentences that "
-        "already read well untouched, and never add new content."
+        "already read well untouched, and never add new content. Never add facts, "
+        "names, clauses or sentences that are not already in the text."
     ),
 }
 FALLBACK_EXPLANATIONS = {
@@ -101,6 +102,50 @@ GLOSSARY_MAX_CHARS = 2000
 GLOSSARY_HEADER = "Protected terms — never change their spelling, capitalization or form: "
 GLOSSARY_CONTEXT = 20  # characters around an insertion point checked against the glossary
 GLOSSARY_EXPLANATION = "Suppressed: touches a protected term."
+
+# Hallucination guard: heuristics that mark a change as possibly inventing
+# content rather than correcting it (see ``flag_suspicious``).
+FLAG_GROWTH = "growth"
+FLAG_NOVEL_WORDS = "novel_words"
+FLAG_REWRITE_IN_STRICT_CHECK = "rewrite_in_strict_check"
+FLAG_LABELS = {
+    FLAG_GROWTH: "The replacement is much longer than the text it replaces.",
+    FLAG_NOVEL_WORDS: "Adds words that appear nowhere else in the segment.",
+    FLAG_REWRITE_IN_STRICT_CHECK: "A spelling or grammar check rewrote a whole phrase.",
+}
+FLAG_REPORT_MARK = "\u26a0 possibly invented"
+GROWTH_FACTOR = 1.6
+GROWTH_SLACK = 12
+NOVEL_MIN_WORDS = 2
+NOVEL_MIN_LENGTH = 4
+STRICT_CHECKS = (CHECK_SPELLING, CHECK_GRAMMAR)
+# Function words (>= 4 letters) that never count as "novel" content, German and English.
+STOPWORDS = frozenset("""
+about above after again against alone along already also although always among another anyone anything
+around because been before being below between both cannot could does doing done down during each either
+else enough even ever every everything from further having here hers herself himself however into itself
+just last less like many might more most much must myself neither never nevertheless next nobody none
+nothing often once only other ours ourselves over perhaps quite rather really same several shall should
+since some something sometimes soon still such than that their theirs them themselves then there these
+they things this those though through thus toward towards under until upon very were what whatever when
+whenever where whether which while whom whose will with within without would yours yourself
+aber alle allem allen aller allerdings alles also andere anderem anderen anderer anderes auch aufs beide
+beiden beim bereits bevor bloss bloß dabei dadurch dafür dagegen daher damit danach dann daran darauf
+daraus darin darum darunter dass davon dazu dein deine deinem deinen deiner deines denen denn dennoch deren
+derer deshalb dessen desto dich diese diesem diesen dieser dieses doch dort durch eben eher eine einem einen
+einer eines einige einigen einiger einiges einmal entweder erst etwa etwas euch euer eure eurem euren eurer
+eures falls ganz gegen gern gewesen haben habt hast hatte hatten hätte hätten hier hinter ihre ihrem ihren
+ihrer ihres immer indem innerhalb irgend jede jedem jeden jeder jedes jedoch jene jenem jenen jener jenes
+jetzt kann kannst kaum kein keine keinem keinen keiner keines können könnt könnte könnten machen mehr mein
+meine meinem meinen meiner meines muss musst musste müssen nach nachdem neben nicht nichts noch nochmals nun
+obwohl oder ohne schon sehr sein seine seinem seinen seiner seines seit seitdem selbst sich sind soll sollen
+sollte sollten solche solchem solchen solcher solches somit sondern sonst soweit sowie sowohl trotz trotzdem
+über überhaupt unser unsere unserem unseren unserer unseres unter viel viele vielem vielen vieler vielleicht
+vom von vor während wann waren warst warum weder weil weiter weitere weiterem weiteren weiterer weiteres
+welche welchem welchen welcher welches wenig wenige weniger wenn werde werden werdet wieder wird wirst wobei
+wodurch wohl wollen wollte wollten worden wurde wurden würde würden zwar zwischen
+""".split())
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 STATUS_QUEUED = "queued"
 STATUS_ERROR = "error"
@@ -135,10 +180,16 @@ class Change:
     explanation: str = ""
     decision: str = PENDING
     kind: str = ""
+    flags: List[str] = field(default_factory=list)  # hallucination-guard reason ids, see flag_suspicious
 
     def __post_init__(self):
         if self.kind not in CHANGE_KINDS:
             self.kind = classify_change(self.original_text, self.proposed_text)
+        self.flags = [str(flag) for flag in (self.flags or []) if flag]
+
+    @property
+    def flagged(self):
+        return bool(self.flags)
 
     @property
     def priority(self):
@@ -155,6 +206,7 @@ class Change:
             "explanation": self.explanation,
             "decision": self.decision,
             "kind": self.kind,
+            "flags": list(self.flags),
         }
 
     @classmethod
@@ -163,7 +215,7 @@ class Change:
             data["id"], data["check"], int(data["start"]), int(data["end"]),
             data.get("original", ""), data.get("proposed", ""),
             data.get("explanation", ""), data.get("decision", PENDING),
-            data.get("kind") or "",
+            data.get("kind") or "", list(data.get("flags") or []),
         )
 
 
@@ -402,10 +454,10 @@ class Project:
         stats = {
             "segments": 0, "queued": 0, "error": 0, "clean": 0, "ready": 0, "reviewed": 0,
             "tasks_total": 0, "tasks_done": 0, "changes": 0, "accepted": 0, "rejected": 0, "pending": 0,
-            "suppressed": 0, "words": 0,
+            "suppressed": 0, "flagged": 0, "flagged_pending": 0, "words": 0,
             "per_check": {
                 check: {
-                    "changes": 0, "accepted": 0, "rejected": 0, "suppressed": 0,
+                    "changes": 0, "accepted": 0, "rejected": 0, "suppressed": 0, "flagged": 0,
                     "by_kind": {kind: 0 for kind in CHANGE_KINDS},
                 }
                 for check in CHECKS
@@ -436,6 +488,11 @@ class Project:
                 per_check["changes"] += 1
                 per_check["by_kind"][change.kind] += 1
                 per_kind["changes"] += 1
+                if change.flagged:
+                    stats["flagged"] += 1
+                    per_check["flagged"] += 1
+                    if change.decision == PENDING:
+                        stats["flagged_pending"] += 1
                 if change.decision == ACCEPTED:
                     stats["accepted"] += 1
                     per_check["accepted"] += 1
@@ -558,6 +615,8 @@ class Project:
                 ))
             if per["suppressed"]:
                 lines.append("    - Glossary suppressed {0} proposed change(s)".format(per["suppressed"]))
+            if per["flagged"]:
+                lines.append("    - {0}: {1} change(s) flagged".format(FLAG_REPORT_MARK, per["flagged"]))
         lines.append("")
         for chapter in self.chapters:
             lines.append("## {0}. {1}\n".format(chapter.index, chapter.title))
@@ -570,11 +629,14 @@ class Project:
                 states = change_states(segment, self.enabled)
                 lines.append("- Segment {0}: {1} change(s), {2}".format(segment.index, len(changes), status))
                 for change in changes:
-                    lines.append("  - [{0}] `{1}` → `{2}` — {3} — {4}".format(
+                    line = "  - [{0}] `{1}` → `{2}` — {3} — {4}".format(
                         CHECK_LABELS[change.check],
                         _inline(change.original_text), _inline(change.proposed_text),
                         states[change.change_id], change.explanation or FALLBACK_EXPLANATIONS[change.check],
-                    ))
+                    )
+                    if change.flagged:
+                        line += " — {0} ({1})".format(FLAG_REPORT_MARK, ", ".join(change.flags))
+                    lines.append(line)
             lines.append("")
         return "\n".join(lines)
 
@@ -840,6 +902,52 @@ def suppress_glossary_changes(text, changes, matcher):
     return kept, suppressed
 
 
+# ---------------------------------------------------- hallucination guard
+def content_words(text):
+    """Return the lower-cased words of ``text`` that can carry content (long enough, not stopwords)."""
+    return {
+        word for word in _WORD_RE.findall((text or "").lower())
+        if len(word) >= NOVEL_MIN_LENGTH and word not in STOPWORDS
+    }
+
+
+def novel_words(segment_text, proposed_text):
+    """Return the content words of ``proposed_text`` that occur nowhere in ``segment_text`` (case-insensitive)."""
+    known = set(_WORD_RE.findall((segment_text or "").lower()))
+    return sorted(word for word in content_words(proposed_text) if word not in known)
+
+
+def flag_suspicious(segment_text, change):
+    """Return a reason id when ``change`` looks like added content rather than a correction, else ``None``.
+
+    Rules, first match wins: ``growth`` (the replacement is far longer than the
+    original), ``novel_words`` (at least ``NOVEL_MIN_WORDS`` content words that
+    appear nowhere in the segment) and ``rewrite_in_strict_check`` (a spelling
+    or grammar check produced a ``rewrite``-kind change).
+    """
+    original = change.original_text
+    proposed = change.proposed_text
+    if len(proposed) > GROWTH_FACTOR * len(original) + GROWTH_SLACK:
+        return FLAG_GROWTH
+    if len(novel_words(segment_text, proposed)) >= NOVEL_MIN_WORDS:
+        return FLAG_NOVEL_WORDS
+    if change.kind == "rewrite" and change.check in STRICT_CHECKS:
+        return FLAG_REWRITE_IN_STRICT_CHECK
+    return None
+
+
+def flag_changes(segment_text, changes):
+    """Append the ``flag_suspicious`` reason to every change it fires on; returns the flagged ones."""
+    flagged = []
+    for change in changes:
+        reason = flag_suspicious(segment_text, change)
+        if reason and reason not in change.flags:
+            change.flags.append(reason)
+        if reason:
+            flagged.append(change)
+    return flagged
+
+
 def build_check_instruction(check, options=None, style_guide=None, glossary=None):
     """Return the instruction sent for ``check`` with the author's rules and protected terms appended.
 
@@ -990,6 +1098,7 @@ def run_check(service, model, text, check, cancel_event, explain=True, language=
                 raise EditCancelled("Editing was cancelled.")
 
     changes, suppressed = suppress_glossary_changes(text, extract_changes(text, proposed, check), glossary_matcher(glossary))
+    flag_changes(text, changes)
     explained = False
     explanations = {}
     if changes and explain:
