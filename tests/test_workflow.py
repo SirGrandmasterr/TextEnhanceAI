@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from core.backend import BackendUnavailable, EditCancelled, OutputTruncated
+from core.backend import BackendUnavailable, EditCancelled, OutputTruncated, StructuredOutputUnsupported
 from core.models import ACCEPTED, PENDING, REJECTED
 from core.change_kinds import CHANGE_KIND_LABELS, CHANGE_KINDS, levenshtein
 from core.workflow import (
@@ -22,7 +22,12 @@ from core.workflow import (
     CHECK_INSTRUCTIONS,
     CHECK_SPELLING,
     CHECKS,
+    CANNED_EXPLANATIONS,
+    COMBINED_SCHEMA,
     DECISION_LOG_LIMIT,
+    EVALUATION_COMBINED,
+    EVALUATION_SEPARATE,
+    EXPLANATION_GROUP_SIZE,
     FLAG_GROWTH,
     FLAG_NOVEL_WORDS,
     FLAG_REPORT_MARK,
@@ -52,10 +57,17 @@ from core.workflow import (
     apply_result,
     applied_changes,
     build_check_instruction,
+    build_combined_messages,
     build_explanation_messages,
+    build_grouped_explanation_messages,
+    canned_explanation,
     change_states,
     classify_change,
     create_project,
+    detect_language,
+    evaluate,
+    explain_result,
+    explanation_language,
     extract_changes,
     flag_changes,
     flag_suspicious,
@@ -66,6 +78,7 @@ from core.workflow import (
     new_decision_group,
     normalise_style_guide,
     novel_words,
+    parse_combined,
     parse_explanations,
     parse_glossary,
     parse_outline,
@@ -73,9 +86,11 @@ from core.workflow import (
     render_chapter_annotated,
     render_segment,
     render_segment_annotated,
+    request_explanations,
     resync_project,
     text_fingerprint,
     run_check,
+    run_segment_combined,
     sanity_check_proposal,
     strip_fences,
     suppress_glossary_changes,
@@ -337,12 +352,45 @@ class FakeService:
             return text.replace("were", "was")
         return "```\n" + text.replace("very very", "extremely") + "\n```"
 
-    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None):
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
+        content = messages[1]["content"]
+        if content.startswith("Review the text below"):
+            with self.lock:
+                self.calls.append(("combined", content[:20], response_format is not None))
+            return self.combined_answer(content, response_format)
         with self.lock:
-            self.calls.append(("explain", messages[1]["content"][:20], None))
-            self.prompts.append(messages[1]["content"])
-        count = messages[1]["content"].count("→")
+            self.calls.append(("explain", content[:20], None))
+            self.prompts.append(content)
+        count = content.count("→")
         return json.dumps({str(n): "Reason {0}".format(n) for n in range(1, count + 1)})
+
+    def combined_answer(self, content, response_format):
+        """Answer a combined request: edits for the known test sentence, nothing otherwise."""
+        edits = []
+        if "Teh dog were very very big." in content:
+            edits = [
+                {"category": "spelling", "original": "Teh", "replacement": "The", "reason": "Typo."},
+                {"category": "grammar", "original": "dog were", "replacement": "dog was", "reason": "Agreement."},
+                {"category": "expression", "original": "very very big", "replacement": "extremely big",
+                 "reason": "Repetition."},
+            ]
+        return json.dumps({"edits": edits})
+
+
+class GarbageCombinedService(FakeService):
+    """Answers the combined request with prose so the parser must give up."""
+
+    def combined_answer(self, content, response_format):
+        return "Sure! Here are my thoughts on the text: it reads fine overall."
+
+
+class NoSchemaService(FakeService):
+    """Rejects response_format like a server without guided decoding, answers plain requests."""
+
+    def combined_answer(self, content, response_format):
+        if response_format is not None:
+            raise StructuredOutputUnsupported("Relay error 400: response_format is not supported")
+        return super().combined_answer(content, response_format)
 
 
 # ----------------------------------------------------------- style guide
@@ -737,6 +785,164 @@ def test_run_check_propagates_cancellation():
         run_check(FakeService(delay=1), "m", "Teh dog.", CHECK_SPELLING, cancel)
 
 
+# ------------------------------------------------------- combined pass
+GERMAN = (
+    "Er hatte in der Nacht kaum geschlaffen und wusste nicht ob der Zug kommt. "
+    "Die Tatsache der Sachlage war die, dass er müde war. Er ging nach Hause, und er ging nach Hause."
+)
+
+
+def _answer(edits):
+    return json.dumps({"edits": edits}, ensure_ascii=False)
+
+
+def test_combined_prompt_lists_rules_text_shape_and_author_settings():
+    options = ProjectOptions(style_guide="British spelling", glossary=["Thalbrück"], language="German")
+    system, user = build_combined_messages("Some text.", options)
+    assert "single JSON object" in system["content"]
+    content = user["content"]
+    for number, check in enumerate(CHECKS, 1):
+        assert "{0}. {1}: {2}".format(number, check, CHECK_INSTRUCTIONS[check]) in content
+    assert content.index(STYLE_GUIDE_HEADER) < content.index(GLOSSARY_HEADER) < content.index("Text:\nSome text.")
+    assert '"edits"' in content and "exact substring" in content and "in German" in content
+    only_spelling = ProjectOptions(checks={CHECK_SPELLING: True, CHECK_GRAMMAR: False, CHECK_EXPRESSION: False})
+    assert "2. grammar" not in build_combined_messages("x", only_spelling)[1]["content"]
+
+
+def test_parse_combined_realistic_german_answer():
+    answer = _answer([
+        {"category": "spelling", "original": "geschlaffen", "replacement": "geschlafen", "reason": "Tippfehler."},
+        {"category": "grammar", "original": "nicht ob", "replacement": "nicht, ob", "reason": "Komma vor dem Nebensatz."},
+        {"category": "expression", "original": "Die Tatsache der Sachlage war die, dass er müde war.",
+         "replacement": "Tatsächlich war er müde.", "reason": "Umständliche Formulierung."},
+        {"category": "grammar", "original": "Hause, und er ging", "replacement": "Hause und er ging",
+         "reason": "Kein Komma vor und."},
+    ])
+    results = parse_combined(GERMAN, answer, ProjectOptions())
+
+    assert set(results) == set(CHECKS)
+    assert all(result.status == "done" and result.method == EVALUATION_COMBINED for result in results.values())
+    spelling = results[CHECK_SPELLING].changes
+    assert [(c.original_text, c.proposed_text, c.kind, c.explanation) for c in spelling] == [
+        ("geschlaffen", "geschlafen", "spelling", "Tippfehler.")
+    ]
+    assert GERMAN[spelling[0].start:spelling[0].end] == "geschlaffen"
+    grammar = results[CHECK_GRAMMAR].changes
+    assert [(c.original_text, c.proposed_text, c.kind) for c in grammar] == [("", ",", "punctuation"), (",", "", "punctuation")]
+    assert [c.change_id for c in grammar] == ["grammar-1", "grammar-2"]
+    assert grammar[0].explanation == "Komma vor dem Nebensatz." and grammar[1].explanation == "Kein Komma vor und."
+    expression = results[CHECK_EXPRESSION].changes
+    assert expression[0].kind == "rewrite" and not expression[0].flagged  # rewrites are fine for expression
+    assert results[CHECK_EXPRESSION].proposed_text.startswith(
+        "Er hatte in der Nacht kaum geschlaffen und wusste nicht ob der Zug kommt. Tatsächlich war er müde."
+    )
+    assert results[CHECK_SPELLING].proposed_text == GERMAN.replace("geschlaffen", "geschlafen")
+    assert all(result.explained for result in results.values())
+    for result in results.values():
+        for change in result.changes:
+            assert GERMAN[change.start:change.end] == change.original_text
+
+
+def test_parse_combined_anchors_repeated_words_through_context():
+    # "nach Hause" occurs twice; the model disambiguated with the surrounding words
+    answer = _answer([
+        {"category": "expression", "original": "und er ging nach Hause", "replacement": "und er ging heim", "reason": "Kürzer."},
+    ])
+    results = parse_combined(GERMAN, answer, ProjectOptions())
+    change = results[CHECK_EXPRESSION].changes[0]
+    assert (change.original_text, change.proposed_text) == ("nach Hause", "heim")
+    assert change.start == GERMAN.rindex("nach Hause")
+
+    # ... but a bare repeated substring is ambiguous and cannot be anchored
+    ambiguous = _answer([{"category": "expression", "original": "nach Hause", "replacement": "heim", "reason": "x"}])
+    assert parse_combined(GERMAN, ambiguous, ProjectOptions()) is None
+
+
+def test_parse_combined_gives_up_on_unanchorable_or_malformed_answers():
+    good = {"category": "spelling", "original": "geschlaffen", "replacement": "geschlafen", "reason": "Tippfehler."}
+    assert parse_combined(GERMAN, _answer([good, {"category": "grammar", "original": "nicht da", "replacement": "x", "reason": ""}])) is None
+    assert parse_combined(GERMAN, _answer([{"category": "grammar", "original": "", "replacement": "x", "reason": ""}])) is None
+    assert parse_combined(GERMAN, _answer([{"category": "layout", "original": "Zug", "replacement": "Bus", "reason": ""}])) is None
+    assert parse_combined(GERMAN, _answer([{"category": "grammar", "original": 5, "replacement": "x", "reason": ""}])) is None
+    assert parse_combined(GERMAN, "I cannot help with that.") is None
+    assert parse_combined(GERMAN, '{"changes": []}') is None
+    assert parse_combined(GERMAN, "```json\n" + _answer([good]) + "\n```") is not None  # fences are tolerated
+    empty = parse_combined(GERMAN, '{"edits": []}', ProjectOptions())
+    assert all(result.changes == [] and result.proposed_text == GERMAN for result in empty.values())
+    # an unchanged "edit" and a disabled category are skipped, not fatal
+    skipped = parse_combined(GERMAN, _answer([
+        dict(good, replacement="geschlaffen"),
+        {"category": "expression", "original": "müde", "replacement": "erschöpft", "reason": "x"},
+    ]), ProjectOptions(checks={CHECK_SPELLING: True, CHECK_GRAMMAR: True, CHECK_EXPRESSION: False}))
+    assert set(skipped) == {CHECK_SPELLING, CHECK_GRAMMAR} and skipped[CHECK_SPELLING].changes == []
+
+
+def test_parse_combined_applies_glossary_and_hallucination_guard():
+    answer = _answer([
+        {"category": "spelling", "original": "geschlaffen", "replacement": "geschlafen", "reason": "Tippfehler."},
+        {"category": "grammar", "original": "kommt.", "replacement": "kommt, obwohl der Schaffner und der Lokführer es versprochen hatten.",
+         "reason": "Ergänzt."},
+    ])
+    results = parse_combined(GERMAN, answer, ProjectOptions(glossary=["geschlaffen"]))
+    assert results[CHECK_SPELLING].changes == [] and len(results[CHECK_SPELLING].suppressed) == 1
+    grammar = results[CHECK_GRAMMAR].changes
+    assert grammar and grammar[0].flags == [FLAG_GROWTH]
+
+
+def test_run_segment_combined_uses_one_request_and_marks_results():
+    service = FakeService()
+    text = "Teh dog were very very big. It run fast."
+    results = run_segment_combined(service, "m", text, ProjectOptions(), threading.Event())
+
+    assert [call[0] for call in service.calls] == ["combined"]
+    assert service.calls[0][2] is True  # asked for the JSON schema
+    assert all(result.method == EVALUATION_COMBINED and result.model == "m" for result in results.values())
+    assert [c.proposed_text for c in results[CHECK_SPELLING].changes] == ["The"]
+    assert [c.proposed_text for c in results[CHECK_GRAMMAR].changes] == ["was"]
+    assert [c.proposed_text for c in results[CHECK_EXPRESSION].changes] == ["extremely"]
+    assert results[CHECK_GRAMMAR].changes[0].explanation == "Agreement."
+
+
+def test_run_segment_combined_falls_back_to_separate_checks_on_garbage():
+    service = GarbageCombinedService()
+    text = "Teh dog were very very big."
+    results = run_segment_combined(service, "m", text, ProjectOptions(), threading.Event())
+
+    assert [call[0] for call in service.calls] == ["combined", "edit", "explain", "edit", "explain", "edit", "explain"]
+    assert all(result.status == "done" and result.method == EVALUATION_SEPARATE for result in results.values())
+    assert [c.proposed_text for c in results[CHECK_SPELLING].changes] == ["The"]
+    assert results[CHECK_SPELLING].changes[0].explanation == "Reason 1"
+
+
+def test_run_segment_combined_reports_missing_structured_output_support():
+    service = NoSchemaService()
+    disabled = []
+    results = run_segment_combined(
+        service, "m", "Teh dog were very very big.", ProjectOptions(), threading.Event(),
+        on_structured_unsupported=lambda: disabled.append(True),
+    )
+    assert disabled == [True]
+    assert all(result.method == EVALUATION_SEPARATE for result in results.values())  # this segment fell back
+    # without the schema the same service answers the combined request
+    results = run_segment_combined(service, "m", "Teh dog were very very big.", ProjectOptions(), threading.Event(), structured=False)
+    assert all(result.method == EVALUATION_COMBINED for result in results.values())
+
+
+def test_combined_schema_and_method_persist():
+    assert COMBINED_SCHEMA["properties"]["edits"]["items"]["properties"]["category"]["enum"] == list(CHECKS)
+    result = CheckResult(CHECK_SPELLING, "done", method=EVALUATION_COMBINED)
+    assert CheckResult.from_dict(result.to_dict()).method == EVALUATION_COMBINED
+    legacy = {key: value for key, value in result.to_dict().items() if key != "method"}
+    assert CheckResult.from_dict(legacy).method == EVALUATION_SEPARATE
+    assert CheckResult.from_dict(dict(legacy, method="magic")).method == EVALUATION_SEPARATE
+    options = ProjectOptions()
+    assert options.evaluation_mode == EVALUATION_COMBINED and options.combined
+    assert ProjectOptions.from_dict({"evaluation_mode": "separate"}).evaluation_mode == EVALUATION_SEPARATE
+    assert ProjectOptions.from_dict({"evaluation_mode": "weird"}).evaluation_mode == EVALUATION_COMBINED
+    assert ProjectOptions.from_dict({}).evaluation_mode == EVALUATION_COMBINED
+    assert ProjectOptions.from_dict(ProjectOptions(evaluation_mode=EVALUATION_SEPARATE).to_dict()).evaluation_mode == EVALUATION_SEPARATE
+
+
 FILLER = " ".join(["The evening settled quietly over the small town by the river."] * 5)
 MANUSCRIPT = (
     "Kapitel 1\n\nTeh dog were very very big. It run fast.\n\n" + FILLER + "\n\n"
@@ -747,6 +953,7 @@ MANUSCRIPT = (
 def make_project(tmp_path, **option_overrides):
     source = tmp_path / "novel.txt"
     source.write_text(MANUSCRIPT, encoding="utf-8")
+    option_overrides.setdefault("evaluation_mode", EVALUATION_SEPARATE)  # the classic per-check tasks
     options = ProjectOptions(target_chars=200, max_chars=400, parallelism=2, **option_overrides)
     return create_project(source, MANUSCRIPT, options, model="m", backend="fake")
 
@@ -908,6 +1115,285 @@ def test_runner_dispatches_all_checks_of_a_segment_consecutively(tmp_path):
     runner.start()
     started = [event[1:] for event in drain(events) if event[0] == "workflow_started"]
     assert started == pending
+
+
+def test_pending_tasks_are_per_segment_in_combined_mode(tmp_path):
+    project = make_project(tmp_path, evaluation_mode=EVALUATION_COMBINED)
+    segments = [(c.index, s.index) for c, s in project.all_segments() if not s.is_blank]
+    assert project.pending_tasks() == [(c, s, None) for c, s in segments]
+    chapter, segment = project.find(*segments[0])
+    segment.results[CHECK_SPELLING] = CheckResult(CHECK_SPELLING, "done", segment.text, [])
+    segment.results[CHECK_GRAMMAR] = CheckResult(CHECK_GRAMMAR, "error", error="boom")
+    assert project.pending_checks(segment) == [CHECK_GRAMMAR, CHECK_EXPRESSION]
+    assert project.pending_tasks()[0] == (chapter.index, segment.index, None)
+    segment.results[CHECK_GRAMMAR] = CheckResult(CHECK_GRAMMAR, "done", segment.text, [])
+    segment.results[CHECK_EXPRESSION] = CheckResult(CHECK_EXPRESSION, "done", segment.text, [])
+    assert project.pending_tasks()[0] == (segments[1][0], segments[1][1], None)
+    project.options.evaluation_mode = EVALUATION_SEPARATE
+    assert all(check is not None for _, _, check in project.pending_tasks())
+
+
+def test_runner_emits_three_results_per_segment_in_combined_mode(tmp_path):
+    project = make_project(tmp_path, evaluation_mode=EVALUATION_COMBINED)
+    events = queue.Queue()
+    service = FakeService()
+    runner = ProjectRunner(project, service, "m", events, parallelism=2)
+    queued = runner.start()
+    collected = drain(events)
+
+    segments = [(c.index, s.index) for c, s in project.all_segments() if not s.is_blank]
+    assert queued == runner.total == len(segments)
+    started = [event[1:] for event in collected if event[0] == "workflow_started"]
+    results = [event for event in collected if event[0] == "workflow_result"]
+    assert len(started) == len(results) == 3 * len(segments)
+    assert sorted(started) == sorted((c, s, check) for c, s in segments for check in CHECKS)
+    for _, chapter_index, segment_index, check, result in results:
+        assert result.check == check and result.method == EVALUATION_COMBINED
+        apply_result(project, chapter_index, segment_index, check, result)
+    assert [call[0] for call in service.calls].count("combined") == len(segments)
+    assert project.pending_tasks() == []
+    progress = [event for event in collected if event[0] == "workflow_progress"]
+    assert progress[-1][1:3] == (len(segments), len(segments))
+    chapter, segment = project.find(1, 1)
+    assert [c.proposed_text for c in segment.changes(ALL)] == ["The", "was", "extremely"]
+    assert runner.structured_output is True
+    stats = project.progress()
+    assert stats["methods"] == {EVALUATION_COMBINED: 3 * len(segments), EVALUATION_SEPARATE: 0}
+    assert "- Evaluation: combined ({0} results combined, 0 separate)".format(3 * len(segments)) in project.build_report()
+
+
+def test_runner_disables_structured_output_after_a_rejection(tmp_path):
+    project = make_project(tmp_path, evaluation_mode=EVALUATION_COMBINED)
+    events = queue.Queue()
+    service = NoSchemaService()
+    runner = ProjectRunner(project, service, "m", events, parallelism=1)
+    runner.start()
+    for event in drain(events):
+        if event[0] == "workflow_result":
+            apply_result(project, *event[1:])
+
+    combined_calls = [call for call in service.calls if call[0] == "combined"]
+    assert combined_calls[0][2] is True and all(call[2] is False for call in combined_calls[1:])
+    assert runner.structured_output is False
+    methods = [segment.results[check].method for _, segment in project.all_segments() for check in CHECKS if check in segment.results]
+    assert EVALUATION_SEPARATE in methods and EVALUATION_COMBINED in methods  # first segment fell back, the rest did not
+
+
+# --------------------------------------------------------- explanations
+def test_canned_explanations_cover_trivial_kinds_only():
+    de = "Er wusste nicht ob der Zug kommt und ging nach Hause."
+    comma = extract_changes(de, "Er wusste nicht, ob der Zug kommt und ging nach Hause.", CHECK_GRAMMAR)[0]
+    assert comma.kind == "punctuation"
+    assert canned_explanation(comma, "de") == CANNED_EXPLANATIONS["punctuation"]["de"]
+    assert canned_explanation(comma, "en") == "Punctuation corrected."
+    assert canned_explanation(comma, None) is None and canned_explanation(comma, "fr") is None
+    assert canned_explanation(Change("x", CHECK_SPELLING, 0, 5, "hello", "Hello"), "en") == "Capitalization corrected."
+    assert canned_explanation(Change("x", CHECK_SPELLING, 0, 4, "a  b", "a b"), "en") == "Spacing corrected."
+    one_letter = Change("x", CHECK_SPELLING, 0, 7, "occured", "occurred")
+    assert one_letter.kind == "spelling" and one_letter.distance == 1
+    assert canned_explanation(one_letter, "en") == "Typo: one letter corrected."
+    two_letters = Change("x", CHECK_SPELLING, 0, 8, "recieved", "received")
+    assert two_letters.kind == "spelling" and two_letters.distance == 2
+    assert canned_explanation(two_letters, "en") is None
+    assert canned_explanation(Change("x", CHECK_GRAMMAR, 0, 4, "were", "was"), "en") is None  # word choice
+    assert canned_explanation(Change("x", CHECK_EXPRESSION, 0, 3, "", "a very long added clause"), "en") is None
+
+
+def test_language_heuristic_and_setting_mapping():
+    assert detect_language("Er hatte in der Nacht kaum geschlafen und wusste nicht, ob der Zug kommt.") == "de"
+    assert detect_language("She had barely slept that night and did not know whether the train would come.") == "en"
+    assert detect_language("") == "en"
+    assert explanation_language("same as text", "Der Zug ist da und wir sind froh.") == "de"
+    assert explanation_language("same as text", "The train is here and we are glad.") == "en"
+    assert explanation_language("German", "whatever") == "de" and explanation_language("Deutsch", "") == "de"
+    assert explanation_language("English", "Der Zug") == "en"
+    assert explanation_language("French", "Le train") is None
+
+
+class CommaService(FakeService):
+    """Grammar check that only inserts a comma (a canned kind); spelling fixes two letters."""
+
+    def stream_edit(self, model, instruction, text, cancel_event, on_progress=None, text_first=False):
+        with self.lock:
+            self.calls.append(("edit", instruction[:20], text, text_first))
+            self.instructions.append(instruction)
+        if instruction.startswith("Fix grammar"):
+            return text.replace("nicht ob", "nicht, ob")
+        if instruction.startswith("Correct spelling"):
+            return text.replace("Bahnohf", "Bahnhof")  # transposition: distance 2, not canned
+        return text
+
+
+def test_explanation_request_is_skipped_when_every_change_is_canned():
+    service = CommaService()
+    text = "Er hatte kaum geschlafen und wusste nicht ob der Zug zum Bahnohf kommt."
+    result = run_check(service, "m", text, CHECK_GRAMMAR, threading.Event())
+
+    assert [c.explanation for c in result.changes] == ["Zeichensetzung korrigiert."]
+    assert result.explained is True
+    assert service.prompts == []  # no explanation request went out
+
+    # a two-letter typo still needs the model; canned changes are not re-asked
+    result = run_check(service, "m", text, CHECK_SPELLING, threading.Event())
+    assert [c.explanation for c in result.changes] == ["Reason 1"] and result.explained is True
+    assert len(service.prompts) == 1 and "Bahnohf" in service.prompts[0]
+
+    # explanations off: fallback text, explained False
+    result = run_check(CommaService(), "m", text, CHECK_GRAMMAR, threading.Event(), explain=False)
+    assert [c.explanation for c in result.changes] == ["Grammar or punctuation fix."] and result.explained is False
+
+
+def test_explained_is_true_only_when_no_fallback_remains():
+    class SilentService(FakeService):
+        def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
+            self.prompts.append(messages[1]["content"])
+            return "{}"  # the model answered nothing useful
+
+    result = run_check(SilentService(), "m", "Teh dog were big.", CHECK_SPELLING, threading.Event())
+    assert [c.explanation for c in result.changes] == ["Spelling correction."] and result.explained is False
+    result = evaluate(FakeService(), "m", "Teh dog were big.", CHECK_SPELLING, threading.Event())
+    assert result.changes[0].explanation == "" and result.explained is False
+    explained = explain_result(FakeService(), "m", "Teh dog were big.", result, threading.Event())
+    assert explained.changes[0].explanation == "Reason 1" and explained.explained is True
+
+
+def test_grouped_prompt_numbers_across_segments_and_includes_each_text_once():
+    first = "Teh dog were big."
+    second = "It run fast and it run far."
+    first_changes = extract_changes(first, "The dog was big.", CHECK_GRAMMAR)
+    second_changes = extract_changes(second, "It ran fast and it ran far.", CHECK_GRAMMAR)
+    assert len(first_changes) == 2 and len(second_changes) == 2
+
+    single = build_grouped_explanation_messages([(first, first_changes)], CHECK_GRAMMAR)
+    assert single == build_explanation_messages(first, first_changes, CHECK_GRAMMAR)
+
+    grouped = build_grouped_explanation_messages([(first, first_changes), (second, second_changes)], CHECK_GRAMMAR, "German")
+    content = grouped[1]["content"]
+    assert "for 2 segments" in content and "in German" in content
+    assert content.count(first) == 1 and content.count(second) == 1
+    assert content.index("Segment 1:\n" + first) < content.index("Segment 2:\n" + second)
+    for number, change in enumerate(first_changes + second_changes, 1):
+        assert '{0}. "{1}" → "{2}"'.format(number, change.original_text, change.proposed_text) in content
+    assert "Changes in segment 1:\n1." in content and "Changes in segment 2:\n3." in content
+
+    # the fake answers by counting arrows, so numbering is verified end to end
+    numbered = request_explanations(FakeService(), "m", [(first, first_changes), (second, second_changes)], CHECK_GRAMMAR, threading.Event())
+    assert numbered == {1: "Reason 1", 2: "Reason 2", 3: "Reason 3", 4: "Reason 4"}
+
+
+def test_explainer_batches_by_check_and_distributes_answers(tmp_path):
+    project = make_project(tmp_path)
+    events = queue.Queue()
+    service = FakeService()
+    runner = ProjectRunner(project, service, "m", events, parallelism=1)
+    entries = []
+    for n in range(EXPLANATION_GROUP_SIZE + 2):  # 8 grammar entries → 6 + 2
+        text = "Segment {0}: it were big and it were fast.".format(n)
+        result = evaluate(service, "m", text, CHECK_GRAMMAR, threading.Event())
+        entries.append((1, n + 1, CHECK_GRAMMAR, result, list(result.changes), text))
+    text = "Teh dog."
+    spelling = evaluate(service, "m", text, CHECK_SPELLING, threading.Event())
+    entries.append((2, 1, CHECK_SPELLING, spelling, list(spelling.changes), text))
+    service.prompts.clear()
+
+    runner._explain_batch(entries)
+
+    assert len(service.prompts) == 3  # grammar 6 + grammar 2 + spelling 1
+    assert "for 6 segments" in service.prompts[1] and "for 2 segments" in service.prompts[2]
+    assert "Text:\nTeh dog." in service.prompts[0]  # spelling group first (CHECKS order), single-segment prompt
+    # numbering continues across the six segments of the first group and restarts per request
+    assert [c.explanation for c in entries[0][3].changes] == ["Reason 1", "Reason 2"]
+    assert [c.explanation for c in entries[5][3].changes] == ["Reason 11", "Reason 12"]
+    assert [c.explanation for c in entries[6][3].changes] == ["Reason 1", "Reason 2"]
+    assert [c.explanation for c in entries[7][3].changes] == ["Reason 3", "Reason 4"]
+    assert [c.explanation for c in spelling.changes] == ["Reason 1"]
+    assert all(entry[3].explained for entry in entries)
+    emitted = [event for event in list(events.queue) if event[0] == "workflow_result"]
+    assert [(e[1], e[2], e[3]) for e in emitted] == [(2, 1, CHECK_SPELLING)] + [(1, n + 1, CHECK_GRAMMAR) for n in range(8)]
+    assert runner.done == 9 and runner.explanation_requests == 3
+
+
+class SlowExplainService(FakeService):
+    """Explanations take a moment so evaluations pile up and get grouped."""
+
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
+        if not messages[1]["content"].startswith("Review the text below"):
+            if cancel_event.wait(0.15):
+                raise EditCancelled("cancelled")
+        return super().generate(model, messages, cancel_event, on_progress, max_tokens, response_format)
+
+
+def test_runner_emits_each_result_once_with_batched_explanations(tmp_path):
+    body = "\n\n".join("Paragraph {0}: teh dog were very very big and it run fast.".format(n) for n in range(6))
+    source = tmp_path / "many.txt"
+    source.write_text(body, encoding="utf-8")
+    options = ProjectOptions(target_chars=60, max_chars=100, parallelism=3, evaluation_mode=EVALUATION_SEPARATE)
+    project = create_project(source, body, options, model="m", backend="fake")
+    segments = [(c.index, s.index) for c, s in project.all_segments() if not s.is_blank]
+    assert len(segments) >= 4
+    events = queue.Queue()
+    service = SlowExplainService()
+    runner = ProjectRunner(project, service, "m", events, parallelism=3)
+    queued = runner.start()
+    collected = drain(events, timeout=30)
+
+    results = [event for event in collected if event[0] == "workflow_result"]
+    keys = [(e[1], e[2], e[3]) for e in results]
+    assert sorted(keys) == sorted((c, s, check) for c, s in segments for check in CHECKS)
+    assert len(keys) == len(set(keys)) == queued == runner.total
+    assert collected[-1] == ("workflow_finished", False)
+    assert all(event[0] != "workflow_result" for event in collected[collected.index(collected[-1]):])
+    for _, chapter_index, segment_index, check, result in results:
+        apply_result(project, chapter_index, segment_index, check, result)
+        assert result.status == "done" and result.explained, (segment_index, check)
+    explained_results = sum(1 for _, s in project.all_segments() for r in s.results.values() if r.changes)
+    assert runner.explanation_requests < explained_results  # some requests covered several segments
+    assert runner.done == runner.total
+    progress = [event for event in collected if event[0] == "workflow_progress"]
+    assert progress[-1][1:3] == (runner.total, runner.total)
+
+
+class BlockingExplainService(FakeService):
+    """The first explanation request blocks until cancelled; lets a test cancel mid-explain."""
+
+    def __init__(self):
+        super().__init__()
+        self.explaining = threading.Event()
+
+    def generate(self, model, messages, cancel_event, on_progress=None, max_tokens=None, response_format=None):
+        if not messages[1]["content"].startswith("Review the text below"):
+            self.explaining.set()
+            if cancel_event.wait(10):
+                raise EditCancelled("cancelled")
+        return super().generate(model, messages, cancel_event, on_progress, max_tokens, response_format)
+
+
+def test_cancel_during_the_explain_stage_finishes_cleanly(tmp_path):
+    project = make_project(tmp_path)
+    events = queue.Queue()
+    service = BlockingExplainService()
+    runner = ProjectRunner(project, service, "m", events, parallelism=2)
+    runner.start()
+    assert service.explaining.wait(10), "the explainer never started a request"
+    runner.cancel()
+    collected = drain(events, timeout=10)
+
+    assert collected[-1] == ("workflow_finished", True)
+    for thread in runner._threads:
+        thread.join(5)
+    assert not runner.active
+    results = [event for event in collected if event[0] == "workflow_result"]
+    keys = [(e[1], e[2], e[3]) for e in results]
+    assert len(keys) == len(set(keys))  # never twice
+    for _, chapter_index, segment_index, check, result in results:
+        apply_result(project, chapter_index, segment_index, check, result)
+        assert result.status == "done"
+        for change in result.changes:
+            assert change.explanation  # fallback or canned, never empty
+    # whatever was still waiting for an explanation came out with fallback text ...
+    assert any(not r.explained for _, s in project.all_segments() for r in s.results.values() if r.changes)
+    # ... and the project is consistent: every emitted result is stored, the rest is simply pending
+    assert len(results) + len(project.pending_tasks()) == runner.total
 
 
 def test_runner_with_nothing_to_do_finishes_immediately(tmp_path):
@@ -1187,6 +1673,29 @@ def test_runner_picks_up_tasks_enqueued_mid_run(tmp_path):
     assert project.pending_tasks() == []
     assert all(target.results[check].status == "done" for check in CHECKS)
     assert not runner.active and not runner.has_work()
+
+
+def test_enqueue_takes_whole_segment_tasks_in_combined_mode(tmp_path):
+    project = evaluated_project(tmp_path, evaluation_mode=EVALUATION_COMBINED)
+    chapter = project.chapters[0]
+    target = next(segment for segment in chapter.segments if not segment.is_blank)
+    events = queue.Queue()
+    runner = ProjectRunner(project, FakeService(), "m", events, parallelism=2)
+    assert runner.start() == 0
+    assert events.get(timeout=1) == ("workflow_finished", False)
+
+    removed = project.invalidate(chapter.index, target.index)
+    assert len(removed) == len(CHECKS)
+    assert project.pending_tasks() == [(chapter.index, target.index, None)]
+    assert runner.enqueue(project.pending_tasks()) == 1
+    collected = drain(events)
+    for event in collected:
+        if event[0] == "workflow_result":
+            apply_result(project, *event[1:])
+    started = sorted(event[1:] for event in collected if event[0] == "workflow_started")
+    assert started == sorted(removed)  # one task, one started/result event per check
+    assert collected[-1] == ("workflow_finished", False)
+    assert project.pending_tasks() == [] and all(target.results[check].status == "done" for check in CHECKS)
 
 
 def test_enqueue_after_the_runner_finished_starts_new_workers(tmp_path):

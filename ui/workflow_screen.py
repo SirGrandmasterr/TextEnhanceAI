@@ -29,6 +29,9 @@ from core.workflow import (
     CHECK_DESCRIPTIONS,
     CHECK_LABELS,
     CHECKS,
+    EVALUATION_COMBINED,
+    EVALUATION_LABELS,
+    EVALUATION_MODES,
     FLAG_LABELS,
     PROJECT_DIR_SUFFIX,
     PROJECT_FILE,
@@ -464,6 +467,7 @@ class WorkflowScreen(ttk.Frame):
         project = create_project(path, text, options, model=model, backend=self.host.backend_id())
         self.host.remember_style_guide(options.style_guide)
         self.host.remember_glossary(options.glossary)
+        self.host.remember_evaluation_mode(options.evaluation_mode)
         if project.root.exists() and (project.root / PROJECT_FILE).exists():
             if not messagebox.askyesno(
                 "Replace previous review?",
@@ -629,7 +633,13 @@ class WorkflowScreen(ttk.Frame):
         if not removed:
             self.host.set_status("Nothing to evaluate again there.")
             return 0
-        tasks = [task for task in removed if task not in self.running_tasks]  # in-flight ones return anyway
+        busy = {(chapter, segment) for chapter, segment, _ in self.running_tasks}  # in-flight ones return anyway
+        if self.project.options.combined:
+            # one request answers every missing check of a segment
+            tasks = [(chapter, segment, None) for chapter, segment in
+                     sorted({(chapter, segment) for chapter, segment, _ in removed}) if (chapter, segment) not in busy]
+        else:
+            tasks = [task for task in removed if task[:2] not in busy]
         if self.evaluating:
             queued = self.runner.enqueue(tasks)
             self.project_view.set_running(True)
@@ -1093,17 +1103,29 @@ class StartView(ttk.Frame):
                   "explanations, larger ones need fewer requests.", style="SurfaceMuted.TLabel",
                   wraplength=460).pack(side=tk.LEFT, padx=8)
 
-        ttk.Label(grid, text="Parallel requests:", style="Surface.TLabel").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Label(grid, text="Evaluation:", style="Surface.TLabel").grid(row=2, column=0, sticky="nw", pady=2)
+        modes_row = ttk.Frame(grid, style="Surface.TFrame")
+        modes_row.grid(row=2, column=1, sticky="w", pady=2)
+        self.evaluation_mode = tk.StringVar(value=EVALUATION_COMBINED)
+        for value in EVALUATION_MODES:
+            ttk.Radiobutton(modes_row, text=EVALUATION_LABELS[value], value=value, variable=self.evaluation_mode,
+                            style="Surface.TRadiobutton", command=self._update_preview).pack(anchor="w")
+        ttk.Label(modes_row, text="Combined: one JSON answer per segment lists every category's edits with reasons. "
+                  "Separate: each check edits the whole segment on its own and explanations are a second "
+                  "request; also the automatic fallback when a combined answer cannot be used.",
+                  style="SurfaceMuted.TLabel", wraplength=460).pack(anchor="w", pady=(2, 0))
+
+        ttk.Label(grid, text="Parallel requests:", style="Surface.TLabel").grid(row=3, column=0, sticky="w", pady=2)
         par_row = ttk.Frame(grid, style="Surface.TFrame")
-        par_row.grid(row=2, column=1, sticky="w", pady=2)
+        par_row.grid(row=3, column=1, sticky="w", pady=2)
         self.parallel_var = tk.StringVar(value="2")
         ttk.Spinbox(par_row, from_=1, to=8, textvariable=self.parallel_var, width=5).pack(side=tk.LEFT)
         ttk.Label(par_row, text="(1 for local Ollama, 2–4 for a GPU server behind the relay)",
                   style="SurfaceMuted.TLabel").pack(side=tk.LEFT, padx=8)
 
-        ttk.Label(grid, text="Explanations:", style="Surface.TLabel").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(grid, text="Explanations:", style="Surface.TLabel").grid(row=4, column=0, sticky="w", pady=2)
         expl_row = ttk.Frame(grid, style="Surface.TFrame")
-        expl_row.grid(row=3, column=1, sticky="w", pady=2)
+        expl_row.grid(row=4, column=1, sticky="w", pady=2)
         self.explain_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(expl_row, text="Ask the model to explain each change", variable=self.explain_var,
                         style="Surface.TCheckbutton").pack(side=tk.LEFT)
@@ -1142,6 +1164,9 @@ class StartView(ttk.Frame):
                 self.style_guide_box.set(host.default_style_guide())
             if not self.glossary_box.get_text():
                 self.glossary_box.set("\n".join(host.default_glossary()))
+            mode = host.default_evaluation_mode()
+            if mode in EVALUATION_MODES:
+                self.evaluation_mode.set(mode)
         except Exception:
             pass
 
@@ -1187,6 +1212,7 @@ class StartView(ttk.Frame):
             parallelism=parallel,
             style_guide=self.style_guide_box.get_text(),
             glossary=parse_glossary(self.glossary_box.get_text()),
+            evaluation_mode=self.evaluation_mode.get(),
         )
 
     def _update_preview(self):
@@ -1211,7 +1237,10 @@ class StartView(ttk.Frame):
             )
         )
         checks = len(options.enabled_checks())
-        requests = segments * checks * (2 if options.explain else 1)
+        if options.combined:
+            requests = segments
+        else:
+            requests = segments * checks * (2 if options.explain else 1)
         self.estimate_var.set("≈ {0} model requests".format(requests) if checks else "No check enabled")
 
     def start(self):

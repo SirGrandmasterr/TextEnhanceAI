@@ -74,6 +74,17 @@ def test_default_glossary_is_persisted_as_a_list(tmp_path):
     assert AppSettings.load(path, environ={}).default_glossary == []
 
 
+def test_default_evaluation_mode_is_validated_and_persisted(tmp_path):
+    path = tmp_path / "settings.json"
+    assert AppSettings.load(path, environ={}).default_evaluation_mode == "combined"
+    assert AppSettings.load(path, environ={"TEAI_EVALUATION_MODE": "separate"}).default_evaluation_mode == "separate"
+    assert AppSettings.load(path, environ={"TEAI_EVALUATION_MODE": "turbo"}).default_evaluation_mode == "combined"
+    settings = AppSettings.load(path, environ={})
+    settings.default_evaluation_mode = "separate"
+    settings.save()
+    assert AppSettings.load(path, environ={}).default_evaluation_mode == "separate"
+
+
 def test_saved_file_wins_over_environment_and_round_trips(tmp_path):
     path = tmp_path / "settings.json"
     settings = AppSettings.load(path, environ={})
